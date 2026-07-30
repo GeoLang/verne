@@ -86,6 +86,29 @@ the headers: the test geodatabases are built at test time by
 annotation class or a topology, so those parts of the fixture are definition XML
 written by hand into the catalogue and read back through the driver.
 
+### What a plain conversion loses
+
+Counted on one USGS National Hydrography geodatabase (41 tables, public domain),
+against a GeoPackage written by GDAL's own vector translate, which is the code
+behind `ogr2ogr`:
+
+| | in the geodatabase | the GeoPackage keeps | verne carries |
+|---|---|---|---|
+| domains | 62 | 18 | 62 |
+| relationship classes | 10 | 0 | 10 |
+| subtypes | 5 sets | 0 | 5 sets |
+
+Only 20 of those 62 domains are bound straight to a field. The other 42 are
+reached only through subtypes, and GDAL has no subtype at all, so it cannot see
+them being used and does not carry them: miss the one construct and two thirds of
+the domains go with it, without the output looking any different. GDAL's reader
+sees all 10 relationship classes and its GeoPackage writer keeps none of them.
+
+Verne reads the domains and the relationship classes through GDAL, so that part
+is GDAL's work and not verne's. What verne adds is the subtypes, out of the
+catalogue XML; carrying all of it into somewhere that can hold it; and saying
+what did not survive.
+
 ## Extraction
 
 `verne extract` writes three things into the directory it is given:
@@ -106,10 +129,15 @@ does not exist until the load is running: a subtype's `domain_assignments` names
 its domains, and a relationship class names its two datasets. Both are typed as
 names, and the loader swaps them for the ids the load minted.
 
-The GeoPackage holds more than ptolemy does. Field aliases, the domains
-themselves with their descriptions and split and merge policies, and the binding
-of a field to a domain all survive there, so the losses the report names are
-losses at ptolemy rather than at the file verne writes on the way.
+The GeoPackage holds some things ptolemy does not: field aliases, and for a
+domain bound straight to a field, the domain itself with its description and its
+split and merge policies and that binding. So a loss the report names against
+ptolemy is not always a loss in the file verne writes on the way.
+
+It is not the whole picture though, and the sidecar is not a copy of it. GDAL
+carries a domain into a GeoPackage only where it can see a field using it, and a
+domain reached through a subtype is invisible to it. On a real geodatabase that
+is most of them — see below.
 
 ### The extraction log
 

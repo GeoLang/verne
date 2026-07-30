@@ -423,6 +423,13 @@ pub fn domain_item(scan: &Scan, domain: &Domain) -> Item {
 fn domain_detail(domain: &Domain, users: &[String]) -> String {
     let mut detail = format!("Domain \"{}\" ({})", domain.name, domain.field_type);
     match &domain.kind {
+        DomainKind::Coded(values) if values.is_empty() => {
+            // a coded domain that constrains a field to nothing is a real thing
+            // to find in a geodatabase, and "coded: " with an empty list after
+            // it reads as verne having failed to print rather than as the file
+            // saying so
+            detail.push_str(", coded, no values");
+        }
         DomainKind::Coded(values) => {
             let listed: Vec<String> = values
                 .iter()
@@ -597,4 +604,42 @@ fn system_tables(scan: &Scan, items: &mut Vec<Item>) {
             "the geodatabase's own catalogue of items, relationships and spatial references; it describes the container rather than the data, and GeoLang keeps its own catalogue",
         ),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::domain_detail;
+    use crate::glue::{Domain, DomainKind};
+
+    fn domain(kind: DomainKind) -> Domain {
+        Domain {
+            name: "Area Event Type".to_string(),
+            description: None,
+            field_type: "Integer".to_string(),
+            kind,
+            split_policy: "default value",
+            merge_policy: "default value",
+        }
+    }
+
+    /// A real geodatabase holds coded domains with nothing in them, and the
+    /// report has to say that rather than trail off after "coded:".
+    #[test]
+    fn a_coded_domain_with_no_values_says_so() {
+        let detail = domain_detail(&domain(DomainKind::Coded(Vec::new())), &[]);
+
+        assert!(detail.contains("coded, no values"), "{detail}");
+        assert!(!detail.ends_with("coded: "), "{detail}");
+    }
+
+    #[test]
+    fn a_coded_domain_still_lists_the_values_it_has() {
+        let values = vec![("53700".to_string(), "Area of Complex Channels".to_string())];
+        let detail = domain_detail(&domain(DomainKind::Coded(values)), &[]);
+
+        assert!(
+            detail.contains("coded: 53700=Area of Complex Channels"),
+            "{detail}"
+        );
+    }
 }

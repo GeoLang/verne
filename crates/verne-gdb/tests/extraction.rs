@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use verne_core::sidecar::Action;
-use verne_core::{Item, Report, SIDECAR_FILE, Sidecar, Verdict};
+use verne_core::{Item, ItemKind, Report, SIDECAR_FILE, Sidecar, Verdict};
 use verne_gdb::{GdbSource, serialised};
 
 fn fixture(dir: &Path) -> PathBuf {
@@ -511,4 +511,116 @@ fn many_threads_can_extract_at_once() {
     });
 
     assert_eq!(extracted, vec![4; 8]);
+}
+
+// ─── The dataset schema ─────────────────────────────────────────────
+
+#[test]
+fn every_column_reaches_the_schema_with_its_type() {
+    let extracted = extract();
+    let wells = extracted.sidecar.dataset("wells").expect("wells");
+    let named: Vec<(&str, &str)> = wells
+        .schema
+        .fields
+        .iter()
+        .map(|field| (field.name.as_str(), field.field_type.as_str()))
+        .collect();
+
+    assert_eq!(
+        named,
+        [
+            ("well_name", "string"),
+            ("depth", "integer"),
+            ("status", "string"),
+            // ptolemy has no field type for bytes
+            ("logo", "string"),
+        ]
+    );
+    // the fixture's columns all take a null, so ptolemy is asked for nothing
+    // the geodatabase did not ask for either
+    assert!(wells.schema.fields.iter().all(|field| !field.required));
+}
+
+/// The whole point: the label a reader knows the column by now has somewhere to
+/// go, and a column that never had one does not gain an empty label.
+#[test]
+fn a_field_alias_is_carried_onto_the_schema() {
+    let extracted = extract();
+    let wells = extracted.sidecar.dataset("wells").expect("wells");
+
+    let name = &wells.schema.fields[0];
+    assert_eq!(name.name, "well_name");
+    assert_eq!(name.alias.as_deref(), Some("Well name"));
+    assert!(
+        wells.schema.fields[1..]
+            .iter()
+            .all(|field| field.alias.is_none()),
+        "{:?}",
+        wells.schema.fields
+    );
+}
+
+#[test]
+fn a_table_with_no_columns_gets_an_empty_schema() {
+    let extracted = extract();
+    let pads = extracted.sidecar.dataset("pads").expect("pads");
+    assert!(pads.schema.is_empty(), "{:?}", pads.schema);
+}
+
+/// A type ptolemy cannot name exactly is an approximation, and both the report
+/// and the log have to say which column and which type.
+#[test]
+fn a_column_type_ptolemy_cannot_name_is_a_loss_in_both() {
+    let extracted = extract();
+
+    let wells = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "wells",
+    );
+    let shortfall = wells.verdict.shortfall();
+    assert!(shortfall.contains("logo (Binary)"), "{shortfall}");
+    assert!(
+        shortfall.contains("string, integer, float, boolean, array and object"),
+        "{shortfall}"
+    );
+
+    let note = extracted
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .find(|entry| entry.detail.contains("nearest type ptolemy has"))
+        .expect("the log records the approximation");
+    assert_eq!(note.destination.as_deref(), Some("schema of wells"));
+    let Action::CarriedWithLoss { losses } = &note.action else {
+        panic!("an approximated type is a loss: {note:?}");
+    };
+    assert!(losses[0].contains("Binary column"), "{losses:?}");
+}
+
+/// The alias reaches ptolemy now, so the report must stop saying it merely
+/// could be, and must not overclaim either: nothing displays it.
+#[test]
+fn the_report_says_an_alias_is_stored_but_never_shown() {
+    let extracted = extract();
+    let wells = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "wells",
+    );
+    let shortfall = wells.verdict.shortfall();
+
+    assert!(shortfall.contains("well_name \"Well name\""), "{shortfall}");
+    assert!(shortfall.contains("reach ptolemy"), "{shortfall}");
+    assert!(shortfall.contains("never shown"), "{shortfall}");
+    // the old claim, which was wrong: an extra JSON key was silently dropped
+    assert!(!shortfall.contains("free-form JSON"), "{shortfall}");
+}
+
+fn only<'a>(items: &'a [Item], kind: ItemKind, location: &str) -> &'a Item {
+    items
+        .iter()
+        .find(|item| item.kind == kind && item.location == location)
+        .unwrap_or_else(|| panic!("no {kind} row for {location}"))
 }

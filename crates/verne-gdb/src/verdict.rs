@@ -144,6 +144,61 @@ pub fn subtype_item(table: &Table) -> Option<Item> {
     ))
 }
 
+/// ptolemy's name for the field type a domain applies to, and what is lost
+/// where its three names do not reach.
+pub fn domain_field_type(gdal: &str) -> (&'static str, Option<String>) {
+    match gdal {
+        "String" => ("string", None),
+        "Integer" | "Integer64" => ("integer", None),
+        "Real" => ("float", None),
+        other => (
+            "string",
+            Some(format!(
+                "the domain constrains a {other} field, and ptolemy's domains are documented as constraining a string, an integer or a float, so it was recorded as a string"
+            )),
+        ),
+    }
+}
+
+/// ptolemy's name for a column's own type on a dataset schema, and what
+/// calling it that drops.
+///
+/// A different question from [`domain_field_type`] and a different set of
+/// names: a domain's column is documented as holding one of three, while a
+/// schema field is a six-variant enum ptolemy rejects an unknown name for. Both
+/// are here because both are statements about what the platform can say.
+pub fn schema_field_type(gdal: &str) -> (&'static str, Option<String>) {
+    match gdal {
+        "String" => ("string", None),
+        "Integer" | "Integer64" => ("integer", None),
+        "Real" => ("float", None),
+        "Date" | "Time" | "DateTime" => (
+            "string",
+            Some(format!(
+                "a {gdal} column, and ptolemy's schema field types are string, integer, float, boolean, array and object with nothing temporal among them, so it is declared a string and only the format of the text says it is a {gdal}"
+            )),
+        ),
+        "Binary" => (
+            "string",
+            Some(
+                "a Binary column, and ptolemy has no field type for bytes, so the schema declares a string; the bytes themselves are a separate matter, reported with the table".to_string(),
+            ),
+        ),
+        "IntegerList" | "Integer64List" | "RealList" | "StringList" => (
+            "array",
+            Some(format!(
+                "a {gdal} column, and ptolemy's array field type says nothing about what is in the array, so the element type is not declared"
+            )),
+        ),
+        other => (
+            "string",
+            Some(format!(
+                "a {other} column, which is none of ptolemy's six schema field types, so it is declared a string"
+            )),
+        ),
+    }
+}
+
 fn dedup(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
@@ -370,8 +425,21 @@ fn table_losses(table: &Table) -> Vec<String> {
         .collect();
     if !aliased.is_empty() {
         losses.push(format!(
-            "the field aliases ({}) are human labels; ptolemy's dataset_schemas takes free-form JSON so they can be carried, but nothing reads them",
+            "the field aliases ({}) reach ptolemy on the dataset schema and are stored there, and nothing in the platform displays one, so the label a reader knows the column by is kept but never shown",
             aliased.join(", ")
+        ));
+    }
+    let retyped: Vec<String> = table
+        .fields
+        .iter()
+        .filter(|field| schema_field_type(&field.kind).1.is_some())
+        .map(|field| format!("{} ({})", field.name, field.kind))
+        .collect();
+    if !retyped.is_empty() {
+        losses.push(format!(
+            "the schema cannot name the type of {} exactly: ptolemy's field types are string, integer, float, boolean, array and object, so {} declared as the nearest of those",
+            retyped.join(", "),
+            if retyped.len() == 1 { "it is" } else { "they are" }
         ));
     }
     let binary: Vec<&str> = table

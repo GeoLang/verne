@@ -35,6 +35,9 @@ pub struct Field {
     pub alias: Option<String>,
     pub kind: String,
     pub domain: Option<String>,
+    /// Whether the column refuses a null. ptolemy's schema calls the same thing
+    /// `required`, the other way round.
+    pub not_null: bool,
 }
 
 #[derive(Debug)]
@@ -130,6 +133,7 @@ pub fn scan(dataset: &Dataset) -> Scan {
                 alias: alias(&field),
                 kind: field_type_to_name(field.field_type()),
                 domain: glue::field_domain_name(&layer, index),
+                not_null: !field.is_nullable(),
             })
             .collect();
         scan.tables.push(Table {

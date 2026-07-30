@@ -12,7 +12,7 @@ pub use model::{Item, ItemKind, Losses, Outcome, SourceDescription, Target, Verd
 pub use report::{Counts, Report};
 pub use sidecar::{
     Action, DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, LogCounts, LogEntry, NewDataset,
-    NewDomain, NewRelationship, NewSubtype, SIDECAR_FILE, Sidecar,
+    NewDomain, NewField, NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar,
 };
 
 /// A thing verne can read.

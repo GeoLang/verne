@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use verne_core::sidecar::{DatasetPlan, NewRelationship, NewSubtype, Sidecar};
+use verne_core::sidecar::{DatasetPlan, NewRelationship, NewSchema, NewSubtype, Sidecar};
 
 /// Prefix every ptolemy route shares.
 const API: &str = "/api/v1";
@@ -63,6 +63,9 @@ pub enum LoadError {
 pub struct Loaded {
     /// Dataset name to the id ptolemy gave it.
     pub datasets: BTreeMap<String, String>,
+    /// Dataset name to how many fields its schema carries. A dataset whose
+    /// source table had no fields gets no schema and is not in here.
+    pub schemas: BTreeMap<String, usize>,
     /// `(dataset, domain)` to the id ptolemy gave that domain. A geodatabase
     /// domain two datasets use is two rows here, as it is two rows there.
     pub domains: BTreeMap<(String, String), String>,
@@ -75,12 +78,24 @@ pub struct Loaded {
 impl Loaded {
     pub fn sentence(&self) -> String {
         format!(
-            "{} datasets, {} domains, {} subtypes, {} relationship classes.",
+            "{} datasets, {} schemas, {} domains, {} subtypes, {} relationship classes.",
             self.datasets.len(),
+            self.schemas.len(),
             self.domains.len(),
             self.subtypes.len(),
             self.relationships.len()
         )
+    }
+
+    /// How many field aliases the load carried, which is the part of a schema
+    /// with nowhere else in the platform to go.
+    pub fn aliases(sidecar: &Sidecar) -> usize {
+        sidecar
+            .datasets
+            .iter()
+            .flat_map(|plan| plan.schema.fields.iter())
+            .filter(|field| field.alias.is_some())
+            .count()
     }
 }
 
@@ -124,6 +139,13 @@ impl Loader {
             loaded
                 .datasets
                 .insert(plan.dataset.name.clone(), id.clone());
+            // the schema is about the dataset itself and waits on nothing, so
+            // it goes on before the domains that hang off the same dataset
+            if self.set_schema(&id, &plan.schema)? {
+                loaded
+                    .schemas
+                    .insert(plan.dataset.name.clone(), plan.schema.fields.len());
+            }
             self.create_domains(plan, &id, &mut loaded)?;
         }
         // subtypes only after every domain, because a subtype names one by id
@@ -148,6 +170,17 @@ impl Loader {
         // the response is the whole dataset, not just its id
         let body = self.post(&route, &plan.dataset)?;
         id_of(&route, &body)
+    }
+
+    /// The dataset's columns, aliases included. Answers whether one was sent: a
+    /// table with no fields has no schema to set, and an empty one would only
+    /// record that ptolemy should validate nothing.
+    fn set_schema(&self, dataset_id: &str, schema: &NewSchema) -> Result<bool, LoadError> {
+        if schema.is_empty() {
+            return Ok(false);
+        }
+        self.put(&format!("{API}/datasets/{dataset_id}/schema"), schema)?;
+        Ok(true)
     }
 
     fn create_domains(
@@ -228,26 +261,57 @@ impl Loader {
     }
 
     fn post<T: Serialize>(&self, route: &str, body: &T) -> Result<serde_json::Value, LoadError> {
-        let response = self
-            .client
-            .post(format!("{}{route}", self.base))
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()?;
-        let status = response.status();
-        let text = response.text()?;
-        if !status.is_success() {
-            return Err(LoadError::Refused {
-                method: "POST",
-                route: route.to_string(),
-                status: status.as_u16(),
-                body: text,
-            });
-        }
+        let text = self.send(Method::Post, route, body)?;
         serde_json::from_str(&text).map_err(|_| LoadError::NoId {
             route: route.to_string(),
             body: text,
         })
+    }
+
+    /// A PUT answers with a status and nothing else, so unlike [`Self::post`]
+    /// there is no body to read an id out of.
+    fn put<T: Serialize>(&self, route: &str, body: &T) -> Result<(), LoadError> {
+        self.send(Method::Put, route, body).map(drop)
+    }
+
+    fn send<T: Serialize>(
+        &self,
+        method: Method,
+        route: &str,
+        body: &T,
+    ) -> Result<String, LoadError> {
+        let url = format!("{}{route}", self.base);
+        let request = match method {
+            Method::Post => self.client.post(url),
+            Method::Put => self.client.put(url),
+        };
+        let response = request.bearer_auth(&self.token).json(body).send()?;
+        let status = response.status();
+        let text = response.text()?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        Err(LoadError::Refused {
+            method: method.name(),
+            route: route.to_string(),
+            status: status.as_u16(),
+            body: text,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Method {
+    Post,
+    Put,
+}
+
+impl Method {
+    fn name(self) -> &'static str {
+        match self {
+            Method::Post => "POST",
+            Method::Put => "PUT",
+        }
     }
 }
 

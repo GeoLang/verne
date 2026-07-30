@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 
 use verne_core::SourceDescription;
 use verne_core::sidecar::{
-    DatasetPlan, ExtractionLog, NewDataset, NewDomain, NewRelationship, NewSubtype, Sidecar,
+    DatasetPlan, ExtractionLog, NewDataset, NewDomain, NewField, NewRelationship, NewSchema,
+    NewSubtype, Sidecar,
 };
 use verne_load::Loader;
 
@@ -54,6 +55,22 @@ fn a_sidecar(suffix: &str) -> Sidecar {
                     geometry_type: "point".into(),
                     created_by: "verne-load test".into(),
                 },
+                schema: NewSchema {
+                    fields: vec![
+                        NewField {
+                            name: "well_name".into(),
+                            field_type: "string".into(),
+                            required: false,
+                            alias: Some("Well name".into()),
+                        },
+                        NewField {
+                            name: "depth".into(),
+                            field_type: "integer".into(),
+                            required: false,
+                            alias: None,
+                        },
+                    ],
+                },
                 domains: vec![
                     NewDomain::coded(
                         "status_codes",
@@ -88,6 +105,8 @@ fn a_sidecar(suffix: &str) -> Sidecar {
                     geometry_type: "geometry".into(),
                     created_by: "verne-load test".into(),
                 },
+                // no fields, so no schema is sent for it
+                schema: NewSchema { fields: Vec::new() },
                 domains: Vec::new(),
                 subtypes: Vec::new(),
             },
@@ -149,6 +168,8 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
     eprintln!("loaded {}", loaded.sentence());
 
     assert_eq!(loaded.datasets.len(), 2);
+    // only the dataset with fields got one
+    assert_eq!(loaded.schemas.len(), 1);
     assert_eq!(loaded.domains.len(), 2);
     assert_eq!(loaded.subtypes.len(), 2);
     assert_eq!(loaded.relationships.len(), 1);
@@ -172,6 +193,22 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
         .collect();
     assert!(names.contains(&"status_codes"), "{domains}");
     assert!(names.contains(&"depth_range"), "{domains}");
+
+    // the alias is the reason the schema is carried at all: ptolemy stores it
+    // and nothing displays it, so the round trip is the whole contract
+    let schema: serde_json::Value = client
+        .get(format!("{}/api/v1/datasets/{wells}/schema", live.url))
+        .bearer_auth(&live.token)
+        .send()
+        .expect("the schema")
+        .json()
+        .expect("json");
+    let fields = schema["fields"].as_array().expect("fields");
+    assert_eq!(fields[0]["name"], "well_name", "{schema}");
+    assert_eq!(fields[0]["alias"], "Well name", "{schema}");
+    assert_eq!(fields[0]["field_type"], "string", "{schema}");
+    // a field with no alias must not come back with an empty one
+    assert!(fields[1]["alias"].is_null(), "{schema}");
 
     // the subtype's domain assignment holds the id of a domain row, which is
     // the one field the loader had to swap

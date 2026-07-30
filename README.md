@@ -118,8 +118,9 @@ features.gpkg — the features and attributes, converted by GDAL's own vector
                 translate. -preserve_fid is always on, because a geodatabase
                 keys its relationship classes on OBJECTID and OpenFileGDB gives
                 that as the feature id rather than as a field.
-sidecar.json  — the datasets, coded and range domains, subtypes and
-                relationship classes to create in ptolemy, plus the log
+sidecar.json  — the datasets, their column schemas, coded and range domains,
+                subtypes and relationship classes to create in ptolemy, plus
+                the log
 ```
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
@@ -129,15 +130,30 @@ does not exist until the load is running: a subtype's `domain_assignments` names
 its domains, and a relationship class names its two datasets. Both are typed as
 names, and the loader swaps them for the ids the load minted.
 
-The GeoPackage holds some things ptolemy does not: field aliases, and for a
-domain bound straight to a field, the domain itself with its description and its
-split and merge policies and that binding. So a loss the report names against
-ptolemy is not always a loss in the file verne writes on the way.
+The GeoPackage holds some things ptolemy does not: for a domain bound straight
+to a field, the domain itself with its description and its split and merge
+policies and that binding. So a loss the report names against ptolemy is not
+always a loss in the file verne writes on the way.
 
 It is not the whole picture though, and the sidecar is not a copy of it. GDAL
 carries a domain into a GeoPackage only where it can see a field using it, and a
 domain reached through a subtype is invisible to it. On a real geodatabase that
 is most of them — see below.
+
+### Field aliases
+
+An Esri field carries a name and a human label beside it, and the label is what
+the source's users have always read the column by. It goes onto ptolemy's
+dataset schema, one `alias` per field, and is stored there.
+
+Nothing in the platform displays it. Carrying it is not the same as showing it,
+and the report says which of the two happened rather than the more flattering
+one: the label survives the migration and no screen has caught up with it yet.
+
+A column's type goes the same way, mapped onto ptolemy's six field types. Where
+none of them names the source type, as with a date, a binary column or a list,
+the nearest is used and both the report and the log name the column and the type
+it had.
 
 ### The extraction log
 
@@ -155,9 +171,10 @@ required rather than optional: an extraction has to be able to say who made it.
 
 ## Loading
 
-`verne load` creates datasets first, then the domains and subtypes that hang off
-one, then the relationship classes, which name two datasets and cannot be
-created before both exist.
+`verne load` creates datasets first, each with its schema and then the domains
+that hang off it, then the subtypes, which name a domain by id, then the
+relationship classes, which name two datasets and cannot be created before both
+exist.
 
 The token comes from `VERNE_PTOLEMY_TOKEN` and is never an argument, which would
 put it in the process list. ptolemy grants the creator of a dataset an admin row

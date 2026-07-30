@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use verne_core::{
-    DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, Item, ItemKind, NewDataset, NewDomain,
-    NewRelationship, NewSubtype, SIDECAR_FILE, Sidecar, Source,
+    DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, Item, ItemKind, NewDataset, NewDomain, NewField,
+    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source,
 };
 
 use crate::geopackage;
@@ -230,7 +230,8 @@ fn dataset_plans(
                 losses: dropped,
             });
         }
-        let (domains, subtypes) = schema_of(scan, table, conversions);
+        let (domains, subtypes) = semantics_of(scan, table, conversions);
+        let schema = columns_of(table, conversions);
         placed.push((
             verdict::table_item(table),
             Placed::At(format!("dataset {}", table.name)),
@@ -254,6 +255,7 @@ fn dataset_plans(
                 geometry_type: geometry_type.to_string(),
                 created_by: operator.to_string(),
             },
+            schema,
             domains,
             subtypes,
         });
@@ -267,7 +269,7 @@ fn dataset_plans(
 const DEFAULT_SRID: i32 = 4326;
 
 /// The domains and subtypes that belong to one table's dataset.
-fn schema_of(
+fn semantics_of(
     scan: &Scan,
     table: &Table,
     conversions: &mut Vec<Conversion>,
@@ -282,6 +284,41 @@ fn schema_of(
         }
     }
     (domains, subtypes_of(table, conversions))
+}
+
+/// The table's columns as ptolemy's dataset schema holds them.
+///
+/// This is where a field alias lands. It is the only home the platform has for
+/// one, and storing it is the whole of what happens to it: nothing displays it.
+fn columns_of(table: &Table, conversions: &mut Vec<Conversion>) -> NewSchema {
+    let mut fields = Vec::new();
+    let mut retyped = Vec::new();
+    for field in &table.fields {
+        let (field_type, approximated) = verdict::schema_field_type(&field.kind);
+        if let Some(loss) = approximated {
+            retyped.push(loss);
+        }
+        fields.push(NewField {
+            name: field.name.clone(),
+            field_type: field_type.to_string(),
+            required: field.not_null,
+            alias: field.alias.clone(),
+        });
+    }
+    if !retyped.is_empty() {
+        conversions.push(Conversion {
+            location: table.name.clone(),
+            kind: ItemKind::AttributeSchema,
+            detail: format!(
+                "{} column{} declared as the nearest type ptolemy has",
+                retyped.len(),
+                plural(retyped.len())
+            ),
+            destination: format!("schema of {}", table.name),
+            losses: retyped,
+        });
+    }
+    NewSchema { fields }
 }
 
 /// Every domain one table names, whether through a field binding or through a
@@ -305,7 +342,7 @@ fn new_domain(
     dataset: &str,
     conversions: &mut Vec<Conversion>,
 ) -> Option<NewDomain> {
-    let (field_type, retyped) = ptolemy_field_type(&domain.field_type);
+    let (field_type, retyped) = verdict::domain_field_type(&domain.field_type);
     if let Some(loss) = retyped {
         conversions.push(Conversion {
             location: domain.name.clone(),
@@ -583,22 +620,6 @@ fn ptolemy_geometry(table: &Table) -> (&'static str, Vec<String>) {
     (name, losses)
 }
 
-/// ptolemy's name for the field type a domain applies to, and what is lost
-/// where its three names do not reach.
-fn ptolemy_field_type(gdal: &str) -> (&'static str, Option<String>) {
-    match gdal {
-        "String" => ("string", None),
-        "Integer" | "Integer64" => ("integer", None),
-        "Real" => ("float", None),
-        other => (
-            "string",
-            Some(format!(
-                "the domain constrains a {other} field, and ptolemy's domains are documented as constraining a string, an integer or a float, so it was recorded as a string"
-            )),
-        ),
-    }
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -619,6 +640,7 @@ mod tests {
                     geometry_type: "point".into(),
                     created_by: "operator".into(),
                 },
+                schema: NewSchema { fields: Vec::new() },
                 domains: Vec::new(),
                 subtypes: Vec::new(),
             })

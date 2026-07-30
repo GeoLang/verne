@@ -44,6 +44,42 @@ pub struct NewDataset {
     pub created_by: String,
 }
 
+/// One column: ptolemy's `FieldDef`.
+///
+/// `allowed_values`, `min` and `max` are left out. They all default on the
+/// wire, and verne fills none of them: what would go in them is a domain, and
+/// domains are carried as domains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewField {
+    pub name: String,
+    /// One of ptolemy's names: `string`, `integer`, `float`, `boolean`,
+    /// `array`, `object`. Unlike a dataset's geometry type, an unknown name is
+    /// rejected there rather than defaulted, so a wrong one fails the load
+    /// rather than landing quietly.
+    pub field_type: String,
+    /// Whether a feature must carry a value. Read off the source column's
+    /// nullability, so ptolemy demands exactly what the geodatabase did.
+    pub required: bool,
+    /// The label the source's users read the column by, where it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// A dataset's schema: `PUT /api/v1/datasets/{id}/schema`.
+///
+/// `geometry_rules` is left out: it defaults there, and the dataset already
+/// says what geometry it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewSchema {
+    pub fields: Vec<NewField>,
+}
+
+impl NewSchema {
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+}
+
 /// A coded or range domain: `POST /api/v1/datasets/{id}/domains`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewDomain {
@@ -140,6 +176,10 @@ pub struct DatasetPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
     pub dataset: NewDataset,
+    /// No serde default: a sidecar written before schemas existed would
+    /// otherwise load with an empty one and drop every alias without saying so,
+    /// which is the failure this field was added to stop.
+    pub schema: NewSchema,
     pub domains: Vec<NewDomain>,
     pub subtypes: Vec<NewSubtype>,
 }

@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use verne_core::sidecar::{Action, ExtractionLog, LogEntry};
 use verne_core::{
-    DatasetPlan, Item, ItemKind, Losses, NewDataset, NewDomain, NewRelationship, NewSubtype,
-    Sidecar, SourceDescription, Target, Verdict,
+    DatasetPlan, Item, ItemKind, Losses, NewDataset, NewDomain, NewField, NewRelationship,
+    NewSchema, NewSubtype, Sidecar, SourceDescription, Target, Verdict,
 };
 
 fn faithful(location: &str) -> Item {
@@ -194,6 +194,22 @@ fn a_sidecar() -> Sidecar {
                 geometry_type: "point".into(),
                 created_by: "operator@example.test".into(),
             },
+            schema: NewSchema {
+                fields: vec![
+                    NewField {
+                        name: "well_name".into(),
+                        field_type: "string".into(),
+                        required: false,
+                        alias: Some("Well name".into()),
+                    },
+                    NewField {
+                        name: "depth".into(),
+                        field_type: "integer".into(),
+                        required: true,
+                        alias: None,
+                    },
+                ],
+            },
             domains: vec![NewDomain::coded(
                 "status_codes",
                 "string",
@@ -271,4 +287,69 @@ fn a_log_entry_flattens_its_action_into_the_row() {
     assert_eq!(json["action"], "skipped");
     assert_eq!(json["reason"], "nothing to write");
     assert!(json.get("destination").is_none(), "{json}");
+}
+
+#[test]
+fn a_field_serialises_as_ptolemys_field_def() {
+    let field = NewField {
+        name: "constructionmaterial".into(),
+        field_type: "string".into(),
+        required: false,
+        alias: Some("Construction Material".into()),
+    };
+    let json = serde_json::to_value(&field).expect("serialises");
+
+    assert_eq!(json["name"], "constructionmaterial");
+    assert_eq!(json["field_type"], "string");
+    assert_eq!(json["required"], false);
+    assert_eq!(json["alias"], "Construction Material");
+}
+
+/// ptolemy skips the key when there is no alias, and a field with none must not
+/// gain an empty one on the way.
+#[test]
+fn a_field_without_an_alias_carries_no_alias_key() {
+    let field = NewField {
+        name: "plain".into(),
+        field_type: "integer".into(),
+        required: true,
+        alias: None,
+    };
+    let json = serde_json::to_value(&field).expect("serialises");
+
+    assert!(json.get("alias").is_none(), "{json}");
+    assert_eq!(json["required"], true);
+}
+
+/// The schema is posted as it stands, so it has to be the request body and not
+/// a bare list of fields.
+#[test]
+fn a_schema_serialises_as_the_request_body_ptolemy_takes() {
+    let schema = NewSchema {
+        fields: vec![NewField {
+            name: "depth".into(),
+            field_type: "integer".into(),
+            required: false,
+            alias: None,
+        }],
+    };
+    let json = serde_json::to_value(&schema).expect("serialises");
+
+    assert!(json["fields"].is_array(), "{json}");
+    assert_eq!(json["fields"][0]["name"], "depth");
+    assert!(NewSchema { fields: Vec::new() }.is_empty());
+}
+
+/// A sidecar written before schemas existed would load with an empty one and
+/// drop every alias in silence, so it has to fail to parse instead.
+#[test]
+fn a_sidecar_without_a_schema_is_refused() {
+    let mut json = serde_json::to_value(a_sidecar()).expect("serialises");
+    json["datasets"][0]
+        .as_object_mut()
+        .expect("an object")
+        .remove("schema");
+
+    let refused = Sidecar::from_json(&json.to_string()).expect_err("a missing schema is an error");
+    assert!(refused.to_string().contains("schema"), "{refused}");
 }

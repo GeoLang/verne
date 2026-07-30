@@ -226,6 +226,8 @@ pub enum ItemKind {
     ViewDependentDisplay,
     /// A 3D model placed at a location.
     Mesh,
+    /// A typed association between the rows of two tables.
+    Relationship,
 }
 
 impl ItemKind {
@@ -242,6 +244,7 @@ impl ItemKind {
             ItemKind::RasterOverlay => "raster overlay",
             ItemKind::ViewDependentDisplay => "view-dependent display",
             ItemKind::Mesh => "mesh",
+            ItemKind::Relationship => "relationship",
         }
     }
 }

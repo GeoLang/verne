@@ -38,6 +38,8 @@ pub struct Table {
 #[derive(Debug, Default)]
 pub struct Scan {
     pub tables: Vec<Table>,
+    pub domains: Vec<glue::Domain>,
+    pub relationships: Vec<glue::Relationship>,
 }
 
 impl Scan {
@@ -45,6 +47,20 @@ impl Scan {
         self.tables
             .iter()
             .filter(|table| table.role == TableRole::User)
+    }
+
+    /// Every `table.field` bound to this domain, in the order the tables came.
+    pub fn domain_users(&self, domain: &str) -> Vec<String> {
+        self.tables
+            .iter()
+            .flat_map(|table| {
+                table
+                    .fields
+                    .iter()
+                    .filter(move |field| field.domain.as_deref() == Some(domain))
+                    .map(move |field| format!("{}.{}", table.name, field.name))
+            })
+            .collect()
     }
 }
 
@@ -76,6 +92,14 @@ pub fn scan(dataset: &Dataset) -> Scan {
             fields,
         });
     }
+    scan.domains = glue::domain_names(dataset)
+        .iter()
+        .filter_map(|name| glue::domain(dataset, name))
+        .collect();
+    scan.relationships = glue::relationship_names(dataset)
+        .iter()
+        .filter_map(|name| glue::relationship(dataset, name))
+        .collect();
     scan
 }
 

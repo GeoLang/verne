@@ -148,3 +148,71 @@ fn a_path_that_is_not_a_geodatabase_fails() {
     assert!(GdbSource::open(&file).is_err());
     assert!(GdbSource::open(dir.path()).is_err());
 }
+
+#[test]
+fn a_coded_domain_carries_its_values_and_names_its_binding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let coded = only_matching(&items, ItemKind::AttributeSchema, "status_codes");
+    assert!(coded.detail.contains("A=Active"), "{}", coded.detail);
+    assert!(coded.detail.contains("P=Plugged"), "{}", coded.detail);
+    assert!(
+        coded.detail.contains("used by wells.status"),
+        "{}",
+        coded.detail
+    );
+    assert_eq!(coded.verdict.outcome(), Outcome::Approximated);
+    assert_eq!(
+        coded.verdict.target().map(|t| t.component()),
+        Some("ptolemy")
+    );
+    let shortfall = coded.verdict.shortfall();
+    // the values themselves go across; the binding and the description do not
+    assert!(shortfall.contains("domain_assignments"), "{shortfall}");
+    assert!(shortfall.contains("well status"), "{shortfall}");
+}
+
+#[test]
+fn a_range_domain_carries_both_bounds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let range = only_matching(&items, ItemKind::AttributeSchema, "depth_range");
+    assert!(
+        range.detail.contains("range: 0 to 5000"),
+        "{}",
+        range.detail
+    );
+    // both ends are included, so nothing is said about inclusivity
+    assert!(
+        !range.verdict.shortfall().contains("part of the range"),
+        "{}",
+        range.verdict.shortfall()
+    );
+}
+
+#[test]
+fn a_composite_relationship_names_the_cascade_it_loses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let related = only_matching(&items, ItemKind::Relationship, "wells_inspections");
+    assert!(
+        related
+            .detail
+            .contains("wells.OBJECTID -> inspections.well_id"),
+        "{}",
+        related.detail
+    );
+    assert!(related.detail.contains("one to many"), "{}", related.detail);
+    assert!(
+        related.detail.contains("has inspections"),
+        "{}",
+        related.detail
+    );
+    assert_eq!(related.verdict.outcome(), Outcome::Approximated);
+    let shortfall = related.verdict.shortfall();
+    assert!(shortfall.contains("is_composite"), "{shortfall}");
+    assert!(shortfall.contains("origin_primary_key"), "{shortfall}");
+}

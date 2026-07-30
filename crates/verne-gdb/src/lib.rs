@@ -11,6 +11,8 @@ pub mod definition;
 #[cfg(feature = "gdal")]
 mod extract;
 #[cfg(feature = "gdal")]
+mod geopackage;
+#[cfg(feature = "gdal")]
 mod glue;
 #[cfg(feature = "gdal")]
 mod scan;
@@ -20,6 +22,6 @@ mod source;
 mod verdict;
 
 #[cfg(feature = "gdal")]
-pub use extract::{Extraction, SIDECAR_FILE};
+pub use extract::{Extraction, GEOPACKAGE_FILE, SIDECAR_FILE};
 #[cfg(feature = "gdal")]
 pub use source::{GdbError, GdbSource};

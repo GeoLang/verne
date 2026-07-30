@@ -23,6 +23,8 @@ pub enum GdbError {
         "the geodatabase holds no tables at all; an empty inventory must not be mistaken for a clean source"
     )]
     NothingFound,
+    #[error("cannot write the GeoPackage at {path}: {message}")]
+    Convert { path: String, message: String },
     #[error("cannot write {path}: {source}")]
     Write {
         path: String,

@@ -17,6 +17,7 @@ use verne_core::{
     Sidecar, Source,
 };
 
+use crate::geopackage;
 use crate::glue::{Domain, DomainKind, Relationship};
 use crate::scan::{self, Scan, Table};
 use crate::source::{GdbError, GdbSource};
@@ -24,6 +25,9 @@ use crate::verdict;
 
 /// The sidecar's name inside the extraction directory.
 pub const SIDECAR_FILE: &str = "sidecar.json";
+
+/// The GeoPackage's name inside the extraction directory.
+pub const GEOPACKAGE_FILE: &str = "features.gpkg";
 
 /// Where an extraction landed.
 #[derive(Debug, Clone)]
@@ -55,8 +59,31 @@ impl GdbSource {
         let mut placed: Vec<(Item, Placed)> = Vec::new();
         let mut conversions: Vec<Conversion> = Vec::new();
 
-        let datasets = dataset_plans(&scan, operator, &mut placed, &mut conversions);
+        let mut datasets = dataset_plans(&scan, operator, &mut placed, &mut conversions);
         let relationships = relationship_classes(&scan, &datasets, &mut placed);
+
+        let geopackage_path = directory.join(GEOPACKAGE_FILE);
+        let tables: Vec<&str> = datasets
+            .iter()
+            .map(|plan| plan.source_table.as_str())
+            .collect();
+        let layers =
+            geopackage::write(&self.dataset, &geopackage_path, &tables).map_err(|message| {
+                GdbError::Convert {
+                    path: geopackage_path.display().to_string(),
+                    message,
+                }
+            })?;
+        for layer in &layers {
+            let Some(plan) = datasets
+                .iter_mut()
+                .find(|plan| plan.source_table == layer.source_table)
+            else {
+                continue;
+            };
+            plan.layer = Some(layer.name.clone());
+            conversions.push(geopackage_conversion(&scan, layer));
+        }
 
         let mut log = ExtractionLog::new(operator);
         // walked in report order, so the log reads down the same list the
@@ -80,7 +107,7 @@ impl GdbSource {
 
         let sidecar = Sidecar {
             source: self.describe(),
-            geopackage: None,
+            geopackage: Some(GEOPACKAGE_FILE.to_string()),
             datasets,
             relationships,
             log,
@@ -96,9 +123,58 @@ impl GdbSource {
         Ok(Extraction {
             directory: directory.to_path_buf(),
             sidecar_path,
-            geopackage_path: None,
+            geopackage_path: Some(geopackage_path),
             sidecar,
         })
+    }
+}
+
+/// What the GeoPackage step did to one table, beside what the report already
+/// says about it. A GeoPackage is a good deal closer to a geodatabase than
+/// ptolemy is, so most of this is empty and the losses that stay are the ones
+/// worth naming.
+fn geopackage_conversion(scan: &Scan, layer: &geopackage::Layer) -> Conversion {
+    let mut losses = Vec::new();
+    if layer.renamed() {
+        losses.push(format!(
+            "GDAL could not use {} as a GeoPackage table name and wrote the layer as {}, so the sidecar names the layer and not the source table",
+            layer.source_table, layer.name
+        ));
+    }
+    if !layer.dropped_fields.is_empty() {
+        losses.push(format!(
+            "the field{} {} are in the geodatabase and not in the layer that came out",
+            plural(layer.dropped_fields.len()),
+            layer.dropped_fields.join(", ")
+        ));
+    }
+    if let Some(table) = scan.table(&layer.source_table) {
+        if table.features.is_some_and(|count| count != layer.features) {
+            losses.push(format!(
+                "the geodatabase counts {} feature{} and the layer holds {}",
+                table.features.unwrap_or_default(),
+                plural(table.features.unwrap_or_default() as usize),
+                layer.features
+            ));
+        }
+        // OBJECTID is the feature id, not a field, so -preserve_fid is what
+        // keeps the numbers a relationship class is keyed on
+        if !table.fields.iter().any(|field| field.name == "OBJECTID") {
+            losses.push(
+                "OBJECTID is the geodatabase's feature id rather than a field, so it survives as the GeoPackage's fid and is not a column anything can be joined on by name".to_string(),
+            );
+        }
+    }
+    Conversion {
+        location: layer.source_table.clone(),
+        kind: ItemKind::FeatureCollection,
+        detail: format!(
+            "{} feature{}",
+            layer.features,
+            plural(layer.features as usize)
+        ),
+        destination: format!("{GEOPACKAGE_FILE} layer {}", layer.name),
+        losses,
     }
 }
 

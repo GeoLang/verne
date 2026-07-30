@@ -30,6 +30,7 @@ fn fixture(dir: &Path) -> PathBuf {
 struct Extracted {
     sidecar: Sidecar,
     report: Report,
+    geopackage: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -52,6 +53,7 @@ fn extract() -> Extracted {
         extraction.sidecar
     );
     Extracted {
+        geopackage: extraction.geopackage_path.expect("a GeoPackage is written"),
         sidecar: extraction.sidecar,
         report,
         _dir: dir,
@@ -369,4 +371,98 @@ fn the_log_records_who_ran_it_and_when() {
     assert!(log.extracted_at.len() >= 20, "{}", log.extracted_at);
     assert!(log.counts().total >= extracted.report.items.len());
     assert!(log.counts().skipped > 0, "{}", log.counts().sentence());
+}
+
+// ─── The GeoPackage ─────────────────────────────────────────────────
+
+#[test]
+fn every_dataset_names_the_layer_its_features_went_to() {
+    let extracted = extract();
+    assert_eq!(
+        extracted.sidecar.geopackage.as_deref(),
+        Some("features.gpkg")
+    );
+    for plan in &extracted.sidecar.datasets {
+        assert_eq!(
+            plan.layer.as_deref(),
+            Some(plan.source_table.as_str()),
+            "{} names no layer",
+            plan.source_table
+        );
+    }
+}
+
+#[test]
+fn the_geopackage_holds_one_layer_per_dataset() {
+    let extracted = extract();
+    let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+    let names: Vec<String> = written
+        .layers()
+        .map(|layer| gdal::vector::LayerAccess::name(&layer))
+        .collect();
+    assert_eq!(names, ["wells", "pads", "well_labels", "inspections"]);
+    // the system and attachment tables were not asked for
+    assert_eq!(written.layer_count(), 4);
+}
+
+/// OBJECTID is the geodatabase's feature id rather than a field, and a
+/// relationship class is keyed on it, so it has to survive as the GeoPackage's
+/// own feature id and not as a number GDAL invented.
+#[test]
+fn the_features_keep_the_ids_a_relationship_is_keyed_on() {
+    use gdal::vector::LayerAccess;
+
+    let extracted = extract();
+    let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+    let mut wells = written.layer_by_name("wells").expect("wells");
+    assert_eq!(wells.feature_count(), 1);
+
+    let feature = wells.features().next().expect("one well");
+    assert_eq!(feature.fid(), Some(1));
+    let name = feature.field_index("well_name").expect("well_name");
+    assert_eq!(
+        feature.field_as_string(name).expect("read"),
+        Some("Alpha".to_string())
+    );
+    assert!(feature.geometry().is_some(), "the point came across");
+}
+
+/// The report's losses are losses at ptolemy. The GeoPackage keeps more than
+/// that, and the log has to be about the file that was written and not about
+/// what will happen to it later.
+#[test]
+fn the_log_reports_the_geopackage_separately_from_the_dataset() {
+    let extracted = extract();
+    let rows: Vec<_> = extracted
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .destination
+                .as_deref()
+                .is_some_and(|to| to.starts_with("features.gpkg"))
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "one per dataset: {rows:#?}");
+
+    let wells = rows
+        .iter()
+        .find(|entry| entry.location == "wells")
+        .expect("wells");
+    assert_eq!(wells.detail, "1 feature");
+    let Action::CarriedWithLoss { losses } = &wells.action else {
+        panic!("the fid story is a loss: {wells:?}");
+    };
+    assert!(losses.iter().any(|l| l.contains("OBJECTID")), "{losses:?}");
+    // no field was dropped and no layer renamed, so nothing claims either
+    assert!(
+        !losses.iter().any(|l| l.contains("not in the layer")),
+        "{losses:?}"
+    );
+    assert!(
+        !losses.iter().any(|l| l.contains("could not use")),
+        "{losses:?}"
+    );
 }

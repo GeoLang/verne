@@ -163,8 +163,11 @@ fn a_ground_overlay_goes_to_terrano_with_losses() {
         Some("terrano")
     );
     let shortfall = overlay.verdict.shortfall();
-    assert!(shortfall.contains("single band"), "{shortfall}");
+    // terrano holds colour now, so an axis-aligned overlay loses no pixels: what
+    // is left is that verne never fetched the image to check it
+    assert!(!shortfall.contains("single band"), "{shortfall}");
     assert!(!shortfall.contains("rotation terms"), "{shortfall}");
+    assert!(shortfall.contains("unverified"), "{shortfall}");
 }
 
 #[test]
@@ -173,7 +176,6 @@ fn a_rotated_ground_overlay_names_the_rotation() {
     let items = inventory(&doc(body));
     let overlay = only(&items, ItemKind::RasterOverlay);
     let shortfall = overlay.verdict.shortfall();
-    assert!(shortfall.contains("single band"), "{shortfall}");
     assert!(shortfall.contains("rotation terms"), "{shortfall}");
 }
 

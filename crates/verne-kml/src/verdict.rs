@@ -481,11 +481,12 @@ fn overlays(scan: &Scan, root: &str, items: &mut Vec<Item>) {
         if overlay.quad {
             detail.push_str(", gx:LatLonQuad");
         }
+        // colour is carried now: terrano gained a multi-band raster and writes an
+        // RGB or RGBA GeoTIFF, and an axis-aligned LatLonBox in EPSG:4326 maps
+        // exactly onto its origin and pixel scale, so nothing is resampled.
         let mut losses = Losses::one(
-            "an overlay image is colour, and terrano's raster holds a single band of f64 per cell, so an RGB image loses its bands unless it is split into one raster per band",
-        )
-        .and("a lat/lon box is not a CRS-registered geotransform, so terrano has to resample the image onto a grid")
-        .and("verne does not fetch the image, so its size, depth and internal georeferencing are unverified");
+            "verne does not fetch the image, so its size, depth and internal georeferencing are unverified",
+        );
         if overlay.quad {
             losses = losses.and(
                 "a gx:LatLonQuad is a projective warp between four corners, which a north-up raster cannot express",

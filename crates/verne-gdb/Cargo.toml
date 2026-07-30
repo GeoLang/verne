@@ -1,0 +1,23 @@
+[package]
+name = "verne-gdb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Esri File Geodatabase inventory adapter for verne"
+
+[features]
+# Off by default: the rest of the workspace builds and tests without GDAL.
+default = []
+gdal = ["dep:gdal", "dep:gdal-sys"]
+
+[dependencies]
+verne-core = { path = "../verne-core" }
+quick-xml = "0.41"
+thiserror = "2"
+gdal = { version = "0.19", optional = true }
+gdal-sys = { version = "0.12", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

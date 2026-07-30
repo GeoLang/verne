@@ -1,6 +1,7 @@
-//! What an extraction produces beside the features: the datasets, domains,
-//! subtypes and relationship classes to create in ptolemy, and a log of what
-//! was taken and what was left behind.
+//! What an extraction produces: the datasets, domains, subtypes, relationship
+//! classes, features and attachments to create in ptolemy, and a log of what
+//! was taken and what was left behind. The features and the attachment bytes
+//! are files beside this one and are named from here rather than held in it.
 //!
 //! Every request-shaped struct here mirrors a ptolemy request body field for
 //! field, so loading is a POST of the struct rather than a translation that can
@@ -263,7 +264,9 @@ pub struct DatasetPlan {
     pub subtypes: Vec<NewSubtype>,
 }
 
-/// Everything an extraction produced apart from the features themselves.
+/// Everything an extraction produced, with the bulk of it named rather than
+/// held: a dataset's features are a file beside this one, and so are an
+/// attachment's bytes.
 ///
 /// The order of the fields is the order a load has to run in: a dataset before
 /// the domains and subtypes that reference it, every dataset before a

@@ -245,6 +245,16 @@ a type the schema does not declare is left out at extraction rather than sent.
 On one USGS geodatabase (41 tables, 8.3 MB) the extraction takes 0.4 seconds and
 the load 9.4, for 29,602 features in 100 commits.
 
+Two things about a geometry that arrives. Z and M survive: the WKB is written in
+the ISO encoding, which says both in the type code, and PostGIS keeps them, so
+the loss the report names there is the narrow one it says it is, that
+`geometry_type` on the dataset names 2D shapes only and nothing in ptolemy
+records that the dataset holds them. The spatial reference does not: ptolemy's
+commit reads every geometry as EPSG:4326 whatever the dataset's `srid` column
+says, so a class in anything else arrives with its coordinates unchanged under a
+label that is not theirs. That is a loss on every class of the USGS file, which
+is NAD83.
+
 The token comes from `VERNE_PTOLEMY_TOKEN` and is never an argument, which would
 put it in the process list. ptolemy grants the creator of a dataset an admin row
 on it and gates every mutating route on a write ladder, so the loader has to

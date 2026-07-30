@@ -243,7 +243,7 @@ fn left_behind(kind: ItemKind) -> &'static str {
             "ptolemy takes a metadata record through a route of its own, which this extraction does not use"
         }
         _ => {
-            "this extraction writes datasets, domains, subtypes and relationship classes, and nothing else"
+            "this extraction writes datasets, domains, subtypes, relationship classes, features and attachments, and nothing else"
         }
     }
 }

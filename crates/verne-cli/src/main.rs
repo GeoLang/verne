@@ -31,15 +31,16 @@ enum Command {
     Extract {
         /// Path to a .gdb directory
         path: PathBuf,
-        /// Directory to write the GeoPackage, the sidecar and the log into
+        /// Directory to write the GeoPackage, the features, the attachment
+        /// blobs, the sidecar and the log into
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
         /// Who is running this, recorded in the extraction log
         #[arg(long, value_name = "NAME")]
         operator: String,
     },
-    /// Create the datasets, domains, subtypes and relationship classes an
-    /// extraction produced in a running ptolemy
+    /// Create the datasets, domains, subtypes, relationship classes, features
+    /// and attachments an extraction produced in a running ptolemy
     Load {
         /// Directory an earlier `verne extract` wrote
         path: PathBuf,

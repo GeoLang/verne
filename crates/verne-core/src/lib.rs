@@ -6,9 +6,14 @@
 
 pub mod model;
 pub mod report;
+pub mod sidecar;
 
 pub use model::{Item, ItemKind, Losses, Outcome, SourceDescription, Target, Verdict};
 pub use report::{Counts, Report};
+pub use sidecar::{
+    Action, DatasetPlan, ExtractionLog, LogCounts, LogEntry, NewDataset, NewDomain,
+    NewRelationship, NewSubtype, Sidecar,
+};
 
 /// A thing verne can read.
 ///

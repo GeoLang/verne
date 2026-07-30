@@ -9,6 +9,8 @@
 pub mod definition;
 
 #[cfg(feature = "gdal")]
+mod extract;
+#[cfg(feature = "gdal")]
 mod glue;
 #[cfg(feature = "gdal")]
 mod scan;
@@ -17,5 +19,7 @@ mod source;
 #[cfg(feature = "gdal")]
 mod verdict;
 
+#[cfg(feature = "gdal")]
+pub use extract::{Extraction, SIDECAR_FILE};
 #[cfg(feature = "gdal")]
 pub use source::{GdbError, GdbSource};

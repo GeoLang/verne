@@ -1,0 +1,621 @@
+//! Extracting a geodatabase into a form ptolemy accepts.
+//!
+//! The source is still read-only: [`GdbSource::extract`] takes `&self` like
+//! everything else on it, reads through the same open dataset the inventory
+//! does, and writes only into the directory it is handed.
+//!
+//! Nothing here decides whether a thing can be carried. That was decided in
+//! `verdict.rs`, and the log restates the verdict rather than forming a second
+//! opinion, so a report and the extraction beside it cannot disagree about the
+//! same row.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use verne_core::{
+    DatasetPlan, ExtractionLog, Item, ItemKind, NewDataset, NewDomain, NewRelationship, NewSubtype,
+    Sidecar, Source,
+};
+
+use crate::glue::{Domain, DomainKind, Relationship};
+use crate::scan::{self, Scan, Table};
+use crate::source::{GdbError, GdbSource};
+use crate::verdict;
+
+/// The sidecar's name inside the extraction directory.
+pub const SIDECAR_FILE: &str = "sidecar.json";
+
+/// Where an extraction landed.
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub directory: PathBuf,
+    pub sidecar_path: PathBuf,
+    /// The GeoPackage the features went to, absent when none was written.
+    pub geopackage_path: Option<PathBuf>,
+    pub sidecar: Sidecar,
+}
+
+impl GdbSource {
+    /// Read the geodatabase and write it out into `directory`.
+    ///
+    /// `&self` throughout: the geodatabase is open read-only and nothing here
+    /// touches it. The `operator` is recorded in the log, which is what makes
+    /// an extraction accountable rather than anonymous.
+    pub fn extract(&self, directory: &Path, operator: &str) -> Result<Extraction, GdbError> {
+        let scan = scan::scan(&self.dataset);
+        let items = verdict::items(&scan);
+        if items.is_empty() {
+            return Err(GdbError::NothingFound);
+        }
+        std::fs::create_dir_all(directory).map_err(|source| GdbError::Write {
+            path: directory.display().to_string(),
+            source,
+        })?;
+
+        let mut placed: Vec<(Item, Placed)> = Vec::new();
+        let mut conversions: Vec<Conversion> = Vec::new();
+
+        let datasets = dataset_plans(&scan, operator, &mut placed, &mut conversions);
+        let relationships = relationship_classes(&scan, &datasets, &mut placed);
+
+        let mut log = ExtractionLog::new(operator);
+        // walked in report order, so the log reads down the same list the
+        // markdown report does
+        for item in &items {
+            match placed.iter().find(|(held, _)| held == item) {
+                Some((_, Placed::At(destination))) => log.carried(item, destination),
+                Some((_, Placed::Left(reason))) => log.skipped(item, reason),
+                None => log.skipped(item, left_behind(item.kind)),
+            }
+        }
+        for conversion in conversions {
+            log.converted(
+                conversion.location,
+                conversion.kind,
+                conversion.detail,
+                conversion.destination,
+                conversion.losses,
+            );
+        }
+
+        let sidecar = Sidecar {
+            source: self.describe(),
+            geopackage: None,
+            datasets,
+            relationships,
+            log,
+        };
+        let sidecar_path = directory.join(SIDECAR_FILE);
+        std::fs::write(&sidecar_path, sidecar.to_json() + "\n").map_err(|source| {
+            GdbError::Write {
+                path: sidecar_path.display().to_string(),
+                source,
+            }
+        })?;
+
+        Ok(Extraction {
+            directory: directory.to_path_buf(),
+            sidecar_path,
+            geopackage_path: None,
+            sidecar,
+        })
+    }
+}
+
+/// What became of one row of the report.
+enum Placed {
+    /// Written out, here.
+    At(String),
+    /// Not written out, for a reason this extraction has and the report does
+    /// not.
+    Left(String),
+}
+
+/// A loss the extraction itself took, which no verdict covers.
+struct Conversion {
+    location: String,
+    kind: ItemKind,
+    detail: String,
+    destination: String,
+    losses: Vec<String>,
+}
+
+/// Why a thing the inventory judged was not written out. A row whose verdict
+/// already says there is no home for it keeps the verdict's own reason: this
+/// only ever answers for a row that could have been carried and was not.
+fn left_behind(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::EmbeddedResource => {
+            "attachments are not extracted: the blobs are a slice of work of their own, and verne opens none of them"
+        }
+        ItemKind::Hierarchy => {
+            "ptolemy has no container above a dataset, so there is nothing to create for the grouping itself; the classes it held each became a dataset"
+        }
+        ItemKind::Metadata => {
+            "ptolemy takes a metadata record through a route of its own, which this extraction does not use"
+        }
+        _ => {
+            "this extraction writes datasets, domains, subtypes and relationship classes, and nothing else"
+        }
+    }
+}
+
+// ─── Datasets, domains and subtypes ─────────────────────────────────
+
+fn dataset_plans(
+    scan: &Scan,
+    operator: &str,
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) -> Vec<DatasetPlan> {
+    let mut plans = Vec::new();
+    for table in scan.user_tables() {
+        let (geometry_type, dropped) = ptolemy_geometry(table);
+        if !dropped.is_empty() {
+            conversions.push(Conversion {
+                location: table.name.clone(),
+                kind: ItemKind::FeatureCollection,
+                detail: format!("geometry type recorded as {geometry_type}"),
+                destination: format!("dataset {}", table.name),
+                losses: dropped,
+            });
+        }
+        let (domains, subtypes) = schema_of(scan, table, conversions);
+        placed.push((
+            verdict::table_item(table),
+            Placed::At(format!("dataset {}", table.name)),
+        ));
+        if let Some(item) = verdict::subtype_item(table) {
+            let destination = if subtypes.is_empty() {
+                Placed::Left(
+                    "every subtype in the definition carries a code ptolemy cannot hold, so there was nothing left to create".into(),
+                )
+            } else {
+                Placed::At(format!("subtypes of {}", table.name))
+            };
+            placed.push((item, destination));
+        }
+        plans.push(DatasetPlan {
+            source_table: table.name.clone(),
+            layer: None,
+            dataset: NewDataset {
+                name: table.name.clone(),
+                srid: table.srid.unwrap_or(DEFAULT_SRID),
+                geometry_type: geometry_type.to_string(),
+                created_by: operator.to_string(),
+            },
+            domains,
+            subtypes,
+        });
+    }
+    place_domains(scan, &plans, placed, conversions);
+    plans
+}
+
+/// ptolemy's default when a request names no srid, and the only sane guess for
+/// a table that has no spatial reference of its own to report.
+const DEFAULT_SRID: i32 = 4326;
+
+/// The domains and subtypes that belong to one table's dataset.
+fn schema_of(
+    scan: &Scan,
+    table: &Table,
+    conversions: &mut Vec<Conversion>,
+) -> (Vec<NewDomain>, Vec<NewSubtype>) {
+    let mut domains = Vec::new();
+    for name in domains_used_by(table) {
+        let Some(domain) = scan.domains.iter().find(|held| held.name == name) else {
+            continue;
+        };
+        if let Some(new) = new_domain(domain, &table.name, conversions) {
+            domains.push(new);
+        }
+    }
+    (domains, subtypes_of(table, conversions))
+}
+
+/// Every domain one table names, whether through a field binding or through a
+/// subtype's per-field assignment, in a stable order and without repeats.
+fn domains_used_by(table: &Table) -> Vec<String> {
+    let bound = table.fields.iter().filter_map(|field| field.domain.clone());
+    let assigned = table
+        .definition
+        .subtypes
+        .iter()
+        .flat_map(|subtype| subtype.fields.iter())
+        .filter_map(|field| field.domain.clone());
+    let mut names: Vec<String> = bound.chain(assigned).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn new_domain(
+    domain: &Domain,
+    dataset: &str,
+    conversions: &mut Vec<Conversion>,
+) -> Option<NewDomain> {
+    let (field_type, retyped) = ptolemy_field_type(&domain.field_type);
+    if let Some(loss) = retyped {
+        conversions.push(Conversion {
+            location: domain.name.clone(),
+            kind: ItemKind::AttributeSchema,
+            detail: format!("domain field type recorded as {field_type}"),
+            destination: format!("domains of {dataset}"),
+            losses: vec![loss],
+        });
+    }
+    match &domain.kind {
+        DomainKind::Coded(values) => Some(NewDomain::coded(
+            domain.name.clone(),
+            field_type,
+            values
+                .iter()
+                .map(|(code, label)| (code.clone(), label.clone())),
+        )),
+        DomainKind::Range { min, max } => Some(NewDomain::range(
+            domain.name.clone(),
+            field_type,
+            min.map(|bound| bound.value),
+            max.map(|bound| bound.value),
+        )),
+        // the report already calls a glob domain unsupported
+        DomainKind::Glob => None,
+    }
+}
+
+/// Log every domain once, against the datasets it went into. A geodatabase
+/// holds one domain for the whole workspace and ptolemy holds one per dataset,
+/// so a domain two tables use becomes two rows, and one no table uses has no
+/// dataset to live in at all.
+fn place_domains(
+    scan: &Scan,
+    plans: &[DatasetPlan],
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) {
+    for domain in &scan.domains {
+        let holders: Vec<&str> = plans
+            .iter()
+            .filter(|plan| plan.domains.iter().any(|held| held.name == domain.name))
+            .map(|plan| plan.dataset.name.as_str())
+            .collect();
+        let item = verdict::domain_item(scan, domain);
+        if holders.is_empty() {
+            placed.push((
+                item,
+                Placed::Left(
+                    "ptolemy's domains hang off a dataset, and no field or subtype in this geodatabase is bound to this one, so there is no dataset to put it in".into(),
+                ),
+            ));
+            continue;
+        }
+        if holders.len() > 1 {
+            conversions.push(Conversion {
+                location: domain.name.clone(),
+                kind: ItemKind::AttributeSchema,
+                detail: format!("one domain copied into {} datasets", holders.len()),
+                destination: format!("domains of {}", holders.join(", ")),
+                losses: vec![format!(
+                    "the geodatabase holds one {} for the whole workspace and ptolemy holds one per dataset, so {} separate copies were written and editing one of them no longer changes the others",
+                    domain.name,
+                    holders.len()
+                )],
+            });
+        }
+        placed.push((
+            item,
+            Placed::At(format!("domains of {}", holders.join(", "))),
+        ));
+    }
+}
+
+fn subtypes_of(table: &Table, conversions: &mut Vec<Conversion>) -> Vec<NewSubtype> {
+    let definition = &table.definition;
+    let Some(field) = &definition.subtype_field else {
+        return Vec::new();
+    };
+    let mut subtypes = Vec::new();
+    let mut untyped = Vec::new();
+    for subtype in &definition.subtypes {
+        // ptolemy keys a subtype on an integer, so a code that is not one has
+        // nothing to be written as
+        let Ok(code) = subtype.code.parse::<i32>() else {
+            conversions.push(Conversion {
+                location: table.name.clone(),
+                kind: ItemKind::AttributeSchema,
+                detail: format!("subtype \"{}\" with code {}", subtype.name, subtype.code),
+                destination: format!("subtypes of {}", table.name),
+                losses: vec![format!(
+                    "ptolemy's subtype code is an integer and this one is \"{}\", so the subtype was not written",
+                    subtype.code
+                )],
+            });
+            continue;
+        };
+        let mut default_values = serde_json::Map::new();
+        let mut domain_assignments = BTreeMap::new();
+        for info in &subtype.fields {
+            if let Some(default) = &info.default_value {
+                default_values.insert(
+                    info.name.clone(),
+                    serde_json::Value::String(default.clone()),
+                );
+                untyped.push(format!("{}.{}", subtype.name, info.name));
+            }
+            if let Some(domain) = &info.domain {
+                domain_assignments.insert(info.name.clone(), domain.clone());
+            }
+        }
+        subtypes.push(NewSubtype {
+            subtype_field: field.clone(),
+            name: subtype.name.clone(),
+            code,
+            default_values,
+            domain_assignments,
+        });
+    }
+    if !untyped.is_empty() {
+        conversions.push(Conversion {
+            location: table.name.clone(),
+            kind: ItemKind::AttributeSchema,
+            detail: format!("{} subtype default value{}", untyped.len(), plural(untyped.len())),
+            destination: format!("subtypes of {}", table.name),
+            losses: vec![format!(
+                "the defaults ({}) come out of the definition XML, which declares each one's type in an attribute verne does not read, so they were written as the text they appear as",
+                untyped.join(", ")
+            )],
+        });
+    }
+    subtypes
+}
+
+// ─── Relationship classes ───────────────────────────────────────────
+
+fn relationship_classes(
+    scan: &Scan,
+    plans: &[DatasetPlan],
+    placed: &mut Vec<(Item, Placed)>,
+) -> Vec<NewRelationship> {
+    let mut classes = Vec::new();
+    for relationship in scan
+        .relationships
+        .iter()
+        .filter(|held| held.related_table_type.as_deref() != Some("media"))
+    {
+        let item = verdict::relationship_item(relationship);
+        match new_relationship(relationship, plans) {
+            Ok(class) => {
+                placed.push((
+                    item,
+                    Placed::At(format!("relationship class {}", class.name)),
+                ));
+                classes.push(class);
+            }
+            Err(reason) => placed.push((item, Placed::Left(reason))),
+        }
+    }
+    classes
+}
+
+/// One class, with a many-to-one turned round.
+///
+/// ptolemy's cardinality is one of three and many-to-one is not among them, so
+/// the class is stored the other way about, which moves the key and the labels
+/// with it. The report already names this as the loss it is.
+fn new_relationship(
+    relationship: &Relationship,
+    plans: &[DatasetPlan],
+) -> Result<NewRelationship, String> {
+    let reversed = relationship.cardinality == "many to one";
+    let (origin, destination) = if reversed {
+        (&relationship.right_table, &relationship.left_table)
+    } else {
+        (&relationship.left_table, &relationship.right_table)
+    };
+    let (origin, destination) = (side(origin, plans)?, side(destination, plans)?);
+    // the key ptolemy wants is the one on the destination side that holds the
+    // origin's key, which is whichever field list belongs to that side
+    let keys = if reversed {
+        &relationship.left_fields
+    } else {
+        &relationship.right_fields
+    };
+    let key = keys.first().ok_or_else(|| {
+        format!(
+            "{} names no field on its {} side, and ptolemy's class is keyed on one",
+            relationship.name,
+            if reversed { "left" } else { "right" }
+        )
+    })?;
+    let (forward, backward) = if reversed {
+        (&relationship.backward_label, &relationship.forward_label)
+    } else {
+        (&relationship.forward_label, &relationship.backward_label)
+    };
+    Ok(NewRelationship {
+        name: relationship.name.clone(),
+        origin_dataset: origin,
+        destination_dataset: destination,
+        origin_foreign_key: key.clone(),
+        cardinality: cardinality(relationship.cardinality).to_string(),
+        forward_label: forward.clone().unwrap_or_default(),
+        backward_label: backward.clone().unwrap_or_default(),
+    })
+}
+
+/// The dataset one side of a class names, refused when nothing was extracted
+/// for it: ptolemy takes two dataset ids and there is no id for a table that
+/// never became a dataset.
+fn side(table: &Option<String>, plans: &[DatasetPlan]) -> Result<String, String> {
+    let name = table
+        .as_deref()
+        .ok_or_else(|| "the class names no table on one side".to_string())?;
+    if plans.iter().any(|plan| plan.source_table == name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!(
+            "{name} is not one of the tables this extraction turned into a dataset, and a relationship class in ptolemy names two dataset ids"
+        ))
+    }
+}
+
+fn cardinality(gdal: &str) -> &'static str {
+    match gdal {
+        "one to one" => "one_to_one",
+        "many to many" => "many_to_many",
+        // a many-to-one was turned round on the way here
+        _ => "one_to_many",
+    }
+}
+
+// ─── Type mapping ───────────────────────────────────────────────────
+
+/// ptolemy's name for a table's geometry, and what calling it that drops.
+///
+/// Every type is mapped here rather than left to ptolemy, which reads a name it
+/// does not know as `point` and says nothing about it.
+fn ptolemy_geometry(table: &Table) -> (&'static str, Vec<String>) {
+    use gdal::vector::OGRwkbGeometryType as Wkb;
+
+    let flat = crate::glue::flatten(table.geometry_code);
+    let mut losses = Vec::new();
+    if flat.has_z {
+        losses.push(
+            "the class carries a Z ordinate and ptolemy's geometry_type names 2D shapes only, so the dataset does not declare it".to_string(),
+        );
+    }
+    if flat.has_m {
+        losses.push(
+            "the class carries an M ordinate and ptolemy's geometry_type names 2D shapes only, so the dataset does not declare it".to_string(),
+        );
+    }
+    let name = match flat.code {
+        Wkb::wkbPoint => "point",
+        Wkb::wkbLineString => "linestring",
+        Wkb::wkbPolygon => "polygon",
+        Wkb::wkbMultiPoint => "multipoint",
+        Wkb::wkbMultiLineString => "multilinestring",
+        Wkb::wkbMultiPolygon => "multipolygon",
+        Wkb::wkbGeometryCollection => "geometrycollection",
+        // a table with no geometry still needs a name in the column; anything
+        // else is a shape ptolemy has no narrower word for
+        _ => {
+            if table.geometry.is_some() {
+                losses.push(format!(
+                    "{} is a shape ptolemy has no name for, so the dataset is declared as holding any geometry",
+                    table.geometry.as_deref().unwrap_or("the geometry")
+                ));
+            }
+            "geometry"
+        }
+    };
+    (name, losses)
+}
+
+/// ptolemy's name for the field type a domain applies to, and what is lost
+/// where its three names do not reach.
+fn ptolemy_field_type(gdal: &str) -> (&'static str, Option<String>) {
+    match gdal {
+        "String" => ("string", None),
+        "Integer" | "Integer64" => ("integer", None),
+        "Real" => ("float", None),
+        other => (
+            "string",
+            Some(format!(
+                "the domain constrains a {other} field, and ptolemy's domains are documented as constraining a string, an integer or a float, so it was recorded as a string"
+            )),
+        ),
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plans(names: &[&str]) -> Vec<DatasetPlan> {
+        names
+            .iter()
+            .map(|name| DatasetPlan {
+                source_table: (*name).to_string(),
+                layer: None,
+                dataset: NewDataset {
+                    name: (*name).to_string(),
+                    srid: DEFAULT_SRID,
+                    geometry_type: "point".into(),
+                    created_by: "operator".into(),
+                },
+                domains: Vec::new(),
+                subtypes: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn relationship(cardinality: &'static str) -> Relationship {
+        Relationship {
+            name: "pads_wells".into(),
+            cardinality,
+            kind: "association",
+            related_table_type: Some("features".into()),
+            left_table: Some("pads".into()),
+            right_table: Some("wells".into()),
+            left_fields: vec!["well_id".into()],
+            right_fields: vec!["OBJECTID".into()],
+            mapping_table: None,
+            forward_label: Some("sits on well".into()),
+            backward_label: Some("has pads".into()),
+        }
+    }
+
+    /// OpenFileGDB will not write a many-to-one class, so this is the one path
+    /// no fixture can reach: ptolemy has no such cardinality, and the report
+    /// already says the class has to be stored the other way about. Storing it
+    /// that way moves the key and the labels with it.
+    #[test]
+    fn a_many_to_one_class_is_turned_round() {
+        let plans = plans(&["pads", "wells"]);
+        let class = new_relationship(&relationship("many to one"), &plans).expect("turned round");
+
+        assert_eq!(class.origin_dataset, "wells");
+        assert_eq!(class.destination_dataset, "pads");
+        assert_eq!(class.cardinality, "one_to_many");
+        // the key ptolemy wants is the one on whichever table is now the
+        // destination, which is pads
+        assert_eq!(class.origin_foreign_key, "well_id");
+        assert_eq!(class.forward_label, "has pads");
+        assert_eq!(class.backward_label, "sits on well");
+    }
+
+    #[test]
+    fn an_ordinary_class_keeps_its_sides() {
+        let plans = plans(&["pads", "wells"]);
+        let class = new_relationship(&relationship("one to many"), &plans).expect("kept");
+
+        assert_eq!(class.origin_dataset, "pads");
+        assert_eq!(class.destination_dataset, "wells");
+        assert_eq!(class.origin_foreign_key, "OBJECTID");
+        assert_eq!(class.forward_label, "sits on well");
+    }
+
+    /// ptolemy's class names two dataset ids, and a table that never became a
+    /// dataset has none.
+    #[test]
+    fn a_class_naming_a_table_with_no_dataset_is_refused() {
+        let plans = plans(&["pads"]);
+        let refused = new_relationship(&relationship("one to many"), &plans).expect_err("refused");
+        assert!(
+            refused.contains("wells is not one of the tables"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_many_to_many_class_keeps_its_cardinality() {
+        assert_eq!(cardinality("many to many"), "many_to_many");
+        assert_eq!(cardinality("one to one"), "one_to_one");
+    }
+}

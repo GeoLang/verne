@@ -66,6 +66,26 @@ unsafe fn string_list(list: *mut *mut c_char) -> Vec<String> {
     out
 }
 
+/// A geometry type split into the flat shape and the dimensions hung off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flat {
+    pub code: gdal_sys::OGRwkbGeometryType::Type,
+    pub has_z: bool,
+    pub has_m: bool,
+}
+
+/// The 2D type behind a geometry type, and whether the original carried Z or M.
+/// Pure arithmetic on the type code: no dataset and no pointers.
+pub fn flatten(code: gdal_sys::OGRwkbGeometryType::Type) -> Flat {
+    unsafe {
+        Flat {
+            code: gdal_sys::OGR_GT_Flatten(code),
+            has_z: gdal_sys::OGR_GT_HasZ(code) != 0,
+            has_m: gdal_sys::OGR_GT_HasM(code) != 0,
+        }
+    }
+}
+
 /// How a domain constrains a field.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DomainKind {

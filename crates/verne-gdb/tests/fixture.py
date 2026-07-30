@@ -56,6 +56,9 @@ def build(path):
     inspections = ds.CreateLayer("inspections", None, ogr.wkbNone)
     inspections.CreateField(ogr.FieldDefn("well_id", ogr.OFTInteger))
     inspections.CreateField(ogr.FieldDefn("note", ogr.OFTString))
+    # a second table bound to the same domain: one domain in the geodatabase
+    # becomes one per dataset in ptolemy
+    inspections.CreateField(ogr.FieldDefn("status", ogr.OFTString))
 
     coded = ogr.CreateCodedFieldDomain(
         "status_codes",
@@ -70,13 +73,17 @@ def build(path):
     )
     ok(ds.AddFieldDomain(drilled), "add the depth_range domain")
 
-    wells = ds.GetLayerByName("wells")
-    for field_name, domain_name in (("status", "status_codes"), ("depth", "depth_range")):
-        index = wells.GetLayerDefn().GetFieldIndex(field_name)
-        current = wells.GetLayerDefn().GetFieldDefn(index)
+    for layer_name, field_name, domain_name in (
+        ("wells", "status", "status_codes"),
+        ("wells", "depth", "depth_range"),
+        ("inspections", "status", "status_codes"),
+    ):
+        layer = ds.GetLayerByName(layer_name)
+        index = layer.GetLayerDefn().GetFieldIndex(field_name)
+        current = layer.GetLayerDefn().GetFieldDefn(index)
         altered = ogr.FieldDefn(current.GetName(), current.GetType())
         altered.SetDomainName(domain_name)
-        wells.AlterFieldDefn(index, altered, ogr.ALTER_DOMAIN_FLAG)
+        layer.AlterFieldDefn(index, altered, ogr.ALTER_DOMAIN_FLAG)
 
     attach = ds.CreateLayer("wells__ATTACH", None, ogr.wkbNone)
     attach.CreateField(ogr.FieldDefn("REL_OBJECTID", ogr.OFTInteger))

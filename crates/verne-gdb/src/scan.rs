@@ -43,6 +43,12 @@ pub struct Table {
     pub role: TableRole,
     /// Geometry type as GDAL names it, absent for a table without geometry.
     pub geometry: Option<String>,
+    /// The raw OGR type behind `geometry`, `wkbNone` for a table without one.
+    /// An extraction maps this rather than the display name, which is prose.
+    pub geometry_code: gdal::vector::OGRwkbGeometryType::Type,
+    /// EPSG code of the layer's spatial reference. Absent when the layer has
+    /// none, or has one no authority names.
+    pub srid: Option<i32>,
     pub features: Option<u64>,
     pub fields: Vec<Field>,
     /// What the Esri definition blob says about it.
@@ -133,6 +139,8 @@ pub fn scan(dataset: &Dataset) -> Scan {
                 gdal::vector::OGRwkbGeometryType::wkbNone => None,
                 other => Some(geometry_type_to_name(other)),
             },
+            geometry_code: geometry_type,
+            srid: epsg(defn),
             // a count GDAL would have to walk the table for is not worth it
             features: layer.try_feature_count(),
             fields,
@@ -179,6 +187,17 @@ pub fn scan(dataset: &Dataset) -> Scan {
         .collect();
     scan.catalog = catalog(dataset, &inventoried);
     scan
+}
+
+/// The EPSG code of a layer's spatial reference. Only EPSG counts: ptolemy's
+/// srid is a code in that authority and nothing else, so a reference from
+/// another authority is no code at all rather than one silently reused.
+fn epsg(defn: &gdal::vector::Defn) -> Option<i32> {
+    let spatial_ref = defn.geom_fields().next()?.spatial_ref().ok()?;
+    if spatial_ref.auth_name().as_deref() != Some("EPSG") {
+        return None;
+    }
+    spatial_ref.auth_code().ok()
 }
 
 /// GDAL returns the field name again when a field has no alias.

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::{Serialize, Serializer, ser::SerializeSeq, ser::SerializeStruct};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeSeq, ser::SerializeStruct};
 
 /// Where an inventoried thing would land in GeoLang.
 ///
@@ -213,7 +213,7 @@ impl fmt::Display for Outcome {
 ///
 /// These recur across platforms. Add a variant when an adapter meets something
 /// none of them describes, not in advance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemKind {
     /// Features with geometry, counted per container.
@@ -299,7 +299,7 @@ impl Item {
 }
 
 /// What a source is, before saying what is in it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDescription {
     /// The format or platform, as an operator would name it.
     pub format: String,

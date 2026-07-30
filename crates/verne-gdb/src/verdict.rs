@@ -89,56 +89,59 @@ fn drawn_classes(scan: &Scan, items: &mut Vec<Item>) {
 /// Esri subtypes go to ptolemy's subtypes table. GDAL does not model them, so
 /// they come out of the layer definition XML.
 fn subtypes(scan: &Scan, items: &mut Vec<Item>) {
-    for table in scan.user_tables() {
-        let definition = &table.definition;
-        if definition.subtypes.is_empty() {
-            continue;
-        }
-        let Some(field) = &definition.subtype_field else {
-            continue;
-        };
-        let listed: Vec<String> = definition
-            .subtypes
-            .iter()
-            .map(|subtype| format!("{} {}", subtype.code, subtype.name))
-            .collect();
-        let mut detail = format!(
-            "{} subtype{} on {}.{}: {}",
-            definition.subtypes.len(),
-            plural(definition.subtypes.len()),
-            table.name,
-            field,
-            listed.join(", ")
-        );
-        if let Some(default) = &definition.default_subtype {
-            detail.push_str(&format!(", default {default}"));
-        }
+    items.extend(scan.user_tables().filter_map(subtype_item));
+}
 
-        let mut losses = Vec::new();
-        if definition.default_subtype.is_some() {
-            losses.push(
-                "ptolemy's subtypes table has no column saying which code is the default, so a new feature gets no subtype unless something else picks one".to_string(),
-            );
-        }
-        let assigned: Vec<String> = definition
-            .subtypes
-            .iter()
-            .flat_map(|subtype| subtype.fields.iter())
-            .filter_map(|field| field.domain.clone())
-            .collect();
-        if !assigned.is_empty() {
-            losses.push(format!(
-                "the per-subtype domain assignments name domains ({}), and ptolemy's domain_assignments holds the id of a domain row, so the domains have to be loaded first and their names swapped for ids",
-                dedup(assigned).join(", ")
-            ));
-        }
-        items.push(Item::new(
-            table.name.clone(),
-            ItemKind::AttributeSchema,
-            detail,
-            verdict_for(Target::Ptolemy, losses),
+/// The one subtype row for a table, absent when the table has no subtypes or
+/// no field to key them on. Public to the crate so an extraction can ask for
+/// the verdict on the thing it just wrote instead of guessing which row it was.
+pub fn subtype_item(table: &Table) -> Option<Item> {
+    let definition = &table.definition;
+    if definition.subtypes.is_empty() {
+        return None;
+    }
+    let field = definition.subtype_field.as_ref()?;
+    let listed: Vec<String> = definition
+        .subtypes
+        .iter()
+        .map(|subtype| format!("{} {}", subtype.code, subtype.name))
+        .collect();
+    let mut detail = format!(
+        "{} subtype{} on {}.{}: {}",
+        definition.subtypes.len(),
+        plural(definition.subtypes.len()),
+        table.name,
+        field,
+        listed.join(", ")
+    );
+    if let Some(default) = &definition.default_subtype {
+        detail.push_str(&format!(", default {default}"));
+    }
+
+    let mut losses = Vec::new();
+    if definition.default_subtype.is_some() {
+        losses.push(
+            "ptolemy's subtypes table has no column saying which code is the default, so a new feature gets no subtype unless something else picks one".to_string(),
+        );
+    }
+    let assigned: Vec<String> = definition
+        .subtypes
+        .iter()
+        .flat_map(|subtype| subtype.fields.iter())
+        .filter_map(|field| field.domain.clone())
+        .collect();
+    if !assigned.is_empty() {
+        losses.push(format!(
+            "the per-subtype domain assignments name domains ({}), and ptolemy's domain_assignments holds the id of a domain row, so the domains have to be loaded first and their names swapped for ids",
+            dedup(assigned).join(", ")
         ));
     }
+    Some(Item::new(
+        table.name.clone(),
+        ItemKind::AttributeSchema,
+        detail,
+        verdict_for(Target::Ptolemy, losses),
+    ))
 }
 
 fn dedup(mut values: Vec<String>) -> Vec<String> {
@@ -301,14 +304,17 @@ fn versioning(items: &mut Vec<Item>) {
 }
 
 fn tables(scan: &Scan, items: &mut Vec<Item>) {
-    for table in scan.user_tables() {
-        items.push(Item::new(
-            table.name.clone(),
-            ItemKind::FeatureCollection,
-            detail(table),
-            verdict_for(Target::Ptolemy, table_losses(table)),
-        ));
-    }
+    items.extend(scan.user_tables().map(table_item));
+}
+
+/// The row for one feature class or table.
+pub fn table_item(table: &Table) -> Item {
+    Item::new(
+        table.name.clone(),
+        ItemKind::FeatureCollection,
+        detail(table),
+        verdict_for(Target::Ptolemy, table_losses(table)),
+    )
 }
 
 fn detail(table: &Table) -> String {
@@ -393,21 +399,25 @@ fn table_losses(table: &Table) -> Vec<String> {
 /// A domain goes to ptolemy's domains table: coded values as JSON, a range as
 /// two double precision bounds. What is left is what those columns do not have.
 fn domains(scan: &Scan, items: &mut Vec<Item>) {
-    for domain in &scan.domains {
-        let users = scan.domain_users(&domain.name);
-        let verdict = match &domain.kind {
-            DomainKind::Glob => Verdict::unsupported(
-                "a glob domain constrains a field by pattern, and ptolemy's domains are a coded list or a numeric range; OpenFileGDB refuses to read one, so this came from another driver",
-            ),
-            _ => verdict_for(Target::Ptolemy, domain_losses(domain, &users)),
-        };
-        items.push(Item::new(
-            ROOT,
-            ItemKind::AttributeSchema,
-            domain_detail(domain, &users),
-            verdict,
-        ));
-    }
+    items.extend(scan.domains.iter().map(|domain| domain_item(scan, domain)));
+}
+
+/// The row for one domain. The scan is needed as well as the domain: which
+/// fields are bound to it is part of both the detail and the loss.
+pub fn domain_item(scan: &Scan, domain: &Domain) -> Item {
+    let users = scan.domain_users(&domain.name);
+    let verdict = match &domain.kind {
+        DomainKind::Glob => Verdict::unsupported(
+            "a glob domain constrains a field by pattern, and ptolemy's domains are a coded list or a numeric range; OpenFileGDB refuses to read one, so this came from another driver",
+        ),
+        _ => verdict_for(Target::Ptolemy, domain_losses(domain, &users)),
+    };
+    Item::new(
+        ROOT,
+        ItemKind::AttributeSchema,
+        domain_detail(domain, &users),
+        verdict,
+    )
 }
 
 fn domain_detail(domain: &Domain, users: &[String]) -> String {
@@ -484,14 +494,23 @@ fn domain_losses(domain: &Domain, users: &[String]) -> Vec<String> {
 /// more columns than the create route fills, so some of this stops at the API.
 fn relationships(scan: &Scan, items: &mut Vec<Item>) {
     // an attachment relationship is reported with its blob table instead
-    for relationship in scan.relationships.iter().filter(|held| !is_media(held)) {
-        items.push(Item::new(
-            ROOT,
-            ItemKind::Relationship,
-            relationship_detail(relationship),
-            verdict_for(Target::Ptolemy, relationship_losses(relationship)),
-        ));
-    }
+    items.extend(
+        scan.relationships
+            .iter()
+            .filter(|held| !is_media(held))
+            .map(relationship_item),
+    );
+}
+
+/// The row for one relationship class. Only for a class that is not an
+/// attachment: a media class is reported with its blob table.
+pub fn relationship_item(relationship: &Relationship) -> Item {
+    Item::new(
+        ROOT,
+        ItemKind::Relationship,
+        relationship_detail(relationship),
+        verdict_for(Target::Ptolemy, relationship_losses(relationship)),
+    )
 }
 
 fn relationship_detail(relationship: &Relationship) -> String {

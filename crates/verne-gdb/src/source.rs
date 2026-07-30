@@ -23,12 +23,18 @@ pub enum GdbError {
         "the geodatabase holds no tables at all; an empty inventory must not be mistaken for a clean source"
     )]
     NothingFound,
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// A file geodatabase on disk, opened for reading and nothing else.
 pub struct GdbSource {
     path: PathBuf,
-    dataset: Dataset,
+    pub(crate) dataset: Dataset,
 }
 
 impl GdbSource {

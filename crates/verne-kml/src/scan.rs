@@ -29,6 +29,10 @@ const GEOMETRIES: &[&str] = &[
 /// settings inside it belong to that row rather than to the container.
 const OWN_ROW_GEOMETRY: &[&str] = &["Model", "gx:Track", "gx:MultiTrack"];
 
+/// Elements that open a track. A gx:Track inside a gx:MultiTrack is a segment
+/// of it rather than a track of its own.
+const TRACK_ELEMENTS: &[&str] = &["gx:Track", "gx:MultiTrack"];
+
 #[derive(Debug)]
 pub struct Container {
     pub element: String,
@@ -75,6 +79,23 @@ pub struct Schema {
     pub fields: Vec<Field>,
 }
 
+/// A gx:Track or gx:MultiTrack: the timed samples of one moving thing.
+#[derive(Debug)]
+pub struct Track {
+    pub container: Option<usize>,
+    /// Name of the placemark holding it, which is all a trajectory row carries.
+    pub name: Option<String>,
+    pub multi: bool,
+    /// How many gx:Track it holds, one unless it is a gx:MultiTrack.
+    pub segments: usize,
+    pub samples: usize,
+    /// A gx:coord with a third value that is not zero.
+    pub altitude: bool,
+    pub angles: bool,
+    pub array_data: bool,
+    pub partial_times: bool,
+}
+
 #[derive(Debug)]
 pub struct NetworkLink {
     pub name: Option<String>,
@@ -110,6 +131,7 @@ pub struct Scan {
     pub timestamps: usize,
     pub timespans: usize,
     pub partial_times: bool,
+    pub tracks: Vec<Track>,
     pub network_links: Vec<NetworkLink>,
     pub ground_overlays: Vec<GroundOverlay>,
     pub screen_overlays: usize,
@@ -161,6 +183,11 @@ struct Walk {
     schema: Option<usize>,
     network_link: Option<usize>,
     overlay: Option<usize>,
+    track: Option<usize>,
+    /// A placemark names its geometry before or after it, so the name is held
+    /// here and handed to the tracks opened inside the placemark at its end.
+    placemark_name: Option<String>,
+    placemark_tracks: usize,
     text: String,
 }
 
@@ -245,6 +272,9 @@ impl Walk {
         if crate::verdict::is_unruled(&name) {
             *self.scan.unruled.entry(name.clone()).or_insert(0) += 1;
         }
+        if TRACK_ELEMENTS.contains(&name.as_str()) {
+            self.open_track(&name);
+        }
 
         match name.as_str() {
             "kml" => self.scan.root_seen = true,
@@ -257,6 +287,8 @@ impl Walk {
             "Placemark" => {
                 self.in_placemark = true;
                 self.placemark_has_geometry = false;
+                self.placemark_name = None;
+                self.placemark_tracks = self.scan.tracks.len();
                 let index = self.container();
                 self.scan.containers[index].placemarks += 1;
             }
@@ -302,8 +334,10 @@ impl Walk {
                     });
                 }
             }
+            // ExtendedData inside a track holds per-sample columns rather than
+            // properties of the placemark, so the track row reports it instead.
             "ExtendedData" => {
-                if self.in_placemark {
+                if self.in_placemark && self.track.is_none() {
                     self.scan.data_placemarks += 1;
                 }
             }
@@ -312,7 +346,21 @@ impl Walk {
                     self.scan.data_keys.insert(key);
                 }
             }
-            "SchemaData" => self.scan.schema_data += 1,
+            "SchemaData" => {
+                if self.track.is_none() {
+                    self.scan.schema_data += 1;
+                }
+            }
+            "gx:angles" => {
+                if let Some(index) = self.track {
+                    self.scan.tracks[index].angles = true;
+                }
+            }
+            "gx:SimpleArrayData" => {
+                if let Some(index) = self.track {
+                    self.scan.tracks[index].array_data = true;
+                }
+            }
             "TimeStamp" => self.scan.timestamps += 1,
             "TimeSpan" => self.scan.timespans += 1,
             "NetworkLink" => {
@@ -389,11 +437,25 @@ impl Walk {
             }
             "Placemark" => {
                 self.in_placemark = false;
+                let placemark_name = self.placemark_name.take();
+                for track in &mut self.scan.tracks[self.placemark_tracks..] {
+                    track.name = placemark_name.clone();
+                }
                 if !self.placemark_has_geometry {
                     let index = self.container();
                     self.scan.containers[index].without_geometry += 1;
                 }
             }
+            "gx:Track" => {
+                // inside a gx:MultiTrack this ends a segment, not the record
+                if self
+                    .track
+                    .is_some_and(|index| !self.scan.tracks[index].multi)
+                {
+                    self.track = None;
+                }
+            }
+            "gx:MultiTrack" => self.track = None,
             "Style" => self.style = None,
             "StyleMap" => self.style_map = None,
             "Schema" => self.schema = None,
@@ -468,6 +530,23 @@ impl Walk {
                     self.scan.ground_overlays[index].tinted = true;
                 }
             }
+            "when" if self.track.is_some() => {
+                let index = self.track.expect("a track is open");
+                self.scan.tracks[index].samples += 1;
+                if !text.is_empty() && !text.contains('T') {
+                    self.scan.tracks[index].partial_times = true;
+                }
+            }
+            "gx:coord" => {
+                if let Some(index) = self.track
+                    && text
+                        .split_whitespace()
+                        .nth(2)
+                        .is_some_and(|alt| alt.parse::<f64>().is_ok_and(|metres| metres != 0.0))
+                {
+                    self.scan.tracks[index].altitude = true;
+                }
+            }
             "when" | "begin" | "end" if !text.is_empty() && !text.contains('T') => {
                 self.scan.partial_times = true;
             }
@@ -498,8 +577,29 @@ impl Walk {
                     self.scan.ground_overlays[index].name = Some(text);
                 }
             }
+            "Placemark" => self.placemark_name = Some(text),
             _ => {}
         }
+    }
+
+    fn open_track(&mut self, element: &str) {
+        if let Some(index) = self.track {
+            self.scan.tracks[index].segments += 1;
+            return;
+        }
+        let multi = element == "gx:MultiTrack";
+        self.scan.tracks.push(Track {
+            container: self.open_containers.last().copied(),
+            name: None,
+            multi,
+            segments: usize::from(!multi),
+            samples: 0,
+            altitude: false,
+            angles: false,
+            array_data: false,
+            partial_times: false,
+        });
+        self.track = Some(self.scan.tracks.len() - 1);
     }
 
     fn take_href(&mut self, text: String) {

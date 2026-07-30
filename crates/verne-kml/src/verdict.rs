@@ -4,87 +4,47 @@
 use verne_core::{Item, ItemKind, Losses, Target, Verdict};
 
 use crate::ArchiveEntry;
-use crate::scan::{Scan, Style};
+use crate::scan::{Scan, Style, Track};
 
 /// Elements verne recognises but has no per-instance rule for. Reported by
-/// count so nothing found in the file goes unmentioned.
+/// count so nothing found in the file goes unmentioned. Every one of them has
+/// no home at all: anything GeoLang can hold is inventoried per instance.
 struct Rule {
     element: &'static str,
     kind: ItemKind,
-    outcome: RuleOutcome,
-}
-
-enum RuleOutcome {
-    Approximated {
-        target: Target,
-        loss: &'static str,
-        also: &'static [&'static str],
-    },
-    Unsupported {
-        reason: &'static str,
-    },
+    reason: &'static str,
 }
 
 const RULES: &[Rule] = &[
     Rule {
         element: "Model",
         kind: ItemKind::Mesh,
-        outcome: RuleOutcome::Unsupported {
-            reason: "a COLLADA mesh placed at a point: not a geometry ptolemy stores, and interiora holds building and indoor models rather than arbitrary meshes",
-        },
+        reason: "a COLLADA mesh placed at a point: not a geometry ptolemy stores, and interiora holds building and indoor models rather than arbitrary meshes",
     },
     Rule {
         element: "PhotoOverlay",
         kind: ItemKind::RasterOverlay,
-        outcome: RuleOutcome::Unsupported {
-            reason: "an image pinned to a camera frustum; terrano registers rasters to the ground, not to a viewpoint",
-        },
+        reason: "an image pinned to a camera frustum; terrano registers rasters to the ground, not to a viewpoint",
     },
     Rule {
         element: "gx:Tour",
         kind: ItemKind::ViewDependentDisplay,
-        outcome: RuleOutcome::Unsupported {
-            reason: "a scripted camera flight, which is presentation rather than data",
-        },
-    },
-    Rule {
-        element: "gx:Track",
-        kind: ItemKind::FeatureCollection,
-        outcome: RuleOutcome::Approximated {
-            target: Target::Ptolemy,
-            loss: "the when/coord samples flatten into an ordinary line with the times alongside, so nothing reads it back as a trajectory",
-            also: &["per-sample angles and gx:SimpleArrayData columns are dropped"],
-        },
-    },
-    Rule {
-        element: "gx:MultiTrack",
-        kind: ItemKind::FeatureCollection,
-        outcome: RuleOutcome::Approximated {
-            target: Target::Ptolemy,
-            loss: "the tracks flatten into ordinary lines with the times alongside, so nothing reads them back as trajectories",
-            also: &["the gap between consecutive tracks, which KML models explicitly, is lost"],
-        },
+        reason: "a scripted camera flight, which is presentation rather than data",
     },
     Rule {
         element: "LookAt",
         kind: ItemKind::ViewDependentDisplay,
-        outcome: RuleOutcome::Unsupported {
-            reason: "a saved viewpoint with tilt, range and heading; GeoLang stores no camera, so a reader opens on the data extent instead",
-        },
+        reason: "a saved viewpoint with tilt, range and heading; GeoLang stores no camera, so a reader opens on the data extent instead",
     },
     Rule {
         element: "Camera",
         kind: ItemKind::ViewDependentDisplay,
-        outcome: RuleOutcome::Unsupported {
-            reason: "a saved camera position; GeoLang stores no camera, so a reader opens on the data extent instead",
-        },
+        reason: "a saved camera position; GeoLang stores no camera, so a reader opens on the data extent instead",
     },
     Rule {
         element: "NetworkLinkControl",
         kind: ItemKind::ExternalReference,
-        outcome: RuleOutcome::Unsupported {
-            reason: "refresh instructions for a live link, which only mean something to the server that sent them",
-        },
+        reason: "refresh instructions for a live link, which only mean something to the server that sent them",
     },
 ];
 
@@ -139,6 +99,7 @@ pub fn items(scan: &Scan, archive: &[ArchiveEntry]) -> Vec<Item> {
     document_metadata(scan, &root, &mut items);
     hierarchy(scan, &root, &mut items);
     features(scan, &mut items);
+    tracks(scan, &mut items);
     schemas(scan, &mut items);
     extended_data(scan, &root, &mut items);
     styles(scan, &mut items);
@@ -259,6 +220,83 @@ fn features(scan: &Scan, items: &mut Vec<Item>) {
             verdict_for(Target::Ptolemy, losses),
         ));
     }
+}
+
+/// A track has a home now: ptolemy takes a name and an array of timed points,
+/// derives the period from them, and stores both on stock PostGIS as JSONB and
+/// on MobilityDB as a tgeompoint. What is left is what that row does not carry.
+fn tracks(scan: &Scan, items: &mut Vec<Item>) {
+    for track in &scan.tracks {
+        let location = match track.container {
+            Some(index) => scan.path(index),
+            None => scan.root_path(),
+        };
+        items.push(Item::new(
+            location,
+            ItemKind::FeatureCollection,
+            track_detail(track),
+            verdict_for(Target::Ptolemy, track_losses(track)),
+        ));
+    }
+}
+
+fn track_detail(track: &Track) -> String {
+    let element = if track.multi {
+        "gx:MultiTrack"
+    } else {
+        "gx:Track"
+    };
+    let name = match &track.name {
+        Some(name) => format!(" \"{name}\""),
+        None => String::new(),
+    };
+    let mut detail = format!("{element}{name}, ");
+    if track.multi {
+        detail.push_str(&format!(
+            "{} track{}, ",
+            track.segments,
+            plural(track.segments)
+        ));
+    }
+    detail.push_str(&format!(
+        "{} timed sample{}",
+        track.samples,
+        plural(track.samples)
+    ));
+    detail
+}
+
+fn track_losses(track: &Track) -> Vec<String> {
+    let mut losses = vec![
+        "a trajectory holds a name, its timed points and their period, and no feature_id, so the placemark's attributes, style and folder path stay on a separate feature with nothing joining the two".to_string(),
+        "only create, list and get run on stock PostGIS: speed, distance, position at a time, simplify and nearest approach are MobilityDB functions, so without that extension the samples are stored and read back as a line, a point count and a period, and nothing computes on them".to_string(),
+    ];
+    if track.multi {
+        losses.push(
+            "each gx:Track becomes a trajectory of its own, since ptolemy has no group of trajectories, so the gap KML models between consecutive tracks is only implied by their periods".to_string(),
+        );
+    }
+    if track.altitude {
+        losses.push(
+            "a gx:coord carries an altitude, and a trajectory point is a longitude, a latitude and a timestamp, so the third value is dropped".to_string(),
+        );
+    }
+    if track.angles {
+        losses.push(
+            "gx:angles gives each sample a heading, tilt and roll, which a trajectory point has no room for".to_string(),
+        );
+    }
+    if track.array_data {
+        losses.push(
+            "gx:SimpleArrayData columns are one value per sample, and a trajectory carries no properties of its own".to_string(),
+        );
+    }
+    if track.partial_times {
+        losses.push(
+            "KML allows a sample time such as 1997, and each point's timestamp is read as a timestamptz, so a partial date widens to an instant and nothing records that the precision was a year".to_string(),
+        );
+    }
+    losses
 }
 
 fn schemas(scan: &Scan, items: &mut Vec<Item>) {
@@ -567,17 +605,11 @@ fn unruled(scan: &Scan, root: &str, items: &mut Vec<Item>) {
         let Some(rule) = RULES.iter().find(|rule| rule.element == element) else {
             continue;
         };
-        let verdict = match &rule.outcome {
-            RuleOutcome::Approximated { target, loss, also } => {
-                Verdict::approximated(*target, Losses::one(*loss).and_all(also.iter().copied()))
-            }
-            RuleOutcome::Unsupported { reason } => Verdict::unsupported(*reason),
-        };
         items.push(Item::new(
             root,
             rule.kind,
             format!("{count} {element}"),
-            verdict,
+            Verdict::unsupported(rule.reason),
         ));
     }
 }

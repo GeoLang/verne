@@ -242,24 +242,71 @@ fn a_style_map_is_approximated_against_jung() {
 }
 
 #[test]
-fn a_model_has_no_home_and_a_track_is_approximated() {
+fn a_model_has_no_home_and_a_track_becomes_a_trajectory() {
     let body = r#"<Placemark><name>shed</name><Model><Location><longitude>1</longitude></Location></Model></Placemark>
-    <Placemark><name>run</name><gx:Track><when>2026-01-01T00:00:00Z</when><gx:coord>1 2 0</gx:coord></gx:Track></Placemark>"#;
+    <Placemark><name>run</name><gx:Track><when>2026-01-01T00:00:00Z</when><gx:coord>1 2 0</gx:coord><when>2026-01-01T00:01:00Z</when><gx:coord>3 4 0</gx:coord></gx:Track></Placemark>"#;
     let items = inventory(&doc(body));
 
     let mesh = only(&items, ItemKind::Mesh);
     assert_eq!(mesh.verdict.outcome(), Outcome::Unsupported);
     assert!(mesh.detail.contains("1 Model"));
 
-    let mut tracks = items.iter().filter(|item| item.detail == "1 gx:Track");
-    let track = tracks.next().expect("a gx:Track row");
-    assert!(tracks.next().is_none(), "more than one gx:Track row");
-    assert_eq!(track.kind, ItemKind::FeatureCollection);
+    // ptolemy takes a name and an array of timed points on stock PostGIS now, so
+    // the samples go across as a trajectory rather than as a line with times
+    let track = only_matching(&items, ItemKind::FeatureCollection, "gx:Track \"");
+    assert_eq!(track.detail, r#"gx:Track "run", 2 timed samples"#);
     assert_eq!(track.verdict.outcome(), Outcome::Approximated);
     assert_eq!(
         track.verdict.target().map(|t| t.component()),
         Some("ptolemy")
     );
+    let shortfall = track.verdict.shortfall();
+    assert!(!shortfall.contains("flatten"), "{shortfall}");
+    assert!(shortfall.contains("feature_id"), "{shortfall}");
+    assert!(shortfall.contains("MobilityDB"), "{shortfall}");
+    // nothing in this track carries altitude, angles or per-sample columns
+    assert!(!shortfall.contains("gx:angles"), "{shortfall}");
+    assert!(!shortfall.contains("altitude"), "{shortfall}");
+    assert!(!shortfall.contains("gx:SimpleArrayData"), "{shortfall}");
+    assert!(!shortfall.contains("1997"), "{shortfall}");
+}
+
+#[test]
+fn a_track_names_what_a_trajectory_row_cannot_hold() {
+    let body = r##"<Placemark><name>flight</name><gx:Track>
+      <when>1997</when><gx:coord>1 2 300</gx:coord><gx:angles>45 0 0</gx:angles>
+      <ExtendedData><SchemaData schemaUrl="#s"><gx:SimpleArrayData name="heartrate"><gx:value>120</gx:value></gx:SimpleArrayData></SchemaData></ExtendedData>
+    </gx:Track></Placemark>"##;
+    let items = inventory(&doc(body));
+    let track = only_matching(&items, ItemKind::FeatureCollection, "gx:Track \"");
+    let shortfall = track.verdict.shortfall();
+    assert!(shortfall.contains("altitude"), "{shortfall}");
+    assert!(shortfall.contains("gx:angles"), "{shortfall}");
+    assert!(shortfall.contains("gx:SimpleArrayData"), "{shortfall}");
+    assert!(shortfall.contains("1997"), "{shortfall}");
+    // the per-sample columns are the track's, so they must not also be counted
+    // as properties of the placemark
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.kind == ItemKind::AttributeSchema),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn a_multi_track_names_the_gap_between_its_tracks() {
+    let body = r#"<Placemark><name>tour</name><gx:MultiTrack>
+      <gx:Track><when>2026-01-01T00:00:00Z</when><gx:coord>1 2 0</gx:coord></gx:Track>
+      <gx:Track><when>2026-01-01T02:00:00Z</when><gx:coord>3 4 0</gx:coord></gx:Track>
+    </gx:MultiTrack></Placemark>"#;
+    let items = inventory(&doc(body));
+    let track = only_matching(&items, ItemKind::FeatureCollection, "gx:MultiTrack \"");
+    assert_eq!(
+        track.detail,
+        r#"gx:MultiTrack "tour", 2 tracks, 2 timed samples"#
+    );
+    assert!(track.verdict.shortfall().contains("gap"));
 }
 
 #[test]

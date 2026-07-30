@@ -151,13 +151,10 @@ fn read_back(source: &Dataset, path: &Path, tables: &[&str]) -> Result<Vec<Layer
     let written =
         Dataset::open(path).map_err(|e| format!("cannot reopen {}: {e}", path.display()))?;
     let names: Vec<String> = written.layers().map(|layer| layer.name()).collect();
+    let paired = pair(tables, &names).map_err(|e| format!("{e} in {}", path.display()))?;
+
     let mut layers = Vec::new();
-    for (index, table) in tables.iter().enumerate() {
-        // GDAL writes the layers in the order it was given them, so the one at
-        // this index is this table's however it ended up named
-        let name = names
-            .get(index)
-            .ok_or_else(|| format!("GDAL wrote no layer for {table} in {}", path.display()))?;
+    for (table, name) in paired {
         let layer = written
             .layer_by_name(name)
             .map_err(|e| format!("cannot read {name} back out of {}: {e}", path.display()))?;
@@ -169,6 +166,48 @@ fn read_back(source: &Dataset, path: &Path, tables: &[&str]) -> Result<Vec<Layer
         });
     }
     Ok(layers)
+}
+
+/// Which written layer is which source table.
+///
+/// By name, never by position. A GeoPackage lists its layers in its own order
+/// rather than the order it was handed them — on real data it puts the spatial
+/// ones first — so pairing by index hands most tables another table's layer,
+/// and every rename, dropped field and feature count then reads against the
+/// wrong one. The whole point of this file is a truthful account of what came
+/// out, so a wrong pairing is worse than no pairing.
+///
+/// A name GDAL could not use is the only reason a table is not itself, and
+/// attributing one takes a single candidate: guessing among several is what the
+/// positional version did.
+fn pair<'a>(tables: &[&'a str], names: &'a [String]) -> Result<Vec<(&'a str, &'a String)>, String> {
+    let unclaimed: Vec<&String> = names
+        .iter()
+        .filter(|name| !tables.contains(&name.as_str()))
+        .collect();
+
+    tables
+        .iter()
+        .map(|table| {
+            let name = match names.iter().find(|name| name.as_str() == *table) {
+                Some(name) => name,
+                None => match unclaimed.as_slice() {
+                    [only] => *only,
+                    [] => return Err(format!("GDAL wrote no layer for {table}")),
+                    several => {
+                        let list: Vec<&str> = several.iter().map(|n| n.as_str()).collect();
+                        return Err(format!(
+                            "no layer is named {table}, and {} of them answer to no table ({}), \
+                             so which one is {table} cannot be told",
+                            several.len(),
+                            list.join(", "),
+                        ));
+                    }
+                },
+            };
+            Ok((*table, name))
+        })
+        .collect()
 }
 
 /// Fields the source table had that the layer does not. GDAL renames a field a
@@ -199,5 +238,73 @@ fn last_error() -> String {
         "GDAL refused the conversion and gave no reason".to_string()
     } else {
         message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pair;
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// The bug this replaced. A real geodatabase comes back with its spatial
+    /// layers first, so the written order is not the order the tables were
+    /// handed over, and pairing by index gave every table another one's layer.
+    #[test]
+    fn a_reordered_geopackage_still_pairs_every_table_with_itself() {
+        let tables = [
+            "ExternalCrosswalk",
+            "NHDStatus",
+            "NHDWaterbody",
+            "N_1_Props",
+        ];
+        let written = names(&[
+            "NHDWaterbody",
+            "N_1_Props",
+            "ExternalCrosswalk",
+            "NHDStatus",
+        ]);
+
+        let paired = pair(&tables, &written).expect("the same names in another order pair up");
+
+        for (table, name) in paired {
+            assert_eq!(table, name.as_str(), "{table} was paired with {name}");
+        }
+    }
+
+    /// The case the positional version existed for, which still has to work.
+    #[test]
+    fn the_one_layer_no_table_answers_to_is_the_renamed_one() {
+        let tables = ["wells", "1_odd_name"];
+        let written = names(&["wells", "_1_odd_name"]);
+
+        let paired = pair(&tables, &written).expect("one rename is attributable");
+
+        assert_eq!(paired[0].1.as_str(), "wells");
+        assert_eq!(paired[1].1.as_str(), "_1_odd_name");
+    }
+
+    /// Two renames at once cannot be told apart, and guessing is what caused
+    /// the mispairing, so this says so instead.
+    #[test]
+    fn two_renames_at_once_are_refused_rather_than_guessed() {
+        let tables = ["1_odd", "2_odd"];
+        let written = names(&["_1_odd", "_2_odd"]);
+
+        let error = pair(&tables, &written).expect_err("ambiguous");
+
+        assert!(error.contains("cannot be told"), "{error}");
+    }
+
+    #[test]
+    fn a_table_with_no_layer_at_all_is_an_error() {
+        let tables = ["wells", "pads"];
+        let written = names(&["wells"]);
+
+        let error = pair(&tables, &written).expect_err("a lost table");
+
+        assert!(error.contains("no layer for pads"), "{error}");
     }
 }

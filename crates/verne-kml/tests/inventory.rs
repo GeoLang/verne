@@ -92,15 +92,18 @@ fn plain_points_are_faithful() {
 }
 
 #[test]
-fn mixed_geometry_types_are_approximated() {
+fn mixed_geometry_types_are_carried() {
     let body = format!(
         "<Folder><name>Mixed</name>{}<Placemark><name>p</name><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 1,0 1,1 0,0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark></Folder>",
         point("a")
     );
     let items = inventory(&doc(&body));
     let features = only(&items, ItemKind::FeatureCollection);
-    assert_eq!(features.verdict.outcome(), Outcome::Approximated);
-    assert!(features.verdict.shortfall().contains("geometry_type"));
+    // a ptolemy dataset can declare the geometry type 'geometry', so mixing
+    // point and polygon costs nothing and forces no split
+    assert_eq!(features.verdict.outcome(), Outcome::Faithful);
+    assert!(features.detail.contains("1 Point"), "{}", features.detail);
+    assert!(features.detail.contains("1 Polygon"), "{}", features.detail);
 }
 
 #[test]

@@ -229,13 +229,9 @@ fn features(scan: &Scan, items: &mut Vec<Item>) {
                 container.without_geometry
             ));
         }
+        // a mixed container is carried now: a ptolemy dataset can declare the
+        // geometry type 'geometry', so it no longer has to split by type
         let mut losses = Vec::new();
-        if container.geometries.len() > 1 {
-            losses.push(format!(
-                "the container mixes {} geometry types, and a ptolemy dataset declares one geometry_type, so it has to split into a dataset per type or leave the declared type wrong",
-                container.geometries.len()
-            ));
-        }
         if container.without_geometry > 0 {
             losses.push(format!(
                 "{} placemark{} carr{} no geometry; ptolemy's geometry column accepts null but a null geometry there records a deletion, so attribute-only placemarks need a convention of their own",
@@ -431,19 +427,24 @@ fn temporal(scan: &Scan, root: &str, items: &mut Vec<Item>) {
         return;
     }
     let detail = format!("{} TimeStamp, {} TimeSpan", scan.timestamps, scan.timespans);
-    let mut losses = Losses::one(
-        "times land as attribute values, so nothing in GeoLang filters, animates or slices by them",
-    );
+    // a TimeSpan is carried now: a feature version has a half-open valid range
+    // and the features endpoint filters on it
+    let mut losses = Vec::new();
+    if scan.timestamps > 0 {
+        losses.push(
+            "a TimeStamp is an instant, and a valid range is the nearest thing to it, so an open-ended range reads as valid from that moment onwards rather than at it".to_string(),
+        );
+    }
     if scan.partial_times {
-        losses = losses.and(
-            "KML allows partial dates such as 1997 or 1997-07, which stay strings rather than instants",
+        losses.push(
+            "KML allows partial dates such as 1997 or 1997-07, and a timestamptz cannot record that the precision was a year or a month".to_string(),
         );
     }
     items.push(Item::new(
         root,
         ItemKind::Temporal,
         detail,
-        Verdict::approximated(Target::Ptolemy, losses),
+        verdict_for(Target::Ptolemy, losses),
     ));
 }
 
@@ -550,12 +551,13 @@ fn embedded(archive: &[ArchiveEntry], items: &mut Vec<Item>) {
         "kmz archive",
         ItemKind::EmbeddedResource,
         format!("{} files, {} bytes: {}", names.len(), bytes, names.join(", ")),
+        // an attachment can belong to a dataset now, so a style's icon has a
+        // carrier without inventing a feature to hang it on
         Verdict::approximated(
             Target::Ptolemy,
             Losses::one(
-                "ptolemy stores an attachment against a feature and a branch, but an icon or overlay image referenced by a style belongs to no feature, so it needs a carrier of its own",
-            )
-            .and("the archive addresses these by relative path from the KML, so every href has to be rewritten to an attachment URL"),
+                "the archive addresses these by relative path from the KML, so every href has to be rewritten to an attachment URL",
+            ),
         ),
     ));
 }

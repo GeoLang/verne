@@ -27,6 +27,10 @@ use verne_load::Loader;
 /// POINT (1 2) as hex WKB, which is what an extraction writes.
 const POINT: &str = "0101000000000000000000f03f0000000000000040";
 
+/// The same well as its source recorded it, a projected point a transform
+/// would have moved. It must come back byte for byte, not close.
+const NATIVE_POINT: &str = "0101000000adfb5e7cc4841f41e92631c9c0ba5141";
+
 /// An empty geometry collection: the convention for a row from a table with no
 /// geometry, since ptolemy's insert takes a geometry and reads a null one as a
 /// deletion.
@@ -70,6 +74,8 @@ fn an_extraction(suffix: &str) -> Extraction {
                 .as_object()
                 .expect("an object")
                 .clone(),
+            native_geometry_wkb_hex: Some(NATIVE_POINT.into()),
+            native_srid: Some(26919),
         }],
     );
     // a table with no geometry, which is the case the empty geometry
@@ -81,6 +87,8 @@ fn an_extraction(suffix: &str) -> Extraction {
             feature_id: inspection,
             geometry_wkb_hex: EMPTY.into(),
             properties: serde_json::Map::new(),
+            native_geometry_wkb_hex: None,
+            native_srid: None,
         }],
     );
     std::fs::create_dir_all(directory.path().join("attachments")).expect("attachments dir");
@@ -386,6 +394,25 @@ fn the_features_and_their_attachment_come_back_off_the_branch() {
     assert_eq!(listed[0]["id"].as_str(), Some(expected_feature.as_str()));
     assert_eq!(listed[0]["properties"]["well_name"], "Alpha", "{features}");
     assert_eq!(listed[0]["properties"]["depth"], 120, "{features}");
+
+    // the original coordinates come back exactly as the extraction wrote them,
+    // with the code that says what they are in
+    let native: serde_json::Value = client
+        .get(format!(
+            "{}/api/v1/branches/{branch}/features/{expected_feature}/native",
+            live.url
+        ))
+        .bearer_auth(&live.token)
+        .send()
+        .expect("the native geometry")
+        .json()
+        .expect("json");
+    assert_eq!(
+        native["native_geometry_wkb_hex"].as_str(),
+        Some(NATIVE_POINT),
+        "{native}"
+    );
+    assert_eq!(native["native_srid"], 26919, "{native}");
 
     // the blob comes back byte for byte, with the content type the source row
     // declared, off the feature it belongs to and not off the dataset

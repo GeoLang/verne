@@ -122,7 +122,8 @@ features.gpkg — the features and attributes in the source's own spatial
                 the feature id rather than as a field.
 features/     — one file per dataset, one line of JSON per feature, each line a
                 whole insert operation of ptolemy's commit route, transformed
-                to EPSG:4326 because that is the only reference ptolemy holds
+                to EPSG:4326, ptolemy's working reference, with the untouched
+                original beside it where its reference has an EPSG code
 attachments/  — the blobs out of the __ATTACH tables, one file each
 sidecar.json  — the datasets, their column schemas, coded and range domains,
                 subtypes, relationship classes and attachments to create in
@@ -256,7 +257,7 @@ only and nothing in ptolemy records that the dataset holds them.
 
 ptolemy's commit hands every WKB to `ST_GeomFromWKB(..., 4326)`, on insert and
 on update, so EPSG:4326 is not a default that could be talked out of: it is the
-only thing the geometry column ever holds. **The features that go to ptolemy are
+only thing the working geometry column ever holds. **The features that go to ptolemy are
 transformed into 4326 by GDAL. The GeoPackage is not touched and keeps the
 source's own reference.** A GeoPackage holds any CRS and it is the artefact a
 reader keeps, so reprojecting it would be a loss taken for nothing. The two
@@ -273,9 +274,15 @@ class for exactly this, one point on the zone's central meridian at easting
 500000, and the test asserts what the loader would send is near 69 degrees west
 rather than anywhere near 500000.
 
-Every dataset therefore declares `srid` 4326, because that is what its geometry
-is by the time ptolemy has it. What the class was in is in the GeoPackage and in
-the extraction log, and the report names losing it.
+Every dataset therefore declares `srid` 4326, because that is what its working
+geometry is by the time ptolemy has it. The original is not lost with it: when
+the class's reference has an EPSG code, every transformed feature also carries
+`native_geometry_wkb_hex` and `native_srid`, the untouched geometry and the
+code it is in, which ptolemy stores beside the working copy and returns byte
+for byte from `GET /branches/{id}/features/{feature}/native`. A reference no
+single code names, such as NAD83 with NAVD88 height, cannot be stated that way,
+so its original stays in the GeoPackage alone and the log says which it is per
+class.
 
 The transformation itself is the cost, and it is GDAL's: verne does no
 coordinate arithmetic. PROJ picks the coordinate operation for the pair of

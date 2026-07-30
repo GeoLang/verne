@@ -298,26 +298,35 @@ fn write_table(
         })
         .collect();
 
+    // the original rides beside the transformed copy only when its reference
+    // has an EPSG code to store it under, since that is how ptolemy names one.
+    // a codeless reference keeps its original in the GeoPackage alone, and the
+    // losses say so
+    let original_srid = if transform.is_some() { table.srid } else { None };
+
     let mut minted = key_field.map(|_| BTreeMap::new());
     let mut tally = Tally::default();
     for feature in layer.features() {
         tally.read += 1;
         let id = uuid::Uuid::now_v7().to_string();
-        let geometry = match feature
-            .geometry()
-            .map(|geometry| wkb_hex(geometry, transform.as_deref()))
-        {
-            Some(Ok(hex)) => hex,
-            // a geometry GDAL will not transform or will not export is still a
-            // row, and the row is carried with the shape left out rather than
-            // dropped
-            Some(Err(_)) => {
-                tally.unwritable += 1;
-                EMPTY_GEOMETRY.to_string()
-            }
+        let (geometry, native) = match feature.geometry() {
+            Some(shape) => match wkb_hex(shape, transform.as_deref()) {
+                Ok(hex) => {
+                    let native = original_srid
+                        .and_then(|srid| wkb_hex(shape, None).ok().map(|original| (original, srid)));
+                    (hex, native)
+                }
+                // a geometry GDAL will not transform or will not export is
+                // still a row, and the row is carried with the shape left out
+                // rather than dropped
+                Err(_) => {
+                    tally.unwritable += 1;
+                    (EMPTY_GEOMETRY.to_string(), None)
+                }
+            },
             None => {
                 tally.shapeless += 1;
-                EMPTY_GEOMETRY.to_string()
+                (EMPTY_GEOMETRY.to_string(), None)
             }
         };
         let mut properties = serde_json::Map::new();
@@ -326,10 +335,16 @@ fn write_table(
                 properties.insert((*name).to_string(), value);
             }
         }
+        let (native_hex, native_srid) = match native {
+            Some((hex, srid)) => (Some(hex), Some(srid)),
+            None => (None, None),
+        };
         let line = serde_json::to_string(&NewFeature {
             feature_id: id.clone(),
             geometry_wkb_hex: geometry,
             properties,
+            native_geometry_wkb_hex: native_hex,
+            native_srid,
         })
         .map_err(|error| GdbError::Features {
             table: table.name.clone(),
@@ -393,9 +408,14 @@ fn feature_losses(table: &Table, tally: &Tally, transformed_from: Option<&str>) 
     // the one place the two outputs are said to differ, against the file that
     // differs from the other
     if let Some(from) = transformed_from {
-        losses.push(format!(
-            "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the only reference ptolemy stores; {GEOPACKAGE_FILE} beside it keeps the class in {from}, so the two files hold different coordinates for the same features on purpose"
-        ));
+        losses.push(match table.srid {
+            Some(code) => format!(
+                "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. the untransformed original rides on each insert as EPSG:{code} and ptolemy keeps it beside the working copy, and {GEOPACKAGE_FILE} keeps the whole class in {from} as well"
+            ),
+            None => format!(
+                "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. ptolemy names a reference by EPSG code and none names {from}, so the original could not be sent beside the working copy and {GEOPACKAGE_FILE} is the only file keeping the class in {from}"
+            ),
+        });
     }
     // a shapeless row in a table that has no geometry column is what the
     // report already calls out; this is about the ones that were meant to have

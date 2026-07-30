@@ -376,6 +376,8 @@ fn a_feature_serialises_as_ptolemys_insert_operation() {
             .as_object()
             .expect("an object")
             .clone(),
+        native_geometry_wkb_hex: None,
+        native_srid: None,
     };
 
     let json: serde_json::Value =
@@ -384,6 +386,35 @@ fn a_feature_serialises_as_ptolemys_insert_operation() {
     assert_eq!(json["type"], "insert");
     assert_eq!(json["feature_id"], "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
     assert_eq!(json["properties"]["depth"], 120);
+    // an untransformed feature must not put the keys on the wire at all:
+    // ptolemy defaults them, and null and absent should read the same
+    let object = json.as_object().expect("an object");
+    assert!(!object.contains_key("native_geometry_wkb_hex"));
+    assert!(!object.contains_key("native_srid"));
+    let read: NewFeature = serde_json::from_value(json).expect("a line reads back");
+    assert_eq!(read, feature);
+}
+
+/// A transformed feature carries its original beside the working copy, in the
+/// field names ptolemy's commit reads.
+#[test]
+fn a_transformed_feature_carries_its_original_and_code() {
+    let feature = NewFeature {
+        feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+        geometry_wkb_hex: "0101000000000000000000f03f0000000000000040".into(),
+        properties: serde_json::Map::new(),
+        native_geometry_wkb_hex: Some("0101000000adfb5e7cc4841f41e92631c9c0ba5141".into()),
+        native_srid: Some(26919),
+    };
+
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&feature).expect("serialises")).expect("json");
+
+    assert_eq!(
+        json["native_geometry_wkb_hex"],
+        "0101000000adfb5e7cc4841f41e92631c9c0ba5141"
+    );
+    assert_eq!(json["native_srid"], 26919);
     let read: NewFeature = serde_json::from_value(json).expect("a line reads back");
     assert_eq!(read, feature);
 }

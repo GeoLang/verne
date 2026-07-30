@@ -841,6 +841,33 @@ fn a_projected_class_reaches_ptolemy_in_degrees_and_not_in_metres() {
     assert_eq!(northing, 5_150_000.0);
 }
 
+/// A transformed feature carries its untouched original beside the working
+/// copy, so ptolemy can keep the coordinates as recorded and not only the
+/// recomputed ones.
+#[test]
+fn a_projected_class_carries_its_original_coordinates_and_code() {
+    let extracted = extract();
+    let plots = features(&extracted, "plots");
+    assert_eq!(plots.len(), 1);
+
+    assert_eq!(plots[0]["native_srid"], 26919, "{}", plots[0]);
+    let (easting, northing) = point(
+        plots[0]["native_geometry_wkb_hex"]
+            .as_str()
+            .expect("the original geometry"),
+    );
+    // exactly, not approximately: the original is exported without a transform
+    assert_eq!(easting, 500_000.0);
+    assert_eq!(northing, 5_150_000.0);
+
+    // a class already in 4326 has no distinct original, and absent keys are
+    // how the loader leaves ptolemy's columns NULL
+    let wells = features(&extracted, "wells");
+    let well = wells[0].as_object().expect("an object");
+    assert!(!well.contains_key("native_geometry_wkb_hex"), "{:?}", well);
+    assert!(!well.contains_key("native_srid"), "{:?}", well);
+}
+
 /// The report and the log have to say the two outputs differ, because a reader
 /// who takes the GeoPackage and the ptolemy dataset for copies of each other
 /// is wrong about both.
@@ -870,7 +897,7 @@ fn the_log_says_which_output_holds_which_coordinates() {
     assert!(
         losses
             .iter()
-            .any(|loss| loss.contains("features.gpkg beside it keeps the class in")),
+            .any(|loss| loss.contains("features.gpkg keeps the whole class in")),
         "{losses:?}"
     );
 

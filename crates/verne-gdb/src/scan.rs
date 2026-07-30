@@ -141,8 +141,12 @@ pub fn scan(dataset: &Dataset) -> Scan {
         });
     }
     // the definition and the metadata record come back through special SQL,
-    // which needs the layer's name rather than the layer
+    // which needs the layer's name rather than the layer. Only a user table has
+    // a definition worth reading: a system table's comes back empty.
     for index in 0..scan.tables.len() {
+        if scan.tables[index].role != TableRole::User {
+            continue;
+        }
         let name = scan.tables[index].name.clone();
         let definition = special_sql(dataset, &format!("GetLayerDefinition {name}"))
             .map(|xml| definition::parse(&xml))

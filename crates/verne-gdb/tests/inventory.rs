@@ -295,6 +295,20 @@ fn an_attachment_table_goes_to_the_attachments_table() {
 }
 
 #[test]
+fn a_blob_table_with_no_relationship_is_still_reported() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let orphan = only_matching(&items, ItemKind::EmbeddedResource, "pads__ATTACH");
+    assert!(
+        orphan.detail.contains("no relationship pointing at it"),
+        "{}",
+        orphan.detail
+    );
+    assert_eq!(orphan.verdict.outcome(), Outcome::Approximated);
+}
+
+#[test]
 fn a_feature_dataset_is_a_grouping_ptolemy_has_no_container_for() {
     let dir = tempfile::tempdir().expect("tempdir");
     let items = inventory(&fixture(dir.path()));

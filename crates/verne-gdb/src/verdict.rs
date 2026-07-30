@@ -34,6 +34,7 @@ pub fn items(scan: &Scan) -> Vec<Item> {
     domains(scan, &mut items);
     relationships(scan, &mut items);
     attachments(scan, &mut items);
+    orphan_attachments(scan, &mut items);
     layer_metadata(scan, &mut items);
     catalog(scan, &mut items);
     system_tables(scan, &mut items);
@@ -186,6 +187,41 @@ fn attachments(scan: &Scan, items: &mut Vec<Item>) {
                 )
                 .and(
                     "verne reads the table's shape and its row count, never the blobs themselves, so nothing here is a claim about what the files are",
+                ),
+            ),
+        ));
+    }
+}
+
+/// A blob table no media relationship points at. Nothing verne found may go
+/// unmentioned, so it gets a row saying exactly that.
+fn orphan_attachments(scan: &Scan, items: &mut Vec<Item>) {
+    let related: Vec<&str> = scan
+        .relationships
+        .iter()
+        .filter(is_media)
+        .filter_map(|relationship| relationship.right_table.as_deref())
+        .collect();
+    for table in scan
+        .tables
+        .iter()
+        .filter(|table| table.role == TableRole::Attachment)
+        .filter(|table| !related.contains(&table.name.as_str()))
+    {
+        items.push(Item::new(
+            table.name.clone(),
+            ItemKind::EmbeddedResource,
+            format!(
+                "attachment table with no relationship pointing at it{}",
+                match table.features {
+                    Some(count) => format!(", {count} row{}", plural_u64(count)),
+                    None => String::new(),
+                }
+            ),
+            Verdict::approximated(
+                Target::Ptolemy,
+                Losses::one(
+                    "the blobs can go to ptolemy's attachments, but nothing in the geodatabase says which class they belong to, so the link has to be guessed from the table's name",
                 ),
             ),
         ));

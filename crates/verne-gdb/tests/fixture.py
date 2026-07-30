@@ -96,6 +96,12 @@ def build(path):
     photo.SetFieldBinaryFromHexString("DATA", "89504E47")
     attach.CreateFeature(photo)
 
+    # a blob table with no relationship pointing at it, which happens when a
+    # class is deleted and its attachments are left behind
+    orphan = ds.CreateLayer("pads__ATTACH", None, ogr.wkbNone)
+    orphan.CreateField(ogr.FieldDefn("REL_OBJECTID", ogr.OFTInteger))
+    orphan.CreateField(ogr.FieldDefn("DATA", ogr.OFTBinary))
+
     media = gdal.Relationship(
         "wells_attach", "wells", "wells__ATTACH", gdal.GRC_ONE_TO_MANY
     )

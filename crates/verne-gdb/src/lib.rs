@@ -24,4 +24,6 @@ mod verdict;
 #[cfg(feature = "gdal")]
 pub use extract::Extraction;
 #[cfg(feature = "gdal")]
+pub use geopackage::serialised;
+#[cfg(feature = "gdal")]
 pub use source::{GdbError, GdbSource};

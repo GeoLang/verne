@@ -7,7 +7,7 @@ use std::process::Command;
 
 use verne_core::sidecar::Action;
 use verne_core::{Item, Report, SIDECAR_FILE, Sidecar, Verdict};
-use verne_gdb::GdbSource;
+use verne_gdb::{GdbSource, serialised};
 
 fn fixture(dir: &Path) -> PathBuf {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -395,14 +395,19 @@ fn every_dataset_names_the_layer_its_features_went_to() {
 #[test]
 fn the_geopackage_holds_one_layer_per_dataset() {
     let extracted = extract();
-    let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
-    let names: Vec<String> = written
-        .layers()
-        .map(|layer| gdal::vector::LayerAccess::name(&layer))
-        .collect();
+    // reading one back is opening and closing a GeoPackage like any other, so
+    // it goes through the same guard: see verne_gdb::geopackage
+    let (names, count) = serialised(|| {
+        let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+        let names: Vec<String> = written
+            .layers()
+            .map(|layer| gdal::vector::LayerAccess::name(&layer))
+            .collect();
+        (names, written.layer_count())
+    });
     assert_eq!(names, ["wells", "pads", "well_labels", "inspections"]);
     // the system and attachment tables were not asked for
-    assert_eq!(written.layer_count(), 4);
+    assert_eq!(count, 4);
 }
 
 /// OBJECTID is the geodatabase's feature id rather than a field, and a
@@ -413,18 +418,24 @@ fn the_features_keep_the_ids_a_relationship_is_keyed_on() {
     use gdal::vector::LayerAccess;
 
     let extracted = extract();
-    let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
-    let mut wells = written.layer_by_name("wells").expect("wells");
-    assert_eq!(wells.feature_count(), 1);
+    let (count, fid, name, has_geometry) = serialised(|| {
+        let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+        let mut wells = written.layer_by_name("wells").expect("wells");
+        let count = wells.feature_count();
+        let feature = wells.features().next().expect("one well");
+        let index = feature.field_index("well_name").expect("well_name");
+        (
+            count,
+            feature.fid(),
+            feature.field_as_string(index).expect("read"),
+            feature.geometry().is_some(),
+        )
+    });
 
-    let feature = wells.features().next().expect("one well");
-    assert_eq!(feature.fid(), Some(1));
-    let name = feature.field_index("well_name").expect("well_name");
-    assert_eq!(
-        feature.field_as_string(name).expect("read"),
-        Some("Alpha".to_string())
-    );
-    assert!(feature.geometry().is_some(), "the point came across");
+    assert_eq!(count, 1);
+    assert_eq!(fid, Some(1));
+    assert_eq!(name, Some("Alpha".to_string()));
+    assert!(has_geometry, "the point came across");
 }
 
 /// The report's losses are losses at ptolemy. The GeoPackage keeps more than
@@ -465,4 +476,39 @@ fn the_log_reports_the_geopackage_separately_from_the_dataset() {
         !losses.iter().any(|l| l.contains("could not use")),
         "{losses:?}"
     );
+}
+
+/// The load that used to abort the whole binary: several threads extracting at
+/// once, each writing its own GeoPackage. On GDAL 3.8 an unguarded close tears
+/// down libxml2's global encoding table twice and glibc kills the process, so
+/// this passing is the whole of what `geopackage::serialised` is for. It passes
+/// on GDAL 3.11 either way, which is why the guard also carries a debug
+/// assertion that does not depend on the version.
+#[test]
+fn many_threads_can_extract_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let geodatabase = fixture(dir.path());
+    let out = dir.path().join("concurrent");
+
+    let extracted: Vec<usize> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|n| {
+                let geodatabase = geodatabase.clone();
+                let out = out.join(n.to_string());
+                scope.spawn(move || {
+                    let source = GdbSource::open(&geodatabase).expect("the fixture opens");
+                    let extraction = source
+                        .extract(&out, "operator@example.test")
+                        .expect("the fixture extracts");
+                    extraction.sidecar.datasets.len()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("no thread panicked"))
+            .collect()
+    });
+
+    assert_eq!(extracted, vec![4; 8]);
 }

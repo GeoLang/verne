@@ -9,12 +9,68 @@
 //! The tables to write are named explicitly. Passing none would take the
 //! system and `__ATTACH` tables with the rest, and the report has already said
 //! those are not data.
+//!
+//! # One GeoPackage at a time
+//!
+//! GDAL 3.8's GeoPackage driver calls `spatialite_cleanup_ex` when a dataset
+//! closes, which tears down libxml2's process-global table of character
+//! encoding handlers. Two threads closing a GeoPackage at the same moment free
+//! that table twice and glibc aborts the process with "double free or
+//! corruption (fasttop)". This is GDAL's to fix and not verne's: 3.11 does not
+//! reach that path at all, so the same code is clean there and the older
+//! version, which is what CI has, is the one that breaks.
+//!
+//! [`serialised`] is therefore the only way to touch a GeoPackage in this
+//! crate, and callers reading one back in the same process have to go through
+//! it too. Serialising costs nothing an extraction notices: a single extraction
+//! writes its GeoPackage in one pass anyway.
 
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::Path;
+use std::sync::Mutex;
 
 use gdal::Dataset;
 use gdal::vector::LayerAccess;
+
+static GEOPACKAGE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Whether this thread is inside [`serialised`].
+    ///
+    /// Only the debug assertion below reads it, and that assertion is the whole
+    /// guard: GDAL 3.11 tolerates an unguarded close, so a new GeoPackage call
+    /// added outside `serialised` would pass every test on a modern GDAL and
+    /// abort on CI. This makes it fail here instead, on any version.
+    static HOLDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `f` with GDAL's GeoPackage machinery to ourselves.
+///
+/// Everything that opens, writes or closes a GeoPackage has to be inside one of
+/// these, a plain read of a file verne wrote included. See the module comment
+/// for what happens otherwise.
+///
+/// Not reentrant: the lock is a plain mutex, so a `serialised` inside a
+/// `serialised` on one thread deadlocks.
+///
+/// A panic inside `f` poisons the lock and nothing else. What it guards is the
+/// absence of a second caller rather than a value a panic could leave half
+/// written, so the poison is stepped over instead of propagated.
+pub fn serialised<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = GEOPACKAGE.lock().unwrap_or_else(|held| held.into_inner());
+    HOLDING.with(|holding| holding.set(true));
+    let out = f();
+    HOLDING.with(|holding| holding.set(false));
+    out
+}
+
+fn assert_serialised(what: &str) {
+    debug_assert!(
+        HOLDING.with(Cell::get),
+        "{what} touches a GeoPackage outside geopackage::serialised, which is not safe on GDAL 3.8"
+    );
+}
 
 /// Layer names GDAL used, in the order the tables were given. A name it had to
 /// change to make legal in a GeoPackage would come back different from the one
@@ -44,6 +100,13 @@ pub fn write(source: &Dataset, path: &Path, tables: &[&str]) -> Result<Vec<Layer
     if tables.is_empty() {
         return Ok(Vec::new());
     }
+    // the write and the read back both close a GeoPackage, so both are inside
+    // the one guard and the file is closed again before it is released
+    serialised(|| translate(source, path, tables).and_then(|()| read_back(source, path, tables)))
+}
+
+fn translate(source: &Dataset, path: &Path, tables: &[&str]) -> Result<(), String> {
+    assert_serialised("translate");
     // no -skipfailures: a partial GeoPackage that reports itself whole is
     // exactly the failure verne exists to avoid
     let mut argv = vec![arg("-f")?, arg("GPKG")?, arg("-preserve_fid")?];
@@ -77,14 +140,14 @@ pub fn write(source: &Dataset, path: &Path, tables: &[&str]) -> Result<Vec<Layer
         // the file is not complete until it is closed, and it is read back below
         gdal_sys::GDALClose(written);
     }
-
-    read_back(source, path, tables)
+    Ok(())
 }
 
 /// What the GeoPackage actually holds, against what was asked for. A table
 /// with no layer is an error rather than a note: a conversion that lost a whole
 /// table has not happened.
 fn read_back(source: &Dataset, path: &Path, tables: &[&str]) -> Result<Vec<Layer>, String> {
+    assert_serialised("read_back");
     let written =
         Dataset::open(path).map_err(|e| format!("cannot reopen {}: {e}", path.display()))?;
     let names: Vec<String> = written.layers().map(|layer| layer.name()).collect();

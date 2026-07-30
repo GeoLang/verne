@@ -4,6 +4,12 @@ Run by the test harness, never at build time. Needs the GDAL python bindings
 (python3-gdal); no network. Everything here is written with the same open
 driver verne reads with, so a fixture cannot claim more than the driver does.
 
+Relationships are added in a session of their own: on GDAL 3.8 OpenFileGDB
+refuses AddRelationship while the geodatabase it has just created is still
+open, and returns False rather than raising. Every call that answers with a
+bool is checked here, so a fixture that did not come out whole fails at the
+call that failed and not in a test three files away.
+
 usage: python3 fixture.py <path-to-create.gdb>
 """
 
@@ -58,11 +64,11 @@ def build(path):
         ogr.OFSTNone,
         {"A": "Active", "P": "Plugged"},
     )
-    ds.AddFieldDomain(coded)
+    ok(ds.AddFieldDomain(coded), "add the status_codes domain")
     drilled = ogr.CreateRangeFieldDomain(
         "depth_range", "drilled depth", ogr.OFTInteger, ogr.OFSTNone, 0, True, 5000, True
     )
-    ds.AddFieldDomain(drilled)
+    ok(ds.AddFieldDomain(drilled), "add the depth_range domain")
 
     wells = ds.GetLayerByName("wells")
     for field_name, domain_name in (("status", "status_codes"), ("depth", "depth_range")):
@@ -71,16 +77,6 @@ def build(path):
         altered = ogr.FieldDefn(current.GetName(), current.GetType())
         altered.SetDomainName(domain_name)
         wells.AlterFieldDefn(index, altered, ogr.ALTER_DOMAIN_FLAG)
-
-    inspected = gdal.Relationship(
-        "wells_inspections", "wells", "inspections", gdal.GRC_ONE_TO_MANY
-    )
-    inspected.SetLeftTableFields(["OBJECTID"])
-    inspected.SetRightTableFields(["well_id"])
-    inspected.SetForwardPathLabel("has inspections")
-    inspected.SetBackwardPathLabel("inspected well")
-    inspected.SetType(gdal.GRT_COMPOSITE)
-    ds.AddRelationship(inspected)
 
     attach = ds.CreateLayer("wells__ATTACH", None, ogr.wkbNone)
     attach.CreateField(ogr.FieldDefn("REL_OBJECTID", ogr.OFTInteger))
@@ -102,17 +98,42 @@ def build(path):
     orphan.CreateField(ogr.FieldDefn("REL_OBJECTID", ogr.OFTInteger))
     orphan.CreateField(ogr.FieldDefn("DATA", ogr.OFTBinary))
 
+    ds = None
+
+    add_relationships(path)
+    patch_definitions(path)
+    verify(path)
+
+
+def ok(result, what):
+    """GDAL answers these with a bool, and UseExceptions does not turn a False
+    into an exception, so an unchecked call fails silently."""
+    if not result:
+        raise SystemExit(f"fixture: GDAL would not {what}: {gdal.GetLastErrorMsg()}")
+
+
+def add_relationships(path):
+    ds = gdal.OpenEx(path, gdal.OF_VECTOR | gdal.OF_UPDATE)
+
+    inspected = gdal.Relationship(
+        "wells_inspections", "wells", "inspections", gdal.GRC_ONE_TO_MANY
+    )
+    inspected.SetLeftTableFields(["OBJECTID"])
+    inspected.SetRightTableFields(["well_id"])
+    inspected.SetForwardPathLabel("has inspections")
+    inspected.SetBackwardPathLabel("inspected well")
+    inspected.SetType(gdal.GRT_COMPOSITE)
+    ok(ds.AddRelationship(inspected), "add the wells_inspections relationship")
+
     media = gdal.Relationship(
         "wells_attach", "wells", "wells__ATTACH", gdal.GRC_ONE_TO_MANY
     )
     media.SetLeftTableFields(["OBJECTID"])
     media.SetRightTableFields(["REL_OBJECTID"])
     media.SetRelatedTableType("media")
-    ds.AddRelationship(media)
+    ok(ds.AddRelationship(media), "add the wells_attach relationship")
 
     ds = None
-
-    patch_definitions(path)
 
 
 # GDAL cannot write Esri subtypes, an annotation class or a topology, and it
@@ -186,6 +207,30 @@ def patch_definitions(path):
     topology.SetField("Type", "{B7E2E7A5-1C1D-4E3C-9D8B-3A5A6E7C8D90}")
     topology.SetField("Definition", TOPOLOGY)
     items.CreateFeature(topology)
+    ds = None
+
+
+def verify(path):
+    """What the tests read back, checked here so a fixture that came out short
+    says so itself."""
+    ds = gdal.OpenEx(path, gdal.OF_VECTOR, open_options=["LIST_ALL_TABLES=YES"])
+    expected = {
+        "layers": ["wells", "pads", "well_labels", "inspections", "wells__ATTACH", "pads__ATTACH"],
+        "domains": ["status_codes", "depth_range"],
+        "relationships": ["wells_inspections", "wells_attach"],
+    }
+    found = {
+        "layers": [ds.GetLayer(i).GetName() for i in range(ds.GetLayerCount())],
+        "domains": list(ds.GetFieldDomainNames() or []),
+        "relationships": list(ds.GetRelationshipNames() or []),
+    }
+    for what, names in expected.items():
+        missing = [name for name in names if name not in found[what]]
+        if missing:
+            raise SystemExit(
+                f"fixture: {path} is missing {what} {missing}; "
+                f"GDAL {gdal.__version__} gave {found[what]}"
+            )
     ds = None
 
 

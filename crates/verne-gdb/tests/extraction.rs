@@ -170,6 +170,7 @@ fn every_user_table_becomes_a_dataset() {
             "pads",
             "well_labels",
             "plots",
+            "gauges",
             "stray_points",
             "inspections"
         ]
@@ -431,6 +432,7 @@ fn the_geopackage_holds_one_layer_per_dataset() {
     assert_eq!(
         sorted,
         [
+            "gauges",
             "inspections",
             "pads",
             "plots",
@@ -440,7 +442,7 @@ fn the_geopackage_holds_one_layer_per_dataset() {
         ]
     );
     // the system and attachment tables were not asked for
-    assert_eq!(count, 6);
+    assert_eq!(count, 7);
 }
 
 /// OBJECTID is the geodatabase's feature id rather than a field, and a
@@ -489,7 +491,7 @@ fn the_log_reports_the_geopackage_separately_from_the_dataset() {
                 .is_some_and(|to| to.starts_with("features.gpkg"))
         })
         .collect();
-    assert_eq!(rows.len(), 6, "one per dataset: {rows:#?}");
+    assert_eq!(rows.len(), 7, "one per dataset: {rows:#?}");
 
     let wells = rows
         .iter()
@@ -543,7 +545,7 @@ fn many_threads_can_extract_at_once() {
             .collect()
     });
 
-    assert_eq!(extracted, vec![6; 8]);
+    assert_eq!(extracted, vec![7; 8]);
 }
 
 // ─── The dataset schema ─────────────────────────────────────────────
@@ -839,6 +841,79 @@ fn a_projected_class_reaches_ptolemy_in_degrees_and_not_in_metres() {
     });
     assert_eq!(easting, 500_000.0);
     assert_eq!(northing, 5_150_000.0);
+}
+
+fn point_z(hex: &str) -> (f64, f64, f64) {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+        .collect();
+    assert_eq!(bytes[0], 1, "little endian");
+    assert_eq!(
+        u32::from_le_bytes(bytes[1..5].try_into().expect("4 bytes")),
+        1001,
+        "a point with z"
+    );
+    let at =
+        |start: usize| f64::from_le_bytes(bytes[start..start + 8].try_into().expect("8 bytes"));
+    (at(5), at(13), at(21))
+}
+
+/// The compound class carries its original with the reference's full WKT
+/// definition, since no single EPSG code names NAD83 + NAVD88 height, and the
+/// log says that is how it went.
+#[test]
+fn a_compound_class_carries_its_original_with_its_wkt() {
+    let extracted = extract();
+    let gauges = features(&extracted, "gauges");
+    assert_eq!(gauges.len(), 1);
+
+    let gauge = gauges[0].as_object().expect("an object");
+    assert!(!gauge.contains_key("native_srid"), "{gauge:?}");
+    let wkt = gauges[0]["native_crs_wkt"]
+        .as_str()
+        .expect("the definition");
+    assert!(wkt.contains("COMPOUNDCRS"), "{wkt}");
+    assert!(wkt.contains("NAVD88"), "{wkt}");
+
+    // the original, untouched to the last bit, z included. The expectation is
+    // read back off the GeoPackage rather than written as a literal: the
+    // geodatabase snaps coordinates to its own precision grid on write, so
+    // what the source holds is not exactly what the fixture asked for, and
+    // faithful means matching the source, not the wish
+    let original = gauges[0]["native_geometry_wkb_hex"]
+        .as_str()
+        .expect("the original geometry");
+    let kept = serialised(|| {
+        use gdal::vector::LayerAccess;
+        let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+        let mut layer = written.layer_by_name("gauges").expect("gauges");
+        let feature = layer.features().next().expect("one gauge");
+        feature.geometry().expect("a point").get_point(0)
+    });
+    assert_eq!(point_z(original), kept);
+
+    // while the working copy really was transformed: NAD83 to WGS 84 moves
+    // the point, so identical bytes would mean the transform never ran
+    let working = gauges[0]["geometry_wkb_hex"].as_str().expect("the copy");
+    assert_ne!(working, original);
+
+    let written = extracted
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .find(|entry| entry.destination.as_deref() == Some("features/gauges.ndjson"))
+        .expect("the gauges file is logged");
+    let Action::CarriedWithLoss { losses } = &written.action else {
+        panic!("a transformation is a loss: {written:?}");
+    };
+    assert!(
+        losses
+            .iter()
+            .any(|loss| loss.contains("full WKT definition")),
+        "{losses:?}"
+    );
 }
 
 /// A transformed feature carries its untouched original beside the working

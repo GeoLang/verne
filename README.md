@@ -123,7 +123,7 @@ features.gpkg — the features and attributes in the source's own spatial
 features/     — one file per dataset, one line of JSON per feature, each line a
                 whole insert operation of ptolemy's commit route, transformed
                 to EPSG:4326, ptolemy's working reference, with the untouched
-                original beside it where its reference has an EPSG code
+                original beside it named by EPSG code or by WKT
 attachments/  — the blobs out of the __ATTACH tables, one file each
 sidecar.json  — the datasets, their column schemas, coded and range domains,
                 subtypes, relationship classes and attachments to create in
@@ -275,14 +275,15 @@ class for exactly this, one point on the zone's central meridian at easting
 rather than anywhere near 500000.
 
 Every dataset therefore declares `srid` 4326, because that is what its working
-geometry is by the time ptolemy has it. The original is not lost with it: when
-the class's reference has an EPSG code, every transformed feature also carries
-`native_geometry_wkb_hex` and `native_srid`, the untouched geometry and the
-code it is in, which ptolemy stores beside the working copy and returns byte
-for byte from `GET /branches/{id}/features/{feature}/native`. A reference no
-single code names, such as NAD83 with NAVD88 height, cannot be stated that way,
-so its original stays in the GeoPackage alone and the log says which it is per
-class.
+geometry is by the time ptolemy has it. The original is not lost with it: every
+transformed feature also carries `native_geometry_wkb_hex`, the untouched
+geometry, with its reference as `native_srid` when a single EPSG code names it
+or as `native_crs_wkt`, the full WKT2 definition, when none does, which is what
+a compound reference such as NAD83 with NAVD88 height comes as. ptolemy stores
+the original beside the working copy and returns it byte for byte from
+`GET /branches/{id}/features/{feature}/native`. Only a reference GDAL cannot
+state at all leaves its original in the GeoPackage alone, and the log says so
+per class.
 
 The transformation itself is the cost, and it is GDAL's: verne does no
 coordinate arithmetic. PROJ picks the coordinate operation for the pair of

@@ -186,10 +186,19 @@ enum Projection {
     /// geometry at all.
     Straight,
     /// Every geometry through this, by GDAL. Named so the log can say what it
-    /// came out of.
-    Through(Box<CoordTransform>, String),
+    /// came out of, with how the original's reference will be stated on each
+    /// insert, or None when GDAL could not state it at all.
+    Through(Box<CoordTransform>, String, Option<OriginalRef>),
     /// These features cannot go to ptolemy, and this is why.
     Refused(String),
+}
+
+/// How a transformed class's original reference is said to ptolemy: by EPSG
+/// code when a single code names it, or by its WKT definition when none does,
+/// which is what a compound reference comes as.
+enum OriginalRef {
+    Code(i32),
+    Wkt(String),
 }
 
 /// What has to happen to a layer's geometry, decided once per table.
@@ -223,8 +232,14 @@ fn projection(layer: &Layer<'_>, table: &Table) -> Projection {
     // authority declares
     from.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
     to.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    // decided before the transform is built: the original's reference is a
+    // fact about the source, not about whether GDAL can leave it
+    let original = match table.srid {
+        Some(code) => Some(OriginalRef::Code(code)),
+        None => wkt2(&from).map(OriginalRef::Wkt),
+    };
     match CoordTransform::new(&from, &to) {
-        Ok(transform) => Projection::Through(Box::new(transform), named),
+        Ok(transform) => Projection::Through(Box::new(transform), named, original),
         Err(error) => Projection::Refused(format!(
             "GDAL knows no transformation from {named} to EPSG:{PTOLEMY_SRID} ({error}), and ptolemy stores geometry as {PTOLEMY_SRID} and nothing else, so none of these features were written; they are in the GeoPackage in their own reference"
         )),
@@ -251,9 +266,9 @@ fn write_table(
 
     // decided before a file is opened: a refused table gets no feature file
     // rather than an empty one, so the sidecar names nothing for it
-    let (transform, transformed_from) = match projection(&layer, table) {
-        Projection::Straight => (None, None),
-        Projection::Through(transform, named) => (Some(transform), Some(named)),
+    let (transform, transformed_from, original_ref) = match projection(&layer, table) {
+        Projection::Straight => (None, None, None),
+        Projection::Through(transform, named, original) => (Some(transform), Some(named), original),
         Projection::Refused(reason) => {
             return Ok((
                 FeatureFile {
@@ -298,16 +313,6 @@ fn write_table(
         })
         .collect();
 
-    // the original rides beside the transformed copy only when its reference
-    // has an EPSG code to store it under, since that is how ptolemy names one.
-    // a codeless reference keeps its original in the GeoPackage alone, and the
-    // losses say so
-    let original_srid = if transform.is_some() {
-        table.srid
-    } else {
-        None
-    };
-
     let mut minted = key_field.map(|_| BTreeMap::new());
     let mut tally = Tally::default();
     for feature in layer.features() {
@@ -316,8 +321,8 @@ fn write_table(
         let (geometry, native) = match feature.geometry() {
             Some(shape) => match wkb_hex(shape, transform.as_deref()) {
                 Ok(hex) => {
-                    let native = match original_srid {
-                        Some(srid) => wkb_hex(shape, None).ok().map(|original| (original, srid)),
+                    let native = match &original_ref {
+                        Some(_) => wkb_hex(shape, None).ok(),
                         None => None,
                     };
                     (hex, native)
@@ -341,9 +346,10 @@ fn write_table(
                 properties.insert((*name).to_string(), value);
             }
         }
-        let (native_hex, native_srid) = match native {
-            Some((hex, srid)) => (Some(hex), Some(srid)),
-            None => (None, None),
+        let (native_hex, native_srid, native_crs_wkt) = match (native, &original_ref) {
+            (Some(hex), Some(OriginalRef::Code(code))) => (Some(hex), Some(*code), None),
+            (Some(hex), Some(OriginalRef::Wkt(wkt))) => (Some(hex), None, Some(wkt.clone())),
+            _ => (None, None, None),
         };
         let line = serde_json::to_string(&NewFeature {
             feature_id: id.clone(),
@@ -351,6 +357,7 @@ fn write_table(
             properties,
             native_geometry_wkb_hex: native_hex,
             native_srid,
+            native_crs_wkt,
         })
         .map_err(|error| GdbError::Features {
             table: table.name.clone(),
@@ -386,7 +393,12 @@ fn write_table(
             source_table: table.name.clone(),
             path: Some(relative),
             features: tally.written,
-            losses: feature_losses(table, &tally, transformed_from.as_deref()),
+            losses: feature_losses(
+                table,
+                &tally,
+                transformed_from.as_deref(),
+                original_ref.as_ref(),
+            ),
         },
         minted,
     ))
@@ -409,17 +421,25 @@ struct Tally {
 /// report already says what a binary column, an srid that is not 4326 and a
 /// table with no geometry at all cost, because those are true of the table
 /// before a single row is read.
-fn feature_losses(table: &Table, tally: &Tally, transformed_from: Option<&str>) -> Vec<String> {
+fn feature_losses(
+    table: &Table,
+    tally: &Tally,
+    transformed_from: Option<&str>,
+    original: Option<&OriginalRef>,
+) -> Vec<String> {
     let mut losses = Vec::new();
     // the one place the two outputs are said to differ, against the file that
     // differs from the other
     if let Some(from) = transformed_from {
-        losses.push(match table.srid {
-            Some(code) => format!(
+        losses.push(match original {
+            Some(OriginalRef::Code(code)) => format!(
                 "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. the untransformed original rides on each insert as EPSG:{code} and ptolemy keeps it beside the working copy, and {GEOPACKAGE_FILE} keeps the whole class in {from} as well"
             ),
+            Some(OriginalRef::Wkt(_)) => format!(
+                "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. no single EPSG code names {from}, so the untransformed original rides on each insert with the reference's full WKT definition, ptolemy keeps both beside the working copy, and {GEOPACKAGE_FILE} keeps the whole class in {from} as well"
+            ),
             None => format!(
-                "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. ptolemy names a reference by EPSG code and none names {from}, so the original could not be sent beside the working copy and {GEOPACKAGE_FILE} is the only file keeping the class in {from}"
+                "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the working reference ptolemy serves. GDAL could not state {from} as an EPSG code or as WKT, so the original could not be sent beside the working copy and {GEOPACKAGE_FILE} is the only file keeping the class in {from}"
             ),
         });
     }
@@ -550,6 +570,24 @@ unsafe fn export_wkb(handle: gdal_sys::OGRGeometryH) -> Result<String, ()> {
             return Err(());
         }
         Ok(hex(&bytes))
+    }
+}
+
+/// The reference as WKT2, the encoding that can say everything a compound
+/// reference is. Wraps `OSRExportToWktEx`, which georust/gdal does not, the
+/// same way the WKB export below wraps its C call.
+fn wkt2(reference: &SpatialRef) -> Option<String> {
+    let format = c"FORMAT=WKT2_2019";
+    let options: [*const std::ffi::c_char; 2] = [format.as_ptr(), std::ptr::null()];
+    let mut raw: *mut std::ffi::c_char = std::ptr::null_mut();
+    unsafe {
+        let result = gdal_sys::OSRExportToWktEx(reference.to_c_hsrs(), &mut raw, options.as_ptr());
+        if result != gdal_sys::OGRErr::OGRERR_NONE || raw.is_null() {
+            return None;
+        }
+        let wkt = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+        gdal_sys::VSIFree(raw.cast());
+        (!wkt.trim().is_empty()).then_some(wkt)
     }
 }
 

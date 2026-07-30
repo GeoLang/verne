@@ -66,6 +66,19 @@ def build(path):
     plot.SetGeometry(ogr.CreateGeometryFromWkt("POINT (500000 5150000)"))
     plots.CreateFeature(plot)
 
+    # a compound reference, NAD83 horizontal with NAVD88 height, which comes
+    # back from OpenFileGDB with no authority code at all. This is what real
+    # hydrography carries, and the layer that proves the original travels with
+    # its WKT definition when no single EPSG code names it.
+    compound = osr.SpatialReference()
+    compound.SetFromUserInput("EPSG:4269+5703")
+    gauges = ds.CreateLayer("gauges", compound, ogr.wkbPoint25D)
+    gauges.CreateField(ogr.FieldDefn("gauge_id", ogr.OFTInteger))
+    gauge = ogr.Feature(gauges.GetLayerDefn())
+    gauge.SetField("gauge_id", 1)
+    gauge.SetGeometry(ogr.CreateGeometryFromWkt("POINT Z (-69.1 46.5 12.5)"))
+    gauges.CreateFeature(gauge)
+
     # a class with geometry and no spatial reference at all, which cannot be
     # transformed and must not be sent
     stray = ds.CreateLayer("stray_points", None, ogr.wkbPoint)

@@ -378,6 +378,7 @@ fn a_feature_serialises_as_ptolemys_insert_operation() {
             .clone(),
         native_geometry_wkb_hex: None,
         native_srid: None,
+        native_crs_wkt: None,
     };
 
     let json: serde_json::Value =
@@ -405,6 +406,7 @@ fn a_transformed_feature_carries_its_original_and_code() {
         properties: serde_json::Map::new(),
         native_geometry_wkb_hex: Some("0101000000adfb5e7cc4841f41e92631c9c0ba5141".into()),
         native_srid: Some(26919),
+        native_crs_wkt: None,
     };
 
     let json: serde_json::Value =

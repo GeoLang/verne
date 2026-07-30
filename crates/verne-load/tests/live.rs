@@ -31,6 +31,11 @@ const POINT: &str = "0101000000000000000000f03f0000000000000040";
 /// would have moved. It must come back byte for byte, not close.
 const NATIVE_POINT: &str = "0101000000adfb5e7cc4841f41e92631c9c0ba5141";
 
+/// A reference no single EPSG code names, abbreviated: ptolemy stores the
+/// string as given, so nothing here depends on it resolving.
+const COMPOUND_WKT: &str =
+    "COMPD_CS[\"NAD83 + NAVD88 height\",GEOGCS[\"NAD83\"],VERT_CS[\"NAVD88 height\"]]";
+
 /// An empty geometry collection: the convention for a row from a table with no
 /// geometry, since ptolemy's insert takes a geometry and reads a null one as a
 /// deletion.
@@ -56,27 +61,44 @@ struct Extraction {
     sidecar: Sidecar,
     /// The feature the attachment hangs off, so the test can ask ptolemy for it.
     well: String,
+    /// The feature whose original's reference travels as WKT.
+    well_wkt: String,
     directory: tempfile::TempDir,
 }
 
 fn an_extraction(suffix: &str) -> Extraction {
     let directory = tempfile::tempdir().expect("tempdir");
     let well = uuid::Uuid::now_v7().to_string();
+    let well_wkt = uuid::Uuid::now_v7().to_string();
     let inspection = uuid::Uuid::now_v7().to_string();
 
     write_features(
         directory.path(),
         "wells",
-        &[NewFeature {
-            feature_id: well.clone(),
-            geometry_wkb_hex: POINT.into(),
-            properties: serde_json::json!({ "well_name": "Alpha", "depth": 120 })
-                .as_object()
-                .expect("an object")
-                .clone(),
-            native_geometry_wkb_hex: Some(NATIVE_POINT.into()),
-            native_srid: Some(26919),
-        }],
+        &[
+            NewFeature {
+                feature_id: well.clone(),
+                geometry_wkb_hex: POINT.into(),
+                properties: serde_json::json!({ "well_name": "Alpha", "depth": 120 })
+                    .as_object()
+                    .expect("an object")
+                    .clone(),
+                native_geometry_wkb_hex: Some(NATIVE_POINT.into()),
+                native_srid: Some(26919),
+                native_crs_wkt: None,
+            },
+            NewFeature {
+                feature_id: well_wkt.clone(),
+                geometry_wkb_hex: POINT.into(),
+                properties: serde_json::json!({ "well_name": "Beta", "depth": 80 })
+                    .as_object()
+                    .expect("an object")
+                    .clone(),
+                native_geometry_wkb_hex: Some(NATIVE_POINT.into()),
+                native_srid: None,
+                native_crs_wkt: Some(COMPOUND_WKT.into()),
+            },
+        ],
     );
     // a table with no geometry, which is the case the empty geometry
     // collection exists for
@@ -89,6 +111,7 @@ fn an_extraction(suffix: &str) -> Extraction {
             properties: serde_json::Map::new(),
             native_geometry_wkb_hex: None,
             native_srid: None,
+            native_crs_wkt: None,
         }],
     );
     std::fs::create_dir_all(directory.path().join("attachments")).expect("attachments dir");
@@ -97,6 +120,7 @@ fn an_extraction(suffix: &str) -> Extraction {
     Extraction {
         sidecar: a_sidecar(suffix, &well),
         well,
+        well_wkt,
         directory,
     }
 }
@@ -367,7 +391,7 @@ fn the_features_and_their_attachment_come_back_off_the_branch() {
 
     let wells = format!("verne_wells_{suffix}");
     assert_eq!(loaded.branches.len(), 2, "every dataset gets a branch");
-    assert_eq!(loaded.features[&wells].features, 1);
+    assert_eq!(loaded.features[&wells].features, 2);
     assert_eq!(loaded.features[&wells].commits, 1);
     // the table with no geometry loaded too, which is the empty geometry
     // collection being accepted rather than refused
@@ -390,29 +414,46 @@ fn the_features_and_their_attachment_come_back_off_the_branch() {
         .json()
         .expect("json");
     let listed = features["features"].as_array().expect("features");
-    assert_eq!(listed.len(), 1, "{features}");
-    assert_eq!(listed[0]["id"].as_str(), Some(expected_feature.as_str()));
-    assert_eq!(listed[0]["properties"]["well_name"], "Alpha", "{features}");
-    assert_eq!(listed[0]["properties"]["depth"], 120, "{features}");
+    assert_eq!(listed.len(), 2, "{features}");
+    let alpha = listed
+        .iter()
+        .find(|f| f["id"].as_str() == Some(expected_feature.as_str()))
+        .expect("the attached well is listed");
+    assert_eq!(alpha["properties"]["well_name"], "Alpha", "{features}");
+    assert_eq!(alpha["properties"]["depth"], 120, "{features}");
 
     // the original coordinates come back exactly as the extraction wrote them,
     // with the code that says what they are in
-    let native: serde_json::Value = client
-        .get(format!(
-            "{}/api/v1/branches/{branch}/features/{expected_feature}/native",
-            live.url
-        ))
-        .bearer_auth(&live.token)
-        .send()
-        .expect("the native geometry")
-        .json()
-        .expect("json");
+    let native = |feature: &str| -> serde_json::Value {
+        client
+            .get(format!(
+                "{}/api/v1/branches/{branch}/features/{feature}/native",
+                live.url
+            ))
+            .bearer_auth(&live.token)
+            .send()
+            .expect("the native geometry")
+            .json()
+            .expect("json")
+    };
+    let coded = native(&expected_feature);
     assert_eq!(
-        native["native_geometry_wkb_hex"].as_str(),
+        coded["native_geometry_wkb_hex"].as_str(),
         Some(NATIVE_POINT),
-        "{native}"
+        "{coded}"
     );
-    assert_eq!(native["native_srid"], 26919, "{native}");
+    assert_eq!(coded["native_srid"], 26919, "{coded}");
+    assert!(coded["native_crs_wkt"].is_null(), "{coded}");
+
+    // and a reference no code names comes back as the WKT it went in as
+    let wkt = native(&extraction.well_wkt);
+    assert_eq!(
+        wkt["native_geometry_wkb_hex"].as_str(),
+        Some(NATIVE_POINT),
+        "{wkt}"
+    );
+    assert!(wkt["native_srid"].is_null(), "{wkt}");
+    assert_eq!(wkt["native_crs_wkt"], COMPOUND_WKT, "{wkt}");
 
     // the blob comes back byte for byte, with the content type the source row
     // declared, off the feature it belongs to and not off the dataset

@@ -215,14 +215,18 @@ pub struct NewFeature {
     /// "deleted".
     pub geometry_wkb_hex: String,
     pub properties: serde_json::Map<String, serde_json::Value>,
-    /// The geometry as the source recorded it, before the transform to 4326,
-    /// with the EPSG code it is in. Only on features that were transformed:
-    /// ptolemy stores an absent one as NULL, its word for "no distinct
-    /// original". Always both fields or neither, ptolemy refuses half.
+    /// The geometry as the source recorded it, before the transform to 4326.
+    /// Only on features that were transformed: ptolemy stores an absent one as
+    /// NULL, its word for "no distinct original". Its reference comes as
+    /// exactly one of the EPSG code or, when no single code names it (a
+    /// compound reference), the full WKT definition. ptolemy refuses the
+    /// geometry alone, both namings, or a naming with no geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_geometry_wkb_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_srid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_crs_wkt: Option<String>,
 }
 
 /// One attachment: `POST /api/v1/branches/{branch}/features/{feature}/attachments`

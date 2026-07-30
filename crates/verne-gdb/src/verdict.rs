@@ -537,7 +537,7 @@ fn reprojection_losses(table: &Table) -> Vec<String> {
             "ptolemy serves geometry as EPSG:4326, so the working copy of this class is transformed out of {named} by GDAL before it is committed. every vertex of that copy is recomputed rather than carried across, and a change of datum is only as good as the transformation PROJ finds for the pair and the grids it has installed. the coordinates as recorded ride on each insert as EPSG:{code} and are stored beside the working copy, read back exactly by feature, so the transform costs the copy every query serves and not the record"
         ),
         None => format!(
-            "ptolemy serves geometry as EPSG:4326, so this class is transformed out of {named} by GDAL before it is committed. every vertex is recomputed rather than carried across, a change of datum is only as good as the transformation PROJ finds for the pair and the grids it has installed, and ptolemy names a spatial reference by EPSG code, which nothing names this one by, so the original coordinates go only to the GeoPackage and ptolemy records nowhere what the class was in"
+            "ptolemy serves geometry as EPSG:4326, so the working copy of this class is transformed out of {named} by GDAL before it is committed. every vertex of that copy is recomputed rather than carried across, and a change of datum is only as good as the transformation PROJ finds for the pair and the grids it has installed. no single EPSG code names this reference, so the coordinates as recorded ride on each insert with the reference's full WKT definition and are stored beside the working copy, read back exactly by feature"
         ),
     }]
 }

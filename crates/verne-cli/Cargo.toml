@@ -19,5 +19,6 @@ gdb = ["dep:verne-gdb", "verne-gdb/gdal"]
 [dependencies]
 verne-core = { path = "../verne-core" }
 verne-kml = { path = "../verne-kml" }
+verne-load = { path = "../verne-load" }
 verne-gdb = { path = "../verne-gdb", optional = true }
 clap = { version = "4", features = ["derive"] }

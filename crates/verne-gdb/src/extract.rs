@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use verne_core::{
-    DatasetPlan, ExtractionLog, Item, ItemKind, NewDataset, NewDomain, NewRelationship, NewSubtype,
-    Sidecar, Source,
+    DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, Item, ItemKind, NewDataset, NewDomain,
+    NewRelationship, NewSubtype, SIDECAR_FILE, Sidecar, Source,
 };
 
 use crate::geopackage;
@@ -22,12 +22,6 @@ use crate::glue::{Domain, DomainKind, Relationship};
 use crate::scan::{self, Scan, Table};
 use crate::source::{GdbError, GdbSource};
 use crate::verdict;
-
-/// The sidecar's name inside the extraction directory.
-pub const SIDECAR_FILE: &str = "sidecar.json";
-
-/// The GeoPackage's name inside the extraction directory.
-pub const GEOPACKAGE_FILE: &str = "features.gpkg";
 
 /// Where an extraction landed.
 #[derive(Debug, Clone)]

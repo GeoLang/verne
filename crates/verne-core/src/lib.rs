@@ -11,8 +11,8 @@ pub mod sidecar;
 pub use model::{Item, ItemKind, Losses, Outcome, SourceDescription, Target, Verdict};
 pub use report::{Counts, Report};
 pub use sidecar::{
-    Action, DatasetPlan, ExtractionLog, LogCounts, LogEntry, NewDataset, NewDomain,
-    NewRelationship, NewSubtype, Sidecar,
+    Action, DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, LogCounts, LogEntry, NewDataset,
+    NewDomain, NewRelationship, NewSubtype, SIDECAR_FILE, Sidecar,
 };
 
 /// A thing verne can read.

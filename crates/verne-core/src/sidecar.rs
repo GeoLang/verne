@@ -20,6 +20,14 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::model::{Item, ItemKind, SourceDescription, Verdict};
 
+/// The sidecar's name inside an extraction directory. Both names are here
+/// rather than with the adapter that writes them: they are the layout of an
+/// extraction, and the loader has to find one without knowing what read it.
+pub const SIDECAR_FILE: &str = "sidecar.json";
+
+/// The GeoPackage's name inside an extraction directory.
+pub const GEOPACKAGE_FILE: &str = "features.gpkg";
+
 /// A dataset to create: `POST /api/v1/datasets`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewDataset {

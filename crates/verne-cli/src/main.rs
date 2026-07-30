@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use verne_core::Report;
+use verne_core::{Report, Sidecar};
 use verne_kml::KmlSource;
+use verne_load::Loader;
 
 #[derive(Parser)]
 #[command(
@@ -36,6 +37,15 @@ enum Command {
         /// Who is running this, recorded in the extraction log
         #[arg(long, value_name = "NAME")]
         operator: String,
+    },
+    /// Create the datasets, domains, subtypes and relationship classes an
+    /// extraction produced in a running ptolemy
+    Load {
+        /// Directory an earlier `verne extract` wrote
+        path: PathBuf,
+        /// Root ptolemy is served at, such as http://localhost:3000
+        #[arg(long, value_name = "URL")]
+        ptolemy: String,
     },
 }
 
@@ -70,7 +80,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             out,
             operator,
         } => extract(&path, &out, &operator),
+        Command::Load { path, ptolemy } => load(&path, &ptolemy),
     }
+}
+
+/// The token is read from the environment and never taken as an argument: an
+/// argument is in the process list of every other user on the machine.
+const TOKEN_VAR: &str = "VERNE_PTOLEMY_TOKEN";
+
+fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let token = std::env::var(TOKEN_VAR).map_err(|_| {
+        format!("set {TOKEN_VAR} to a ptolemy bearer token that may write; the load creates the datasets itself and holds the grant that gives it")
+    })?;
+    let sidecar_path = if path.is_dir() {
+        path.join(verne_core::sidecar::SIDECAR_FILE)
+    } else {
+        path.to_path_buf()
+    };
+    let sidecar = Sidecar::from_json(&std::fs::read_to_string(&sidecar_path)?)?;
+    let loaded = Loader::new(ptolemy, &token)?.load(&sidecar)?;
+    println!("loaded into {ptolemy}: {}", loaded.sentence());
+    for (name, id) in &loaded.datasets {
+        println!("  dataset {name} {id}");
+    }
+    for (name, id) in &loaded.relationships {
+        println!("  relationship class {name} {id}");
+    }
+    Ok(())
 }
 
 /// A file geodatabase is a directory, and the extension is what names it.

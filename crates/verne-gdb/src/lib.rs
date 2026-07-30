@@ -22,6 +22,6 @@ mod source;
 mod verdict;
 
 #[cfg(feature = "gdal")]
-pub use extract::{Extraction, GEOPACKAGE_FILE, SIDECAR_FILE};
+pub use extract::Extraction;
 #[cfg(feature = "gdal")]
 pub use source::{GdbError, GdbSource};

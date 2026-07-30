@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use verne_core::sidecar::Action;
-use verne_core::{Item, Report, Sidecar, Verdict};
-use verne_gdb::{GdbSource, SIDECAR_FILE};
+use verne_core::{Item, Report, SIDECAR_FILE, Sidecar, Verdict};
+use verne_gdb::GdbSource;
 
 fn fixture(dir: &Path) -> PathBuf {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))

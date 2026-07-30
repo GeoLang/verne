@@ -5,15 +5,23 @@
 
 Read-only inventory of a third-party geospatial source. Verne opens a file, lists
 what is in it, and says of each thing whether GeoLang could hold it faithfully,
-would have to approximate it, or has no home for it at all. It converts nothing
-and writes nothing back: the report is the product.
+would have to approximate it, or has no home for it at all.
+
+It can then act on that report: `verne extract` writes a geodatabase out as a
+GeoPackage and a sidecar, and `verne load` creates what the sidecar describes in
+a running ptolemy. The source is never written to, in either.
 
 ## Scope
 
-v0.2 reads KML and KMZ, and Esri file geodatabases. No network access and no
-credentials in either. Verne does not follow a NetworkLink or fetch an overlay
-image, so anything behind a URL is reported as outside the inventory rather than
-inspected, and it never opens a raster or an attachment blob.
+v0.3 reads KML and KMZ, and Esri file geodatabases, and extracts a geodatabase
+into a GeoPackage and a ptolemy sidecar.
+
+Reading and extracting reach no network and take no credentials. Verne does not
+follow a NetworkLink or fetch an overlay image, so anything behind a URL is
+reported as outside the inventory rather than inspected, and it never opens a
+raster or an attachment blob. Attachments are not extracted at all: the blobs
+are a slice of work of their own. `verne load` is the one command that reaches a
+network, and the only one that takes a credential.
 
 The KML side is pure Rust and needs no GDAL. The geodatabase side is behind the
 `gdb` feature and needs GDAL 3.8 or later, read through GDAL's own OpenFileGDB
@@ -33,6 +41,13 @@ verne inspect sites.kmz --json sites.json
 # geodatabases need the feature at build time
 cargo install --path crates/verne-cli --features gdb
 verne inspect wells.gdb
+
+# write the features and the semantics out
+verne extract wells.gdb --out ./wells-extract --operator you@example.com
+
+# create them in a running ptolemy
+export VERNE_PTOLEMY_TOKEN=<a bearer token that may write>
+verne load ./wells-extract --ptolemy http://localhost:3000
 ```
 
 ## Verdicts
@@ -71,6 +86,67 @@ the headers: the test geodatabases are built at test time by
 annotation class or a topology, so those parts of the fixture are definition XML
 written by hand into the catalogue and read back through the driver.
 
+## Extraction
+
+`verne extract` writes three things into the directory it is given:
+
+```
+features.gpkg — the features and attributes, converted by GDAL's own vector
+                translate. -preserve_fid is always on, because a geodatabase
+                keys its relationship classes on OBJECTID and OpenFileGDB gives
+                that as the feature id rather than as a field.
+sidecar.json  — the datasets, coded and range domains, subtypes and
+                relationship classes to create in ptolemy, plus the log
+```
+
+The sidecar's structs mirror ptolemy's request bodies field for field, so
+loading is a POST of each struct and not a translation that can drift from the
+API. Two fields cannot mirror one, because ptolemy wants the id of a row that
+does not exist until the load is running: a subtype's `domain_assignments` names
+its domains, and a relationship class names its two datasets. Both are typed as
+names, and the loader swaps them for the ids the load minted.
+
+The GeoPackage holds more than ptolemy does. Field aliases, the domains
+themselves with their descriptions and split and merge policies, and the binding
+of a field to a domain all survive there, so the losses the report names are
+losses at ptolemy rather than at the file verne writes on the way.
+
+### The extraction log
+
+Every row of the report gets one entry saying what became of it: carried whole,
+carried with the report's own words for what was left behind, or skipped with a
+reason. Whether an entry reads as carried or approximated is decided by the
+verdict and not by the caller, so a report and the log beside it cannot give
+different accounts of the same thing. The log also records the losses the
+conversion itself takes, which no verdict covers: one geodatabase domain becomes
+one ptolemy domain per dataset that uses it, and the copies come apart from each
+other; a subtype default arrives as the text the definition XML holds.
+
+The operator who ran it is recorded, along with an RFC 3339 timestamp. Both are
+required rather than optional: an extraction has to be able to say who made it.
+
+## Loading
+
+`verne load` creates datasets first, then the domains and subtypes that hang off
+one, then the relationship classes, which name two datasets and cannot be
+created before both exist.
+
+The token comes from `VERNE_PTOLEMY_TOKEN` and is never an argument, which would
+put it in the process list. ptolemy grants the creator of a dataset an admin row
+on it and gates every mutating route on a write ladder, so the loader has to
+create the datasets itself: pointed at somebody else's, it would need a grant it
+has no way to mint.
+
+There is no rollback. A load that fails part way leaves what it already created
+and the error names the route that refused it.
+
+`crates/verne-load/tests/live.rs` loads a sidecar into a real ptolemy and is
+gated on `VERNE_PTOLEMY_URL` and `VERNE_PTOLEMY_TOKEN`. **CI does not set
+either, so CI does not cover the loader.** A mocked version would only prove the
+loader agrees with itself, and the failure worth catching is a request shape
+drifting from ptolemy's real API. Automating it would need ptolemy to publish a
+container image or an OpenAPI spec; it does neither.
+
 ## Writing an adapter
 
 Implement `verne_core::Source` in any crate that depends on `verne-core`, in this
@@ -81,9 +157,11 @@ registry and no dynamic loading: whoever builds the binary picks the adapters.
 ## Crates
 
 ```
-verne-core — the inventory model, verdicts, and markdown/JSON reports
+verne-core — the inventory model, verdicts, reports, and the sidecar model
 verne-kml  — the KML and KMZ adapter
-verne-gdb  — the Esri file geodatabase adapter, behind the `gdal` feature
+verne-gdb  — the Esri file geodatabase adapter and its extraction, behind the
+             `gdal` feature
+verne-load — the ptolemy loader: HTTP, no GDAL
 verne-cli  — the command-line interface
 ```
 

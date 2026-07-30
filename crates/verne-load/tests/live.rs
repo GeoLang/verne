@@ -15,13 +15,25 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use verne_core::SourceDescription;
 use verne_core::sidecar::{
-    DatasetPlan, ExtractionLog, NewDataset, NewDomain, NewField, NewRelationship, NewSchema,
-    NewSubtype, Sidecar,
+    DatasetPlan, ExtractionLog, NewAttachment, NewDataset, NewDomain, NewFeature, NewField,
+    NewRelationship, NewSchema, NewSubtype, Sidecar,
 };
 use verne_load::Loader;
+
+/// POINT (1 2) as hex WKB, which is what an extraction writes.
+const POINT: &str = "0101000000000000000000f03f0000000000000040";
+
+/// An empty geometry collection: the convention for a row from a table with no
+/// geometry, since ptolemy's insert takes a geometry and reads a null one as a
+/// deletion.
+const EMPTY: &str = "010700000000000000";
+
+/// The bytes the attachment carries, a PNG signature and nothing more.
+const BLOB: &[u8] = &[0x89, 0x50, 0x4e, 0x47];
 
 /// Every run makes its own names: ptolemy's dataset name is unique across the
 /// instance, so a second run against the same database would collide.
@@ -33,7 +45,68 @@ fn suffix() -> String {
     format!("{now:x}")
 }
 
-fn a_sidecar(suffix: &str) -> Sidecar {
+/// An extraction directory: the sidecar, the feature files it names and the
+/// attachment blob. Written rather than mocked, because the loader reads them
+/// off disk the way `verne load` does.
+struct Extraction {
+    sidecar: Sidecar,
+    /// The feature the attachment hangs off, so the test can ask ptolemy for it.
+    well: String,
+    directory: tempfile::TempDir,
+}
+
+fn an_extraction(suffix: &str) -> Extraction {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let well = uuid::Uuid::now_v7().to_string();
+    let inspection = uuid::Uuid::now_v7().to_string();
+
+    write_features(
+        directory.path(),
+        "wells",
+        &[NewFeature {
+            feature_id: well.clone(),
+            geometry_wkb_hex: POINT.into(),
+            properties: serde_json::json!({ "well_name": "Alpha", "depth": 120 })
+                .as_object()
+                .expect("an object")
+                .clone(),
+        }],
+    );
+    // a table with no geometry, which is the case the empty geometry
+    // collection exists for
+    write_features(
+        directory.path(),
+        "inspections",
+        &[NewFeature {
+            feature_id: inspection,
+            geometry_wkb_hex: EMPTY.into(),
+            properties: serde_json::Map::new(),
+        }],
+    );
+    std::fs::create_dir_all(directory.path().join("attachments")).expect("attachments dir");
+    std::fs::write(directory.path().join("attachments/photo.png"), BLOB).expect("the blob");
+
+    Extraction {
+        sidecar: a_sidecar(suffix, &well),
+        well,
+        directory,
+    }
+}
+
+fn write_features(directory: &Path, table: &str, features: &[NewFeature]) {
+    std::fs::create_dir_all(directory.join("features")).expect("features dir");
+    let lines: Vec<String> = features
+        .iter()
+        .map(|feature| serde_json::to_string(feature).expect("a feature serialises"))
+        .collect();
+    std::fs::write(
+        directory.join(format!("features/{table}.ndjson")),
+        lines.join("\n") + "\n",
+    )
+    .expect("the feature file");
+}
+
+fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
     let wells = format!("verne_wells_{suffix}");
     let inspections = format!("verne_inspections_{suffix}");
 
@@ -49,6 +122,7 @@ fn a_sidecar(suffix: &str) -> Sidecar {
             DatasetPlan {
                 source_table: "wells".into(),
                 layer: Some("wells".into()),
+                features: Some("features/wells.ndjson".into()),
                 dataset: NewDataset {
                     name: wells.clone(),
                     srid: 4326,
@@ -99,6 +173,7 @@ fn a_sidecar(suffix: &str) -> Sidecar {
             DatasetPlan {
                 source_table: "inspections".into(),
                 layer: Some("inspections".into()),
+                features: Some("features/inspections.ndjson".into()),
                 dataset: NewDataset {
                     name: inspections.clone(),
                     srid: 4326,
@@ -113,12 +188,21 @@ fn a_sidecar(suffix: &str) -> Sidecar {
         ],
         relationships: vec![NewRelationship {
             name: format!("wells_inspections_{suffix}"),
-            origin_dataset: wells,
+            origin_dataset: wells.clone(),
             destination_dataset: inspections,
             origin_foreign_key: "well_id".into(),
             cardinality: "one_to_many".into(),
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
+        }],
+        attachments: vec![NewAttachment {
+            dataset: wells,
+            feature_id: well_feature.to_string(),
+            name: "photo.png".into(),
+            content_type: Some("image/png".into()),
+            file: "attachments/photo.png".into(),
+            metadata: serde_json::json!({ "source_table": "wells__ATTACH" }),
+            created_by: "verne-load test".into(),
         }],
         log: ExtractionLog::new("verne-load test"),
     }
@@ -161,10 +245,12 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
         return;
     };
     let suffix = suffix();
-    let sidecar = a_sidecar(&suffix);
+    let extraction = an_extraction(&suffix);
     let loader = Loader::new(&live.url, &live.token).expect("the URL is one ptolemy could be at");
 
-    let loaded = loader.load(&sidecar).expect("the sidecar loads");
+    let loaded = loader
+        .load(&extraction.sidecar, extraction.directory.path())
+        .expect("the sidecar loads");
     eprintln!("loaded {}", loaded.sentence());
 
     assert_eq!(loaded.datasets.len(), 2);
@@ -249,6 +335,89 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
     assert_eq!(class["forward_label"], "has inspections");
 }
 
+/// The features and the attachment, read back off the branch the load created.
+///
+/// This is the pair that had to be done together: an attachment in ptolemy
+/// hangs off a feature id, so until verne loaded features there was nothing to
+/// hang one off, and a blob on the dataset instead would have thrown away the
+/// one thing that makes an attachment worth carrying.
+#[test]
+fn the_features_and_their_attachment_come_back_off_the_branch() {
+    let Some(live) = live() else {
+        skipped();
+        return;
+    };
+    let suffix = suffix();
+    let extraction = an_extraction(&suffix);
+    let expected_feature = extraction.well.clone();
+    let loader = Loader::new(&live.url, &live.token).expect("the URL is one ptolemy could be at");
+
+    let loaded = loader
+        .load(&extraction.sidecar, extraction.directory.path())
+        .expect("the sidecar loads");
+    eprintln!("loaded {}", loaded.sentence());
+
+    let wells = format!("verne_wells_{suffix}");
+    assert_eq!(loaded.branches.len(), 2, "every dataset gets a branch");
+    assert_eq!(loaded.features[&wells].features, 1);
+    assert_eq!(loaded.features[&wells].commits, 1);
+    // the table with no geometry loaded too, which is the empty geometry
+    // collection being accepted rather than refused
+    assert_eq!(
+        loaded.features[&format!("verne_inspections_{suffix}")].features,
+        1
+    );
+    assert_eq!(loaded.attachments.len(), 1);
+
+    let client = reqwest::blocking::Client::new();
+    let branch = &loaded.branches[&wells];
+
+    // the feature is on the branch under the id the extraction minted, which
+    // is what let the attachment name it without reading anything back
+    let features: serde_json::Value = client
+        .get(format!("{}/api/v1/branches/{branch}/features", live.url))
+        .bearer_auth(&live.token)
+        .send()
+        .expect("the feature list")
+        .json()
+        .expect("json");
+    let listed = features["features"].as_array().expect("features");
+    assert_eq!(listed.len(), 1, "{features}");
+    assert_eq!(listed[0]["id"].as_str(), Some(expected_feature.as_str()));
+    assert_eq!(listed[0]["properties"]["well_name"], "Alpha", "{features}");
+    assert_eq!(listed[0]["properties"]["depth"], 120, "{features}");
+
+    // the blob comes back byte for byte, with the content type the source row
+    // declared, off the feature it belongs to and not off the dataset
+    let id = &loaded.attachments["photo.png"];
+    let meta: serde_json::Value = client
+        .get(format!("{}/api/v1/attachments/{id}/meta", live.url))
+        .bearer_auth(&live.token)
+        .send()
+        .expect("the attachment metadata")
+        .json()
+        .expect("json");
+    assert_eq!(meta["feature_id"].as_str(), Some(expected_feature.as_str()));
+    assert_eq!(meta["branch_id"].as_str(), Some(branch.as_str()));
+    assert!(meta["dataset_id"].is_null(), "{meta}");
+    assert_eq!(meta["size_bytes"], BLOB.len(), "{meta}");
+    assert_eq!(meta["metadata"]["source_table"], "wells__ATTACH", "{meta}");
+
+    let download = client
+        .get(format!("{}/api/v1/attachments/{id}", live.url))
+        .bearer_auth(&live.token)
+        .send()
+        .expect("the attachment downloads");
+    assert_eq!(
+        download
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert_eq!(download.bytes().expect("bytes").as_ref(), BLOB);
+}
+
 /// ptolemy gates every mutating route on a write ladder, so a loader without a
 /// token creates nothing. The failure has to be the server refusing, not the
 /// loader deciding not to ask.
@@ -258,11 +427,11 @@ fn a_load_without_a_token_is_refused_by_ptolemy() {
         skipped();
         return;
     };
-    let sidecar = a_sidecar(&suffix());
+    let extraction = an_extraction(&suffix());
     let loader = Loader::new(&live.url, "").expect("the URL is fine");
 
     let refused = loader
-        .load(&sidecar)
+        .load(&extraction.sidecar, extraction.directory.path())
         .expect_err("an empty token creates nothing");
     let verne_load::LoadError::Refused { status, route, .. } = refused else {
         panic!("expected ptolemy to refuse it: {refused}");

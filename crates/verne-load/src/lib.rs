@@ -3,17 +3,22 @@
 //! A thin client, on purpose. Every request body is a struct out of
 //! `verne_core::sidecar` serialised as it stands, so there is no place for the
 //! sidecar's shape and ptolemy's to drift apart without the compiler noticing.
-//! Two bodies are not: a subtype's `domain_assignments` and a relationship
+//! Three bodies are not. A subtype's `domain_assignments` and a relationship
 //! class's two sides name ptolemy rows by id, and no id exists until the load
-//! is running. Those are the only two swaps, and they are named as such.
+//! is running. An attachment's bytes are a file beside the sidecar, and the
+//! upload route wants them base64ed into the body. Those are the only three
+//! places a body is built rather than sent, and they are named as such.
 //!
-//! No GDAL: the sidecar is JSON, and loading one needs nothing that read it.
+//! No GDAL: the sidecar is JSON, the features are JSON lines beside it, and the
+//! attachments are plain files. Loading needs nothing that read the source.
 //!
 //! # Order and authorisation
 //!
 //! Datasets first, then the domains and subtypes that hang off one, then the
 //! relationship classes, which name two datasets and cannot be created before
-//! both exist.
+//! both exist. Each dataset also gets a branch, because a dataset with no
+//! branch cannot be committed to and its features have nowhere to go, and the
+//! attachments come last: each hangs off a feature on a branch.
 //!
 //! ptolemy grants the creator of a dataset an admin row on it and enforces a
 //! write ladder on every mutating route thereafter, so the loader has to create
@@ -21,12 +26,27 @@
 //! a grant it has no way to mint.
 
 use std::collections::BTreeMap;
+use std::io::BufRead;
+use std::path::Path;
 
 use serde::Serialize;
-use verne_core::sidecar::{DatasetPlan, NewRelationship, NewSchema, NewSubtype, Sidecar};
+use verne_core::sidecar::{
+    DatasetPlan, MAX_FEATURE_BYTES, NewAttachment, NewFeature, NewRelationship, NewSchema,
+    NewSubtype, Sidecar,
+};
 
 /// Prefix every ptolemy route shares.
 const API: &str = "/api/v1";
+
+/// The branch a load commits its features to. ptolemy creates no branch with a
+/// dataset, so this is the first one the dataset has.
+const BRANCH: &str = "main";
+
+/// How many features go in one commit. The batch is also flushed when the next
+/// feature would take it past [`MAX_FEATURE_BYTES`], which is what stops a
+/// table of large polygons building a body ptolemy refuses; on a table of
+/// points this is what keeps the number of commits down.
+const BATCH_FEATURES: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -56,6 +76,22 @@ pub enum LoadError {
         "relationship class {class} names the dataset {dataset}, which the sidecar does not create"
     )]
     UnknownDataset { class: String, dataset: String },
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{path} line {line} is not a feature: {message}")]
+    BadFeature {
+        path: String,
+        line: usize,
+        message: String,
+    },
+    #[error(
+        "the attachment \"{name}\" belongs to the dataset {dataset}, which the sidecar does not create"
+    )]
+    UnknownAttachmentDataset { name: String, dataset: String },
 }
 
 /// What a load created, keyed by the names the sidecar used.
@@ -73,17 +109,41 @@ pub struct Loaded {
     pub subtypes: BTreeMap<(String, String), String>,
     /// Relationship class name to its id.
     pub relationships: BTreeMap<String, String>,
+    /// Dataset name to the id of the branch its features were committed to.
+    pub branches: BTreeMap<String, String>,
+    /// Dataset name to how many features were committed, and in how many
+    /// commits. A dataset whose table was empty is not in here.
+    pub features: BTreeMap<String, Committed>,
+    /// Attachment name to its id, one per blob that reached its feature.
+    pub attachments: BTreeMap<String, String>,
+}
+
+/// What one dataset's features cost to load.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Committed {
+    pub features: usize,
+    pub commits: usize,
 }
 
 impl Loaded {
     pub fn sentence(&self) -> String {
         format!(
-            "{} datasets, {} schemas, {} domains, {} subtypes, {} relationship classes.",
+            "{} datasets, {} schemas, {} domains, {} subtypes, {} relationship classes, \
+             {} features in {} commits, {} attachments.",
             self.datasets.len(),
             self.schemas.len(),
             self.domains.len(),
             self.subtypes.len(),
-            self.relationships.len()
+            self.relationships.len(),
+            self.features
+                .values()
+                .map(|held| held.features)
+                .sum::<usize>(),
+            self.features
+                .values()
+                .map(|held| held.commits)
+                .sum::<usize>(),
+            self.attachments.len()
         )
     }
 
@@ -129,10 +189,13 @@ impl Loader {
 
     /// Create everything in the sidecar, in the order ptolemy needs it.
     ///
+    /// `directory` is the extraction the sidecar came out of: the feature files
+    /// and the attachment blobs are named relative to it.
+    ///
     /// There is no rollback: a load that fails part way leaves what it already
     /// created, and the error names the route that refused it. Undoing it is a
     /// matter for whoever holds the admin rows the load minted.
-    pub fn load(&self, sidecar: &Sidecar) -> Result<Loaded, LoadError> {
+    pub fn load(&self, sidecar: &Sidecar, directory: &Path) -> Result<Loaded, LoadError> {
         let mut loaded = Loaded::default();
         for plan in &sidecar.datasets {
             let id = self.create_dataset(plan)?;
@@ -140,13 +203,22 @@ impl Loader {
                 .datasets
                 .insert(plan.dataset.name.clone(), id.clone());
             // the schema is about the dataset itself and waits on nothing, so
-            // it goes on before the domains that hang off the same dataset
+            // it goes on before the domains that hang off the same dataset,
+            // and before the features, which ptolemy validates against it
             if self.set_schema(&id, &plan.schema)? {
                 loaded
                     .schemas
                     .insert(plan.dataset.name.clone(), plan.schema.fields.len());
             }
             self.create_domains(plan, &id, &mut loaded)?;
+            let branch = self.create_branch(plan, &id)?;
+            loaded
+                .branches
+                .insert(plan.dataset.name.clone(), branch.clone());
+            let committed = self.commit_features(plan, &branch, directory)?;
+            if committed.features > 0 {
+                loaded.features.insert(plan.dataset.name.clone(), committed);
+            }
         }
         // subtypes only after every domain, because a subtype names one by id
         for plan in &sidecar.datasets {
@@ -161,6 +233,10 @@ impl Loader {
         for class in &sidecar.relationships {
             let id = self.create_relationship(class, &loaded)?;
             loaded.relationships.insert(class.name.clone(), id);
+        }
+        for attachment in &sidecar.attachments {
+            let id = self.upload_attachment(attachment, &loaded, directory)?;
+            loaded.attachments.insert(attachment.name.clone(), id);
         }
         Ok(loaded)
     }
@@ -181,6 +257,138 @@ impl Loader {
         }
         self.put(&format!("{API}/datasets/{dataset_id}/schema"), schema)?;
         Ok(true)
+    }
+
+    /// The dataset's first branch. ptolemy creates none with a dataset, and a
+    /// dataset with no branch has nowhere to hold a feature.
+    fn create_branch(&self, plan: &DatasetPlan, dataset_id: &str) -> Result<String, LoadError> {
+        let route = format!("{API}/datasets/{dataset_id}/branches");
+        let body = self.post(
+            &route,
+            &BranchBody {
+                name: BRANCH,
+                created_by: &plan.dataset.created_by,
+            },
+        )?;
+        id_of(&route, &body)
+    }
+
+    /// The dataset's features, in batches. Read a line at a time rather than
+    /// held in memory: a real geodatabase table is bigger than the process
+    /// should be, and the file is written one insert operation per line so
+    /// that reading it that way is possible.
+    fn commit_features(
+        &self,
+        plan: &DatasetPlan,
+        branch_id: &str,
+        directory: &Path,
+    ) -> Result<Committed, LoadError> {
+        let Some(relative) = &plan.features else {
+            return Ok(Committed::default());
+        };
+        let path = directory.join(relative);
+        let file = std::fs::File::open(&path).map_err(|source| LoadError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+
+        let mut committed = Committed::default();
+        let mut batch: Vec<NewFeature> = Vec::new();
+        let mut bytes = 0usize;
+        for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|source| LoadError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let feature: NewFeature =
+                serde_json::from_str(&line).map_err(|error| LoadError::BadFeature {
+                    path: relative.clone(),
+                    line: index + 1,
+                    message: error.to_string(),
+                })?;
+            // flushed before the feature goes in, not after: a batch that is
+            // already at the limit and then takes one more line is the body
+            // ptolemy refuses
+            if !batch.is_empty()
+                && (batch.len() >= BATCH_FEATURES || bytes + line.len() > MAX_FEATURE_BYTES)
+            {
+                self.commit(plan, branch_id, &batch)?;
+                committed.features += batch.len();
+                committed.commits += 1;
+                batch.clear();
+                bytes = 0;
+            }
+            bytes += line.len();
+            batch.push(feature);
+        }
+        if !batch.is_empty() {
+            self.commit(plan, branch_id, &batch)?;
+            committed.features += batch.len();
+            committed.commits += 1;
+        }
+        Ok(committed)
+    }
+
+    fn commit(
+        &self,
+        plan: &DatasetPlan,
+        branch_id: &str,
+        features: &[NewFeature],
+    ) -> Result<(), LoadError> {
+        self.post(
+            &format!("{API}/branches/{branch_id}/commit"),
+            &CommitBody {
+                message: &format!(
+                    "verne: {} feature{} of {}",
+                    features.len(),
+                    if features.len() == 1 { "" } else { "s" },
+                    plan.source_table
+                ),
+                author: &plan.dataset.created_by,
+                operations: features,
+            },
+        )
+        .map(drop)
+    }
+
+    /// One blob, base64 into the upload route. The only body built out of a
+    /// file rather than out of the sidecar: the bytes are too big to keep in
+    /// a document meant to be read.
+    fn upload_attachment(
+        &self,
+        attachment: &NewAttachment,
+        loaded: &Loaded,
+        directory: &Path,
+    ) -> Result<String, LoadError> {
+        let branch = loaded.branches.get(&attachment.dataset).ok_or_else(|| {
+            LoadError::UnknownAttachmentDataset {
+                name: attachment.name.clone(),
+                dataset: attachment.dataset.clone(),
+            }
+        })?;
+        let path = directory.join(&attachment.file);
+        let bytes = std::fs::read(&path).map_err(|source| LoadError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let route = format!(
+            "{API}/branches/{branch}/features/{}/attachments",
+            attachment.feature_id
+        );
+        let body = self.post(
+            &route,
+            &UploadBody {
+                name: &attachment.name,
+                content_type: attachment.content_type.as_deref(),
+                data: base64(&bytes),
+                metadata: &attachment.metadata,
+                created_by: &attachment.created_by,
+            },
+        )?;
+        id_of(&route, &body)
     }
 
     fn create_domains(
@@ -350,6 +558,40 @@ struct SubtypeBody<'a> {
     code: i32,
     default_values: &'a serde_json::Map<String, serde_json::Value>,
     domain_assignments: serde_json::Map<String, serde_json::Value>,
+}
+
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// `POST /api/v1/datasets/{id}/branches`.
+#[derive(Serialize)]
+struct BranchBody<'a> {
+    name: &'a str,
+    created_by: &'a str,
+}
+
+/// `POST /api/v1/branches/{id}/commit`. The operations are the sidecar's
+/// feature lines put in an array: each one already carries the `insert` tag
+/// ptolemy's `DiffOpRequest` is read by, so nothing here rewrites them.
+#[derive(Serialize)]
+struct CommitBody<'a> {
+    message: &'a str,
+    author: &'a str,
+    operations: &'a [NewFeature],
+}
+
+/// `POST /api/v1/branches/{branch}/features/{feature}/attachments`: the
+/// sidecar's attachment with the file read and base64ed into `data`.
+#[derive(Serialize)]
+struct UploadBody<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<&'a str>,
+    data: String,
+    metadata: &'a serde_json::Value,
+    created_by: &'a str,
 }
 
 /// `POST /api/v1/datasets/{id}/relationships`: the sidecar's class with each

@@ -11,6 +11,8 @@ pub mod definition;
 #[cfg(feature = "gdal")]
 mod extract;
 #[cfg(feature = "gdal")]
+mod features;
+#[cfg(feature = "gdal")]
 mod geopackage;
 #[cfg(feature = "gdal")]
 mod glue;

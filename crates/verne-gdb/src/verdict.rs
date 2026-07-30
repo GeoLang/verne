@@ -206,49 +206,82 @@ fn dedup(mut values: Vec<String>) -> Vec<String> {
 }
 
 /// An attachment relationship and the blob table behind it go to ptolemy's
-/// attachments table.
+/// attachments table, each blob on the feature it belongs to.
 fn attachments(scan: &Scan, items: &mut Vec<Item>) {
-    for relationship in scan.relationships.iter().filter(is_media) {
-        let table = relationship
-            .right_table
+    items.extend(
+        scan.relationships
+            .iter()
+            .filter(is_media)
+            .map(|relationship| attachment_item(scan, relationship)),
+    );
+}
+
+/// The row for one attachment relationship. Public to the crate so an
+/// extraction asks for the verdict on the thing it just wrote rather than
+/// guessing which row it was.
+pub fn attachment_item(scan: &Scan, relationship: &Relationship) -> Item {
+    let table = relationship
+        .right_table
+        .as_deref()
+        .and_then(|name| scan.table(name));
+    let mut detail = format!(
+        "{}: attachments on {}",
+        relationship.name,
+        relationship
+            .left_table
             .as_deref()
-            .and_then(|name| scan.table(name));
-        let mut detail = format!(
-            "{}: attachments on {}",
-            relationship.name,
-            relationship
-                .left_table
-                .as_deref()
-                .unwrap_or("an unnamed table")
-        );
-        if let Some(table) = table {
-            detail.push_str(&format!(
-                ", held in {} ({})",
-                table.name,
-                match table.features {
-                    Some(count) => format!("{count} row{}", plural_u64(count)),
-                    None => "row count not read".to_string(),
-                }
-            ));
-        }
-        items.push(Item::new(
-            relationship
-                .right_table
-                .clone()
-                .unwrap_or_else(|| relationship.name.clone()),
-            ItemKind::EmbeddedResource,
-            detail,
-            Verdict::approximated(
-                Target::Ptolemy,
-                Losses::one(
-                    "ptolemy's attachments carry the bytes, the name, the content type and the size, and the row is tied to a feature id and a branch, so the OBJECTID or GlobalID this table relates on has to be swapped for the id of the loaded feature",
-                )
-                .and(
-                    "verne reads the table's shape and its row count, never the blobs themselves, so nothing here is a claim about what the files are",
-                ),
-            ),
+            .unwrap_or("an unnamed table")
+    );
+    if let Some(table) = table {
+        detail.push_str(&format!(
+            ", held in {} ({})",
+            table.name,
+            match table.features {
+                Some(count) => format!("{count} row{}", plural_u64(count)),
+                None => "row count not read".to_string(),
+            }
         ));
     }
+    Item::new(
+        relationship
+            .right_table
+            .clone()
+            .unwrap_or_else(|| relationship.name.clone()),
+        ItemKind::EmbeddedResource,
+        detail,
+        verdict_for(Target::Ptolemy, attachment_losses(table)),
+    )
+}
+
+/// What an Esri attachment loses on the way to ptolemy's attachments table.
+///
+/// The blob, the file name and the content type each have a column there and
+/// arrive whole; the size is recomputed from the bytes. Everything else the
+/// row held is what this has to name.
+fn attachment_losses(table: Option<&Table>) -> Vec<String> {
+    let mut losses = vec![
+        "an attachment in ptolemy hangs off a feature on one branch, so it reaches the branch the load created and a second branch of the same dataset shows the feature without it".to_string(),
+        "ptolemy takes the bytes as base64 inside a JSON request body, and its request limit is 2 MB, so a blob much over 1.5 MB is refused rather than stored".to_string(),
+    ];
+    // the columns beside the blob have no field on ptolemy's attachment, so
+    // they reach the metadata JSON and stop there
+    if let Some(table) = table {
+        let kept = ["DATA", "ATT_NAME", "CONTENT_TYPE", "DATA_SIZE"];
+        let others: Vec<&str> = table
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .filter(|name| !kept.contains(name))
+            .collect();
+        if !others.is_empty() {
+            losses.push(format!(
+                "the row's other column{} ({}) have no field on ptolemy's attachment, so they are written into its free-form metadata JSON, which nothing in the platform reads",
+                plural(others.len()),
+                others.join(", ")
+            ));
+        }
+    }
+    losses
 }
 
 /// A blob table no media relationship points at. Nothing verne found may go
@@ -260,30 +293,34 @@ fn orphan_attachments(scan: &Scan, items: &mut Vec<Item>) {
         .filter(is_media)
         .filter_map(|relationship| relationship.right_table.as_deref())
         .collect();
-    for table in scan
-        .tables
-        .iter()
-        .filter(|table| table.role == TableRole::Attachment)
-        .filter(|table| !related.contains(&table.name.as_str()))
-    {
-        items.push(Item::new(
-            table.name.clone(),
-            ItemKind::EmbeddedResource,
-            format!(
-                "attachment table with no relationship pointing at it{}",
-                match table.features {
-                    Some(count) => format!(", {count} row{}", plural_u64(count)),
-                    None => String::new(),
-                }
+    items.extend(
+        scan.tables
+            .iter()
+            .filter(|table| table.role == TableRole::Attachment)
+            .filter(|table| !related.contains(&table.name.as_str()))
+            .map(orphan_attachment_item),
+    );
+}
+
+/// The row for a blob table with nothing pointing at it.
+pub fn orphan_attachment_item(table: &Table) -> Item {
+    Item::new(
+        table.name.clone(),
+        ItemKind::EmbeddedResource,
+        format!(
+            "attachment table with no relationship pointing at it{}",
+            match table.features {
+                Some(count) => format!(", {count} row{}", plural_u64(count)),
+                None => String::new(),
+            }
+        ),
+        Verdict::approximated(
+            Target::Ptolemy,
+            Losses::one(
+                "the blobs can go to ptolemy's attachments, but nothing in the geodatabase says which class they belong to, so the link has to be guessed from the table's name",
             ),
-            Verdict::approximated(
-                Target::Ptolemy,
-                Losses::one(
-                    "the blobs can go to ptolemy's attachments, but nothing in the geodatabase says which class they belong to, so the link has to be guessed from the table's name",
-                ),
-            ),
-        ));
-    }
+        ),
+    )
 }
 
 fn is_media(relationship: &&Relationship) -> bool {
@@ -450,15 +487,28 @@ fn table_losses(table: &Table) -> Vec<String> {
         .collect();
     if !binary.is_empty() {
         losses.push(format!(
-            "the binary field{} ({}) hold{} bytes, and ptolemy's properties column is JSONB, so the bytes have to go to the attachments table and be linked back by hand",
+            "the binary field{} ({}) hold{} bytes, and ptolemy's properties column is JSONB, so no value out of {} is committed with the feature; bytes reach ptolemy only where an attachment relationship points at them",
             plural(binary.len()),
             binary.join(", "),
-            if binary.len() == 1 { "s" } else { "" }
+            if binary.len() == 1 { "s" } else { "" },
+            if binary.len() == 1 { "it" } else { "them" }
+        ));
+    }
+    // ptolemy's commit reads every geometry it is given as EPSG:4326, whatever
+    // the dataset's srid column says, so anything else arrives mislabelled. A
+    // table with no geometry has nothing to mislabel.
+    if table.geometry.is_some() && table.srid != Some(4326) {
+        losses.push(format!(
+            "ptolemy's commit reads the geometry it is sent as EPSG:4326 however the dataset declares its srid, and this class is {}, so the coordinates arrive unchanged under a label that is not theirs",
+            match table.srid {
+                Some(code) => format!("EPSG:{code}"),
+                None => "in a spatial reference no EPSG code names".to_string(),
+            }
         ));
     }
     if table.geometry.is_none() {
         losses.push(
-            "this is a table with no geometry; ptolemy's geometry column accepts null but a null geometry there records a deletion, so an attribute-only table needs a convention of its own".to_string(),
+            "this is a table with no geometry; ptolemy's insert takes one and its column accepts a null, but a null geometry there is how a deleted version reads, so every row is committed with an empty geometry collection in place of no geometry at all".to_string(),
         );
     }
     losses

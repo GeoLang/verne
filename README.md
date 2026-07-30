@@ -14,14 +14,15 @@ a running ptolemy. The source is never written to, in either.
 ## Scope
 
 v0.3 reads KML and KMZ, and Esri file geodatabases, and extracts a geodatabase
-into a GeoPackage and a ptolemy sidecar.
+into a GeoPackage and a ptolemy sidecar: the datasets and their semantics, the
+features themselves, and the attachments on the features they belong to.
 
 Reading and extracting reach no network and take no credentials. Verne does not
 follow a NetworkLink or fetch an overlay image, so anything behind a URL is
 reported as outside the inventory rather than inspected, and it never opens a
-raster or an attachment blob. Attachments are not extracted at all: the blobs
-are a slice of work of their own. `verne load` is the one command that reaches a
-network, and the only one that takes a credential.
+raster. An inventory does not open an attachment blob either; an extraction
+does, because carrying one means writing the bytes out. `verne load` is the one
+command that reaches a network, and the only one that takes a credential.
 
 The KML side is pure Rust and needs no GDAL. The geodatabase side is behind the
 `gdb` feature and needs GDAL 3.8 or later, read through GDAL's own OpenFileGDB
@@ -111,24 +112,69 @@ what did not survive.
 
 ## Extraction
 
-`verne extract` writes three things into the directory it is given:
+`verne extract` writes four things into the directory it is given:
 
 ```
 features.gpkg — the features and attributes, converted by GDAL's own vector
                 translate. -preserve_fid is always on, because a geodatabase
                 keys its relationship classes on OBJECTID and OpenFileGDB gives
                 that as the feature id rather than as a field.
+features/     — one file per dataset, one line of JSON per feature, each line a
+                whole insert operation of ptolemy's commit route
+attachments/  — the blobs out of the __ATTACH tables, one file each
 sidecar.json  — the datasets, their column schemas, coded and range domains,
-                subtypes and relationship classes to create in ptolemy, plus
-                the log
+                subtypes, relationship classes and attachments to create in
+                ptolemy, plus the log
 ```
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the
-API. Two fields cannot mirror one, because ptolemy wants the id of a row that
-does not exist until the load is running: a subtype's `domain_assignments` names
-its domains, and a relationship class names its two datasets. Both are typed as
-names, and the loader swaps them for the ids the load minted.
+API. Three fields cannot mirror one. Two are ids of rows that do not exist until
+the load is running: a subtype's `domain_assignments` names its domains, and a
+relationship class names its two datasets, so both are typed as names and the
+loader swaps them. The third is an attachment's bytes, which ptolemy takes as
+base64 in the body: a blob in `sidecar.json` would make the file unreadable, so
+the sidecar names a file beside it and the loader encodes it.
+
+### The features, twice
+
+The features are in the GeoPackage and again in `features/`. That is deliberate
+and it costs disk: on one USGS geodatabase the GeoPackage is 17 MB and the
+feature files 33 MB. `verne-load` builds and ships without GDAL, which it has to
+keep doing, so it cannot open the GeoPackage; reading one with a SQLite crate
+instead would mean verne decoding the GeoPackage geometry header itself and
+re-deriving each column's JSON type out of SQLite's dynamic one, which is work
+GDAL has already done, done again by hand, in the one crate with no GDAL to
+check it. One line per feature also means a load streams the file rather than
+holding a table in memory.
+
+The feature ids are minted by the extraction and not by ptolemy, whose insert
+takes an optional `feature_id`. That is what lets an attachment name the feature
+it belongs to: the load never reads anything back, so the only ids it can key on
+are the ones already written down.
+
+### Attachments
+
+An Esri `__ATTACH` table is carried when a media relationship points at it, and
+each blob lands on the feature it belongs to. ptolemy's attachment holds the
+bytes, the name, the content type and the size; every other column of the source
+row goes into its metadata JSON, which is stored and which nothing in the
+platform reads.
+
+Two things are refused rather than guessed at. A blob table no media
+relationship points at is skipped: ptolemy would take the bytes on the dataset
+instead, but nothing in the geodatabase says which class they belong to, and an
+attachment on the wrong feature is a worse answer than one that did not arrive.
+An `__ATTACH` row whose key matches no feature the extraction wrote is skipped
+the same way. Both are counted in the log with the reason.
+
+ptolemy reads an upload with axum's JSON extractor at its 2 MB default, so a
+blob much over 1.5 MB comes back 413 and the load stops there naming the route.
+Same limit, same reason, on the features: a single insert over 1 MB is not
+written to the feature file at all, since no batching could ever commit it. It
+stays in the GeoPackage and the log says which rows and how big. One real
+feature hits this, the outermost hydrologic unit boundary of a USGS
+geodatabase, a single polygon of 2.7 MB.
 
 The GeoPackage holds some things ptolemy does not: for a domain bound straight
 to a field, the domain itself with its description and its split and merge
@@ -153,7 +199,10 @@ one: the label survives the migration and no screen has caught up with it yet.
 A column's type goes the same way, mapped onto ptolemy's six field types. Where
 none of them names the source type, as with a date, a binary column or a list,
 the nearest is used and both the report and the log name the column and the type
-it had.
+it had. A binary column is the one whose values do not follow: ptolemy's
+properties are JSON, so the column is declared a string and no value is written
+into it. Bytes reach ptolemy only where an attachment relationship points at
+them.
 
 ### The extraction log
 
@@ -162,19 +211,39 @@ carried with the report's own words for what was left behind, or skipped with a
 reason. Whether an entry reads as carried or approximated is decided by the
 verdict and not by the caller, so a report and the log beside it cannot give
 different accounts of the same thing. The log also records the losses the
-conversion itself takes, which no verdict covers: one geodatabase domain becomes
-one ptolemy domain per dataset that uses it, and the copies come apart from each
-other; a subtype default arrives as the text the definition XML holds.
+conversion itself takes, which no verdict covers, because they are only known by
+reading the rows: one geodatabase domain becomes one ptolemy domain per dataset
+that uses it, and the copies come apart from each other; a subtype default
+arrives as the text the definition XML holds; a row with no shape in a class
+that has one is written with an empty geometry; a row whose insert is over the
+limit is not written at all; an `__ATTACH` row that matches no feature is not
+attached to anything.
 
 The operator who ran it is recorded, along with an RFC 3339 timestamp. Both are
 required rather than optional: an extraction has to be able to say who made it.
 
 ## Loading
 
-`verne load` creates datasets first, each with its schema and then the domains
-that hang off it, then the subtypes, which name a domain by id, then the
-relationship classes, which name two datasets and cannot be created before both
-exist.
+`verne load` creates datasets first, each with its schema, then the domains that
+hang off it, then a branch and the features on it, then the subtypes, which name
+a domain by id, then the relationship classes, which name two datasets and
+cannot be created before both exist, and last the attachments, each of which
+hangs off a feature on a branch.
+
+The branch is the loader's doing: ptolemy creates none with a dataset, and a
+dataset with no branch cannot be committed to, so the features would have
+nowhere to go. Every dataset gets one called `main`.
+
+Features go in batches of up to 500, and a batch is flushed early when the next
+feature would take it past 1 MB. ptolemy raises no body limit of its own, so
+axum's 2 MB default is what a commit has to fit inside; 500 keeps the number of
+commits down on a table of points, and the byte count is what stops a table of
+polygons building a body that comes back 413. The schema is set before the
+features so ptolemy validates them against it, which is why a column arriving as
+a type the schema does not declare is left out at extraction rather than sent.
+
+On one USGS geodatabase (41 tables, 8.3 MB) the extraction takes 0.4 seconds and
+the load 9.4, for 29,602 features in 100 commits.
 
 The token comes from `VERNE_PTOLEMY_TOKEN` and is never an argument, which would
 put it in the process list. ptolemy grants the creator of a dataset an admin row

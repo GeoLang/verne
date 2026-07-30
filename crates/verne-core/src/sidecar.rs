@@ -4,11 +4,14 @@
 //!
 //! Every request-shaped struct here mirrors a ptolemy request body field for
 //! field, so loading is a POST of the struct rather than a translation that can
-//! drift from the API. Two fields cannot mirror one: a subtype's domain
+//! drift from the API. Three fields cannot mirror one. A subtype's domain
 //! assignments and a relationship's two sides name ptolemy rows by the id of a
 //! thing that does not exist until the load is running, so those carry the
-//! source's names and the loader does the swap. Both are typed as maps and
-//! names rather than as ids, so the swap cannot be forgotten.
+//! source's names and the loader does the swap; both are typed as maps and
+//! names rather than as ids, so the swap cannot be forgotten. The third is an
+//! attachment's bytes, which ptolemy takes as base64 in the body: keeping a
+//! blob in here would make the sidecar unreadable, so the bytes are a file
+//! beside it and the loader encodes them.
 //!
 //! Pure serde: no GDAL, no HTTP, no filesystem.
 
@@ -27,6 +30,33 @@ pub const SIDECAR_FILE: &str = "sidecar.json";
 
 /// The GeoPackage's name inside an extraction directory.
 pub const GEOPACKAGE_FILE: &str = "features.gpkg";
+
+/// Where the per-dataset feature files go, one line of JSON per feature.
+///
+/// The features are in the GeoPackage as well, and this is a second copy of
+/// them. The loader builds without GDAL and must stay that way, so it cannot
+/// open the GeoPackage; reading one with a SQLite crate instead would mean
+/// verne decoding the GeoPackage geometry header and re-deriving each column's
+/// JSON type from SQLite's dynamic one, which is GDAL's work done a second time
+/// and by hand. The cost of the copy is disk: an extraction directory holds
+/// every feature twice.
+pub const FEATURES_DIR: &str = "features";
+
+/// Where the attachment blobs go, one file each.
+pub const ATTACHMENTS_DIR: &str = "attachments";
+
+/// The most one feature's JSON may be, in bytes.
+///
+/// ptolemy reads a commit body with axum's JSON extractor and raises no limit
+/// of its own, so the 2 MB default stands: a body over it comes back 413 with
+/// the body never read. This is that with room for the rest of the batch, and
+/// it is one number rather than two because it answers both questions. An
+/// extraction will not write a feature bigger than this, since nothing could
+/// ever commit it, and a load flushes a batch before it would cross it.
+///
+/// One real feature hits this: the outermost hydrologic unit boundary of a
+/// USGS geodatabase is a single polygon of 2.7 MB.
+pub const MAX_FEATURE_BYTES: usize = 1024 * 1024;
 
 /// A dataset to create: `POST /api/v1/datasets`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +197,48 @@ pub struct NewRelationship {
     pub backward_label: String,
 }
 
+/// One feature to insert: one `insert` operation of ptolemy's
+/// `POST /api/v1/branches/{id}/commit`, tag included, so a commit body is
+/// these lines put in an array and nothing else.
+///
+/// The id is minted by the extraction rather than left to ptolemy, which is
+/// what lets an attachment name the feature it belongs to without the load
+/// reading anything back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "insert")]
+pub struct NewFeature {
+    pub feature_id: String,
+    /// The geometry as hex WKB. A row from a table with no geometry, or a row
+    /// whose geometry is null, carries an empty geometry collection: ptolemy's
+    /// insert has no way to say "no geometry" that is not also how it says
+    /// "deleted".
+    pub geometry_wkb_hex: String,
+    pub properties: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One attachment: `POST /api/v1/branches/{branch}/features/{feature}/attachments`
+/// with the bytes in a file instead of inline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewAttachment {
+    /// The dataset the feature belongs to, by the name the sidecar creates it
+    /// under. The upload route wants a branch, and the branch is the one the
+    /// load made for this dataset.
+    pub dataset: String,
+    /// The feature it hangs off, as minted in that dataset's feature file.
+    pub feature_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// The file holding the bytes, named relative to the sidecar. The one
+    /// field that is not what ptolemy is sent: the loader reads the file and
+    /// base64s it into `data`.
+    pub file: String,
+    /// Every column of the source row that is not the blob itself, so nothing
+    /// the `__ATTACH` table held is dropped without being written down.
+    pub metadata: serde_json::Value,
+    pub created_by: String,
+}
+
 /// One dataset and everything ptolemy hangs off it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatasetPlan {
@@ -175,6 +247,13 @@ pub struct DatasetPlan {
     /// The GeoPackage layer holding its features, absent when none was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<String>,
+    /// The file of [`NewFeature`] lines to commit, named relative to the
+    /// sidecar. Absent when the extraction wrote none. Defaulted on the wire
+    /// because a sidecar written before features were loaded at all had none
+    /// to name, so reading it as "no features" is the truth about it and not a
+    /// silent drop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<String>,
     pub dataset: NewDataset,
     /// No serde default: a sidecar written before schemas existed would
     /// otherwise load with an empty one and drop every alias without saying so,
@@ -187,8 +266,10 @@ pub struct DatasetPlan {
 /// Everything an extraction produced apart from the features themselves.
 ///
 /// The order of the fields is the order a load has to run in: a dataset before
-/// the domains and subtypes that reference it, and every dataset before a
-/// relationship class, which names two of them.
+/// the domains and subtypes that reference it, every dataset before a
+/// relationship class, which names two of them, and the attachments last of
+/// all, because each one hangs off a feature on a branch and neither exists
+/// until its dataset has been created and committed to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sidecar {
     /// The source it came out of, as the report describes it.
@@ -198,6 +279,11 @@ pub struct Sidecar {
     pub geopackage: Option<String>,
     pub datasets: Vec<DatasetPlan>,
     pub relationships: Vec<NewRelationship>,
+    /// Every attachment that could be attributed to a feature. One that could
+    /// not is not in here: it is a skipped entry in the log with the reason.
+    /// Defaulted on the wire for the same reason `DatasetPlan::features` is.
+    #[serde(default)]
+    pub attachments: Vec<NewAttachment>,
     pub log: ExtractionLog,
 }
 

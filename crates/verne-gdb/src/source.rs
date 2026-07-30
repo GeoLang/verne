@@ -25,6 +25,8 @@ pub enum GdbError {
     NothingFound,
     #[error("cannot write the GeoPackage at {path}: {message}")]
     Convert { path: String, message: String },
+    #[error("cannot read the features of {table}: {message}")]
+    Features { table: String, message: String },
     #[error("cannot write {path}: {source}")]
     Write {
         path: String,

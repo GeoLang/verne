@@ -16,9 +16,14 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
 ] }
+# ptolemy takes an attachment's bytes as base64 in the JSON body
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
 serde_json = "1"
+tempfile = "3"
+# the live test mints its own feature ids, as an extraction does
+uuid = { version = "1", features = ["v7"] }

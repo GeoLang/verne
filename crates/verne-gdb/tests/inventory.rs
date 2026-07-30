@@ -125,7 +125,10 @@ fn a_table_without_geometry_needs_a_convention() {
     let inspections = only_matching(&items, ItemKind::FeatureCollection, "inspections");
     assert_eq!(inspections.verdict.outcome(), Outcome::Approximated);
     assert!(
-        inspections.verdict.shortfall().contains("deletion"),
+        inspections
+            .verdict
+            .shortfall()
+            .contains("empty geometry collection"),
         "{}",
         inspections.verdict.shortfall()
     );

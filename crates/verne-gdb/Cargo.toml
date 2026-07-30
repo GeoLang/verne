@@ -10,7 +10,7 @@ description = "Esri File Geodatabase inventory adapter for verne"
 [features]
 # Off by default: the rest of the workspace builds and tests without GDAL.
 default = []
-gdal = ["dep:gdal", "dep:gdal-sys"]
+gdal = ["dep:gdal", "dep:gdal-sys", "dep:uuid"]
 
 [dependencies]
 verne-core = { path = "../verne-core" }
@@ -18,6 +18,9 @@ quick-xml = "0.41"
 serde_json = "1"
 thiserror = "2"
 gdal = { version = "0.19", optional = true }
+# v7 so the ids an extraction mints sort by the moment it made them, which is
+# what ptolemy gives a feature it names itself
+uuid = { version = "1", features = ["v7"], optional = true }
 gdal-sys = { version = "0.12", optional = true }
 
 [dev-dependencies]

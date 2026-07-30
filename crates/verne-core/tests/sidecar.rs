@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use verne_core::sidecar::{Action, ExtractionLog, LogEntry};
 use verne_core::{
-    DatasetPlan, Item, ItemKind, Losses, NewDataset, NewDomain, NewField, NewRelationship,
-    NewSchema, NewSubtype, Sidecar, SourceDescription, Target, Verdict,
+    DatasetPlan, Item, ItemKind, Losses, NewAttachment, NewDataset, NewDomain, NewFeature,
+    NewField, NewRelationship, NewSchema, NewSubtype, Sidecar, SourceDescription, Target, Verdict,
 };
 
 fn faithful(location: &str) -> Item {
@@ -188,6 +188,7 @@ fn a_sidecar() -> Sidecar {
         datasets: vec![DatasetPlan {
             source_table: "wells".into(),
             layer: Some("wells".into()),
+            features: Some("features/wells.ndjson".into()),
             dataset: NewDataset {
                 name: "wells".into(),
                 srid: 4326,
@@ -231,6 +232,15 @@ fn a_sidecar() -> Sidecar {
             cardinality: "one_to_many".into(),
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
+        }],
+        attachments: vec![NewAttachment {
+            dataset: "wells".into(),
+            feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+            name: "photo.png".into(),
+            content_type: Some("image/png".into()),
+            file: "attachments/wells__ATTACH/0-photo.png".into(),
+            metadata: serde_json::json!({ "REL_OBJECTID": "1" }),
+            created_by: "operator@example.test".into(),
         }],
         log,
     }
@@ -352,4 +362,28 @@ fn a_sidecar_without_a_schema_is_refused() {
 
     let refused = Sidecar::from_json(&json.to_string()).expect_err("a missing schema is an error");
     assert!(refused.to_string().contains("schema"), "{refused}");
+}
+
+/// A feature line is a whole `insert` operation of ptolemy's commit route, tag
+/// included, so a commit body is these lines in an array and the loader
+/// rewrites nothing.
+#[test]
+fn a_feature_serialises_as_ptolemys_insert_operation() {
+    let feature = NewFeature {
+        feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+        geometry_wkb_hex: "0101000000000000000000f03f0000000000000040".into(),
+        properties: serde_json::json!({ "depth": 120 })
+            .as_object()
+            .expect("an object")
+            .clone(),
+    };
+
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&feature).expect("serialises")).expect("json");
+
+    assert_eq!(json["type"], "insert");
+    assert_eq!(json["feature_id"], "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
+    assert_eq!(json["properties"]["depth"], 120);
+    let read: NewFeature = serde_json::from_value(json).expect("a line reads back");
+    assert_eq!(read, feature);
 }

@@ -17,6 +17,7 @@ use verne_core::{
     NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source,
 };
 
+use crate::features;
 use crate::geopackage;
 use crate::glue::{Domain, DomainKind, Relationship};
 use crate::scan::{self, Scan, Table};
@@ -79,6 +80,42 @@ impl GdbSource {
             conversions.push(geopackage_conversion(&scan, layer));
         }
 
+        // the features again, in the form the loader posts: it builds without
+        // GDAL and cannot open the GeoPackage holding the same rows
+        let owned: Vec<(String, String)> = datasets
+            .iter()
+            .map(|plan| (plan.source_table.clone(), plan.dataset.name.clone()))
+            .collect();
+        let named: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(table, dataset)| (table.as_str(), dataset.as_str()))
+            .collect();
+        let written = features::write(&self.dataset, &scan, directory, &named, operator)?;
+        let attachments = written.attachments;
+        for file in &written.files {
+            let Some(plan) = datasets
+                .iter_mut()
+                .find(|plan| plan.source_table == file.source_table)
+            else {
+                continue;
+            };
+            plan.features = Some(file.path.clone());
+            conversions.push(Conversion {
+                location: file.source_table.clone(),
+                kind: ItemKind::FeatureCollection,
+                detail: format!("{} feature{}", file.features, plural(file.features)),
+                destination: file.path.clone(),
+                losses: file.losses.clone(),
+            });
+        }
+        place_attachments(
+            &scan,
+            &named,
+            &written.attachment_files,
+            &mut placed,
+            &mut conversions,
+        );
+
         let mut log = ExtractionLog::new(operator);
         // walked in report order, so the log reads down the same list the
         // markdown report does
@@ -104,6 +141,7 @@ impl GdbSource {
             geopackage: Some(GEOPACKAGE_FILE.to_string()),
             datasets,
             relationships,
+            attachments,
             log,
         };
         let sidecar_path = directory.join(SIDECAR_FILE);
@@ -196,7 +234,7 @@ struct Conversion {
 fn left_behind(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::EmbeddedResource => {
-            "attachments are not extracted: the blobs are a slice of work of their own, and verne opens none of them"
+            "an attachment reaches ptolemy on the feature it belongs to, and this one names no feature this extraction created, so there is nothing to hang it off"
         }
         ItemKind::Hierarchy => {
             "ptolemy has no container above a dataset, so there is nothing to create for the grouping itself; the classes it held each became a dataset"
@@ -207,6 +245,74 @@ fn left_behind(kind: ItemKind) -> &'static str {
         _ => {
             "this extraction writes datasets, domains, subtypes and relationship classes, and nothing else"
         }
+    }
+}
+
+// ─── Attachments ────────────────────────────────────────────────────
+
+/// What became of every blob table, whether or not this extraction carried it.
+///
+/// A row that cannot be attributed to a feature is skipped and said to be
+/// skipped. It is never attached to something else: an attachment on the wrong
+/// feature is a worse answer than an attachment that did not arrive, and the
+/// whole point of carrying one is which feature it belongs to.
+fn place_attachments(
+    scan: &Scan,
+    tables: &[(&str, &str)],
+    written: &[features::AttachmentFile],
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) {
+    let media = features::media_relationships(scan, tables);
+    for relationship in scan
+        .relationships
+        .iter()
+        .filter(|held| held.related_table_type.as_deref() == Some("media"))
+    {
+        let item = verdict::attachment_item(scan, relationship);
+        let carried = written
+            .iter()
+            .find(|file| Some(file.source_table.as_str()) == relationship.right_table.as_deref());
+        match carried {
+            Some(file) if file.carried > 0 => {
+                placed.push((item, Placed::At(format!("attachments of {}", file.source_table))));
+                if !file.orphans.is_empty() {
+                    conversions.push(Conversion {
+                        location: file.source_table.clone(),
+                        kind: ItemKind::EmbeddedResource,
+                        detail: format!("{} attachment{} carried", file.carried, plural(file.carried)),
+                        destination: format!("attachments of {}", file.source_table),
+                        losses: file.orphans.clone(),
+                    });
+                }
+            }
+            Some(file) => placed.push((
+                item,
+                Placed::Left(if file.orphans.is_empty() {
+                    format!("{} holds no rows to attach", file.source_table)
+                } else {
+                    file.orphans.join("; ")
+                }),
+            )),
+            None => placed.push((
+                item,
+                Placed::Left(format!(
+                    "{} names a side this extraction did not turn into a dataset or a blob table, so there is no feature to attach anything to",
+                    relationship.name
+                )),
+            )),
+        }
+    }
+    for table in features::orphan_attachment_tables(scan, &media) {
+        let Some(scanned) = scan.table(table) else {
+            continue;
+        };
+        placed.push((
+            verdict::orphan_attachment_item(scanned),
+            Placed::Left(format!(
+                "no media relationship points at {table}, so nothing in the geodatabase says which class its blobs belong to; verne will not guess it from the name and left them"
+            )),
+        ));
     }
 }
 
@@ -249,6 +355,7 @@ fn dataset_plans(
         plans.push(DatasetPlan {
             source_table: table.name.clone(),
             layer: None,
+            features: None,
             dataset: NewDataset {
                 name: table.name.clone(),
                 srid: table.srid.unwrap_or(DEFAULT_SRID),
@@ -634,6 +741,7 @@ mod tests {
             .map(|name| DatasetPlan {
                 source_table: (*name).to_string(),
                 layer: None,
+                features: None,
                 dataset: NewDataset {
                     name: (*name).to_string(),
                     srid: DEFAULT_SRID,

@@ -31,6 +31,9 @@ struct Extracted {
     sidecar: Sidecar,
     report: Report,
     geopackage: PathBuf,
+    /// Where the extraction landed, so the feature files and the blobs it
+    /// names can be read back off disk.
+    directory: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -54,6 +57,7 @@ fn extract() -> Extracted {
     );
     Extracted {
         geopackage: extraction.geopackage_path.expect("a GeoPackage is written"),
+        directory: extraction.directory,
         sidecar: extraction.sidecar,
         report,
         _dir: dir,
@@ -175,21 +179,26 @@ fn every_user_table_becomes_a_dataset() {
     assert_eq!(inspections.dataset.geometry_type, "geometry");
 }
 
-/// The system and attachment tables are not datasets, and the log says so
-/// rather than leaving them out.
+/// A blob table is not a dataset. Its rows go to ptolemy's attachments, on the
+/// features they belong to, and the log says which.
 #[test]
-fn the_tables_that_are_not_data_are_left_with_a_reason() {
+fn an_attachment_table_is_carried_as_attachments_and_not_as_a_dataset() {
     let extracted = extract();
     assert!(extracted.sidecar.dataset("wells__ATTACH").is_none());
     assert!(extracted.sidecar.dataset("GDB_Items").is_none());
 
     let attachments = entry(&extracted, "wells__ATTACH");
-    let Action::Skipped { reason } = &attachments.action else {
-        panic!("an attachment table is not extracted: {attachments:?}");
+    let Action::CarriedWithLoss { losses } = &attachments.action else {
+        panic!("the fixture's one attachment is carried: {attachments:?}");
     };
+    assert_eq!(
+        attachments.destination.as_deref(),
+        Some("attachments of wells__ATTACH")
+    );
+    // what ptolemy's attachment cannot hold has to be named
     assert!(
-        reason.contains("blobs are a slice of work of their own"),
-        "{reason}"
+        losses.iter().any(|loss| loss.contains("REL_OBJECTID")),
+        "{losses:?}"
     );
 }
 
@@ -623,4 +632,128 @@ fn only<'a>(items: &'a [Item], kind: ItemKind, location: &str) -> &'a Item {
         .iter()
         .find(|item| item.kind == kind && item.location == location)
         .unwrap_or_else(|| panic!("no {kind} row for {location}"))
+}
+
+// ─── The features and the attachments ───────────────────────────────
+
+fn features(extracted: &Extracted, dataset: &str) -> Vec<serde_json::Value> {
+    let plan = extracted
+        .sidecar
+        .dataset(dataset)
+        .unwrap_or_else(|| panic!("no plan for {dataset}"));
+    let named = plan
+        .features
+        .as_deref()
+        .unwrap_or_else(|| panic!("{dataset} names no feature file"));
+    let text = std::fs::read_to_string(extracted.directory.join(named))
+        .unwrap_or_else(|_| panic!("{named} is written"));
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("every line is one operation"))
+        .collect()
+}
+
+/// The whole reason the features are written a second time: the loader builds
+/// without GDAL, so what it gets is a file of ptolemy's own insert operations.
+#[test]
+fn every_dataset_names_a_file_of_insert_operations() {
+    let extracted = extract();
+    for plan in &extracted.sidecar.datasets {
+        assert_eq!(
+            plan.features.as_deref(),
+            Some(format!("features/{}.ndjson", plan.source_table).as_str()),
+            "{} names no feature file",
+            plan.source_table
+        );
+    }
+
+    let wells = features(&extracted, "wells");
+    assert_eq!(wells.len(), 1);
+    assert_eq!(wells[0]["type"], "insert");
+    assert_eq!(
+        wells[0]["geometry_wkb_hex"],
+        "0101000000000000000000f03f0000000000000040"
+    );
+    assert_eq!(wells[0]["properties"]["well_name"], "Alpha");
+    assert_eq!(wells[0]["properties"]["depth"], 120);
+    // ptolemy's properties are JSON and the schema declares the blob column a
+    // string, so a value for it would arrive as something it is not
+    assert!(wells[0]["properties"].get("logo").is_none(), "{wells:?}");
+}
+
+/// A row from a table with no geometry: ptolemy's insert takes a geometry and
+/// reads a null one as a deletion, so it gets an empty geometry collection.
+#[test]
+fn a_row_with_no_geometry_carries_an_empty_geometry_collection() {
+    let extracted = extract();
+    let empty = extracted
+        .sidecar
+        .dataset("inspections")
+        .expect("inspections");
+    assert!(empty.features.is_some());
+
+    // the fixture's table is empty, so the convention is stated in the report
+    // rather than shown in a row
+    let inspections = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "inspections",
+    );
+    assert!(
+        inspections
+            .verdict
+            .shortfall()
+            .contains("empty geometry collection"),
+        "{}",
+        inspections.verdict.shortfall()
+    );
+}
+
+/// An attachment names the feature it belongs to by the id the extraction
+/// minted for it, which is the whole point of minting them here.
+#[test]
+fn an_attachment_names_a_feature_the_extraction_wrote() {
+    let extracted = extract();
+    assert_eq!(extracted.sidecar.attachments.len(), 1);
+    let attachment = &extracted.sidecar.attachments[0];
+
+    assert_eq!(attachment.dataset, "wells");
+    assert_eq!(attachment.name, "photo.png");
+    assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
+    assert_eq!(attachment.created_by, "operator@example.test");
+    // the columns ptolemy has no field for are kept in the metadata
+    assert_eq!(attachment.metadata["REL_OBJECTID"], "1");
+    assert_eq!(attachment.metadata["source_table"], "wells__ATTACH");
+
+    let wells = features(&extracted, "wells");
+    assert_eq!(attachment.feature_id, wells[0]["feature_id"]);
+
+    // the bytes are a file beside the sidecar, never inside it
+    let bytes = std::fs::read(extracted.directory.join(&attachment.file)).expect("the blob");
+    assert_eq!(bytes, [0x89, 0x50, 0x4e, 0x47]);
+    let sidecar = std::fs::read_to_string(extracted.directory.join(SIDECAR_FILE)).expect("read");
+    assert!(!sidecar.contains("iVBOR"), "the blob is not in the sidecar");
+}
+
+/// A blob table nothing points at is skipped and said to be skipped. Attaching
+/// it to whatever the name suggests would put files on the wrong features,
+/// which is worse than not carrying them.
+#[test]
+fn an_orphan_attachment_table_is_skipped_with_the_reason() {
+    let extracted = extract();
+    assert!(
+        extracted
+            .sidecar
+            .attachments
+            .iter()
+            .all(|held| held.file.contains("wells__ATTACH")),
+        "{:?}",
+        extracted.sidecar.attachments
+    );
+
+    let orphan = entry(&extracted, "pads__ATTACH");
+    let Action::Skipped { reason } = &orphan.action else {
+        panic!("nothing says which class these belong to: {orphan:?}");
+    };
+    assert!(reason.contains("will not guess"), "{reason}");
+    assert!(orphan.destination.is_none(), "{orphan:?}");
 }

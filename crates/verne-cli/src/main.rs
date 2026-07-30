@@ -97,8 +97,11 @@ fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         path.to_path_buf()
     };
+    // the feature files and the attachment blobs are named relative to the
+    // sidecar, so the directory holding it is what the loader reads from
+    let directory = sidecar_path.parent().unwrap_or(Path::new("."));
     let sidecar = Sidecar::from_json(&std::fs::read_to_string(&sidecar_path)?)?;
-    let loaded = Loader::new(ptolemy, &token)?.load(&sidecar)?;
+    let loaded = Loader::new(ptolemy, &token)?.load(&sidecar, directory)?;
     println!("loaded into {ptolemy}: {}", loaded.sentence());
     for (name, id) in &loaded.datasets {
         println!("  dataset {name} {id}");

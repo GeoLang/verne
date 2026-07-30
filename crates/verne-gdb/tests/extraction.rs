@@ -893,10 +893,11 @@ fn a_compound_class_carries_its_original_with_its_wkt() {
     });
     assert_eq!(point_z(original), kept);
 
-    // while the working copy really was transformed: NAD83 to WGS 84 moves
-    // the point, so identical bytes would mean the transform never ran
-    let working = gauges[0]["geometry_wkb_hex"].as_str().expect("the copy");
-    assert_ne!(working, original);
+    // nothing here compares the working copy to the original: PROJ picks the
+    // NAD83 to WGS 84 operation per environment and one candidate is the null
+    // transformation, under which identical bytes are correct. that the
+    // transform path really runs is the plots test, where UTM metres to
+    // degrees cannot be an identity
 
     let written = extracted
         .sidecar

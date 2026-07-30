@@ -302,7 +302,11 @@ fn write_table(
     // has an EPSG code to store it under, since that is how ptolemy names one.
     // a codeless reference keeps its original in the GeoPackage alone, and the
     // losses say so
-    let original_srid = if transform.is_some() { table.srid } else { None };
+    let original_srid = if transform.is_some() {
+        table.srid
+    } else {
+        None
+    };
 
     let mut minted = key_field.map(|_| BTreeMap::new());
     let mut tally = Tally::default();
@@ -312,8 +316,10 @@ fn write_table(
         let (geometry, native) = match feature.geometry() {
             Some(shape) => match wkb_hex(shape, transform.as_deref()) {
                 Ok(hex) => {
-                    let native = original_srid
-                        .and_then(|srid| wkb_hex(shape, None).ok().map(|original| (original, srid)));
+                    let native = match original_srid {
+                        Some(srid) => wkb_hex(shape, None).ok().map(|original| (original, srid)),
+                        None => None,
+                    };
                     (hex, native)
                 }
                 // a geometry GDAL will not transform or will not export is

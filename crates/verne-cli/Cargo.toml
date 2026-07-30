@@ -1,0 +1,17 @@
+[package]
+name = "verne-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command line inventory of third-party geospatial sources"
+
+[[bin]]
+name = "verne"
+path = "src/main.rs"
+
+[dependencies]
+verne-core = { path = "../verne-core" }
+verne-kml = { path = "../verne-kml" }
+clap = { version = "4", features = ["derive"] }

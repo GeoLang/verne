@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/GeoLang/verne"
+authors = ["GeoLang <tiletopia@proton.me>"]
+description = "Read-only inventory of third-party geospatial sources"

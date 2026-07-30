@@ -147,6 +147,21 @@ fn a_missing_path_fails() {
 }
 
 #[test]
+fn truncated_document_fails() {
+    // a partial inventory of a cut-off file must not pass for a clean source
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = write(
+        &dir,
+        "cut.kml",
+        b"<kml><Document><name>a</name><Placemark><Point>",
+    );
+    match error(&path) {
+        KmlError::Truncated(open) => assert!(open.contains("Placemark")),
+        other => panic!("expected a truncation error, got {other:?}"),
+    }
+}
+
+#[test]
 fn malformed_xml_fails() {
     // a mismatched end tag, not a truncated one: quick_xml reaches Eof without
     // complaining about elements left open

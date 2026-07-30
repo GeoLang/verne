@@ -495,16 +495,11 @@ fn table_losses(table: &Table) -> Vec<String> {
         ));
     }
     // ptolemy's commit reads every geometry it is given as EPSG:4326, whatever
-    // the dataset's srid column says, so anything else arrives mislabelled. A
-    // table with no geometry has nothing to mislabel.
-    if table.geometry.is_some() && table.srid != Some(4326) {
-        losses.push(format!(
-            "ptolemy's commit reads the geometry it is sent as EPSG:4326 however the dataset declares its srid, and this class is {}, so the coordinates arrive unchanged under a label that is not theirs",
-            match table.srid {
-                Some(code) => format!("EPSG:{code}"),
-                None => "in a spatial reference no EPSG code names".to_string(),
-            }
-        ));
+    // the dataset's srid column says, so a class in anything else is
+    // transformed on the way in. A table with no geometry has nothing to
+    // transform.
+    if table.geometry.is_some() {
+        losses.extend(reprojection_losses(table));
     }
     if table.geometry.is_none() {
         losses.push(
@@ -512,6 +507,34 @@ fn table_losses(table: &Table) -> Vec<String> {
         );
     }
     losses
+}
+
+/// What getting a class's geometry into the only spatial reference ptolemy
+/// stores costs it.
+///
+/// ptolemy's commit hands every WKB it is given to `ST_GeomFromWKB(..., 4326)`,
+/// so 4326 is not a default it could be talked out of: it is the only thing the
+/// column ever holds. A class in anything else is therefore transformed, and
+/// the transformation is the loss. A class with no spatial reference at all
+/// cannot be transformed and is not sent, because the alternative is committing
+/// metres or feet to be read as degrees.
+fn reprojection_losses(table: &Table) -> Vec<String> {
+    if table.crs.is_none() {
+        return vec![
+            "this class names no spatial reference, and ptolemy reads every geometry it is committed as EPSG:4326, so its coordinates would be read as degrees whatever they are; there is nothing to transform out of and none of its features are sent at all".to_string(),
+        ];
+    }
+    if table.srid == Some(4326) {
+        return Vec::new();
+    }
+    let named = match (&table.crs, table.srid) {
+        (Some(name), Some(code)) => format!("{name} (EPSG:{code})"),
+        (Some(name), None) => format!("{name}, which no EPSG code names"),
+        _ => "its own spatial reference".to_string(),
+    };
+    vec![format!(
+        "ptolemy stores geometry as EPSG:4326 and nothing else, so this class is transformed out of {named} by GDAL before it is committed; every vertex is recomputed rather than carried across, a change of datum is only as good as the transformation PROJ finds for the pair and the grids it has installed, and ptolemy records nowhere what the class was in"
+    )]
 }
 
 /// A domain goes to ptolemy's domains table: coded values as JSON, a range as

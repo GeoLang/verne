@@ -52,6 +52,11 @@ pub struct Table {
     /// EPSG code of the layer's spatial reference. Absent when the layer has
     /// none, or has one no authority names.
     pub srid: Option<i32>,
+    /// The name of that spatial reference. A layer can have a reference GDAL
+    /// can transform out of and no EPSG code for it, so this is what says
+    /// whether there is a reference at all; `srid` only says whether EPSG
+    /// names it.
+    pub crs: Option<String>,
     pub features: Option<u64>,
     pub fields: Vec<Field>,
     /// What the Esri definition blob says about it.
@@ -145,6 +150,7 @@ pub fn scan(dataset: &Dataset) -> Scan {
             },
             geometry_code: geometry_type,
             srid: epsg(defn),
+            crs: crs(defn),
             // a count GDAL would have to walk the table for is not worth it
             features: layer.try_feature_count(),
             fields,
@@ -202,6 +208,12 @@ fn epsg(defn: &gdal::vector::Defn) -> Option<i32> {
         return None;
     }
     spatial_ref.auth_code().ok()
+}
+
+/// The name of a layer's spatial reference, whatever authority it comes from.
+/// A layer with no geometry, or with geometry and no reference, has none.
+fn crs(defn: &gdal::vector::Defn) -> Option<String> {
+    defn.geom_fields().next()?.spatial_ref().ok()?.name()
 }
 
 /// GDAL returns the field name again when a field has no alias.

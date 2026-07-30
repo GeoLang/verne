@@ -99,7 +99,7 @@ impl GdbSource {
             else {
                 continue;
             };
-            plan.features = Some(file.path.clone());
+            plan.features = file.path.clone();
             conversions.push(Conversion {
                 location: file.source_table.clone(),
                 kind: ItemKind::FeatureCollection,
@@ -127,13 +127,21 @@ impl GdbSource {
             }
         }
         for conversion in conversions {
-            log.converted(
-                conversion.location,
-                conversion.kind,
-                conversion.detail,
-                conversion.destination,
-                conversion.losses,
-            );
+            match conversion.destination {
+                Some(destination) => log.converted(
+                    conversion.location,
+                    conversion.kind,
+                    conversion.detail,
+                    destination,
+                    conversion.losses,
+                ),
+                None => log.not_converted(
+                    conversion.location,
+                    conversion.kind,
+                    conversion.detail,
+                    conversion.losses.join("; "),
+                ),
+            }
         }
 
         let sidecar = Sidecar {
@@ -205,7 +213,7 @@ fn geopackage_conversion(scan: &Scan, layer: &geopackage::Layer) -> Conversion {
             layer.features,
             plural(layer.features as usize)
         ),
-        destination: format!("{GEOPACKAGE_FILE} layer {}", layer.name),
+        destination: Some(format!("{GEOPACKAGE_FILE} layer {}", layer.name)),
         losses,
     }
 }
@@ -224,7 +232,9 @@ struct Conversion {
     location: String,
     kind: ItemKind,
     detail: String,
-    destination: String,
+    /// Where it went, absent when it did not go anywhere. A conversion with no
+    /// destination is a skip, and its `losses` are the reason for it.
+    destination: Option<String>,
     losses: Vec<String>,
 }
 
@@ -281,7 +291,7 @@ fn place_attachments(
                         location: file.source_table.clone(),
                         kind: ItemKind::EmbeddedResource,
                         detail: format!("{} attachment{} carried", file.carried, plural(file.carried)),
-                        destination: format!("attachments of {}", file.source_table),
+                        destination: Some(format!("attachments of {}", file.source_table)),
                         losses: file.orphans.clone(),
                     });
                 }
@@ -332,7 +342,7 @@ fn dataset_plans(
                 location: table.name.clone(),
                 kind: ItemKind::FeatureCollection,
                 detail: format!("geometry type recorded as {geometry_type}"),
-                destination: format!("dataset {}", table.name),
+                destination: Some(format!("dataset {}", table.name)),
                 losses: dropped,
             });
         }
@@ -358,7 +368,7 @@ fn dataset_plans(
             features: None,
             dataset: NewDataset {
                 name: table.name.clone(),
-                srid: table.srid.unwrap_or(DEFAULT_SRID),
+                srid: PTOLEMY_SRID,
                 geometry_type: geometry_type.to_string(),
                 created_by: operator.to_string(),
             },
@@ -371,9 +381,15 @@ fn dataset_plans(
     plans
 }
 
-/// ptolemy's default when a request names no srid, and the only sane guess for
-/// a table that has no spatial reference of its own to report.
-const DEFAULT_SRID: i32 = 4326;
+/// The srid every dataset declares.
+///
+/// Not a guess and not the source's: ptolemy's commit reads every geometry it
+/// is sent as EPSG:4326, and every geometry an extraction sends is transformed
+/// into it, so 4326 is what the dataset holds. Declaring the source's code
+/// instead would have the dataset say one thing and its features be another.
+/// What the class was in is in the GeoPackage and in the log, and the report
+/// names it as a loss.
+const PTOLEMY_SRID: i32 = 4326;
 
 /// The domains and subtypes that belong to one table's dataset.
 fn semantics_of(
@@ -421,7 +437,7 @@ fn columns_of(table: &Table, conversions: &mut Vec<Conversion>) -> NewSchema {
                 retyped.len(),
                 plural(retyped.len())
             ),
-            destination: format!("schema of {}", table.name),
+            destination: Some(format!("schema of {}", table.name)),
             losses: retyped,
         });
     }
@@ -455,7 +471,7 @@ fn new_domain(
             location: domain.name.clone(),
             kind: ItemKind::AttributeSchema,
             detail: format!("domain field type recorded as {field_type}"),
-            destination: format!("domains of {dataset}"),
+            destination: Some(format!("domains of {dataset}")),
             losses: vec![loss],
         });
     }
@@ -509,7 +525,7 @@ fn place_domains(
                 location: domain.name.clone(),
                 kind: ItemKind::AttributeSchema,
                 detail: format!("one domain copied into {} datasets", holders.len()),
-                destination: format!("domains of {}", holders.join(", ")),
+                destination: Some(format!("domains of {}", holders.join(", "))),
                 losses: vec![format!(
                     "the geodatabase holds one {} for the whole workspace and ptolemy holds one per dataset, so {} separate copies were written and editing one of them no longer changes the others",
                     domain.name,
@@ -539,7 +555,7 @@ fn subtypes_of(table: &Table, conversions: &mut Vec<Conversion>) -> Vec<NewSubty
                 location: table.name.clone(),
                 kind: ItemKind::AttributeSchema,
                 detail: format!("subtype \"{}\" with code {}", subtype.name, subtype.code),
-                destination: format!("subtypes of {}", table.name),
+                destination: Some(format!("subtypes of {}", table.name)),
                 losses: vec![format!(
                     "ptolemy's subtype code is an integer and this one is \"{}\", so the subtype was not written",
                     subtype.code
@@ -574,7 +590,7 @@ fn subtypes_of(table: &Table, conversions: &mut Vec<Conversion>) -> Vec<NewSubty
             location: table.name.clone(),
             kind: ItemKind::AttributeSchema,
             detail: format!("{} subtype default value{}", untyped.len(), plural(untyped.len())),
-            destination: format!("subtypes of {}", table.name),
+            destination: Some(format!("subtypes of {}", table.name)),
             losses: vec![format!(
                 "the defaults ({}) come out of the definition XML, which declares each one's type in an attribute verne does not read, so they were written as the text they appear as",
                 untyped.join(", ")
@@ -744,7 +760,7 @@ mod tests {
                 features: None,
                 dataset: NewDataset {
                     name: (*name).to_string(),
-                    srid: DEFAULT_SRID,
+                    srid: PTOLEMY_SRID,
                     geometry_type: "point".into(),
                     created_by: "operator".into(),
                 },

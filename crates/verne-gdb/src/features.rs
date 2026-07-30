@@ -11,6 +11,15 @@
 //! attachment name the feature it belongs to: the load never reads anything
 //! back, so the only ids it can key on are the ones the extraction chose.
 //!
+//! # The two outputs hold different coordinates
+//!
+//! ptolemy's commit reads every geometry it is sent as EPSG:4326 and stores no
+//! other reference, so what goes into these files is transformed into 4326 by
+//! GDAL first. The GeoPackage is not: a GeoPackage holds any reference, and it
+//! is the file a reader keeps, so reprojecting it would be a loss taken for
+//! nothing. The two differ on purpose and the log says so against every class
+//! it is true of.
+//!
 //! Reading only: the geodatabase is the same read-only dataset the inventory
 //! walked, and everything written goes into the extraction directory.
 
@@ -19,8 +28,11 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use gdal::Dataset;
-use gdal::vector::{Feature, FieldValue, LayerAccess};
-use verne_core::{ATTACHMENTS_DIR, FEATURES_DIR, MAX_FEATURE_BYTES, NewAttachment, NewFeature};
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+use gdal::vector::{Feature, FieldValue, Layer, LayerAccess};
+use verne_core::{
+    ATTACHMENTS_DIR, FEATURES_DIR, GEOPACKAGE_FILE, MAX_FEATURE_BYTES, NewAttachment, NewFeature,
+};
 
 use crate::glue::Relationship;
 use crate::scan::{Scan, Table, TableRole};
@@ -40,11 +52,18 @@ const DATA_COLUMN: &str = "DATA";
 const NAME_COLUMN: &str = "ATT_NAME";
 const CONTENT_TYPE_COLUMN: &str = "CONTENT_TYPE";
 
+/// The one spatial reference ptolemy stores. Its commit hands the WKB to
+/// `ST_GeomFromWKB(..., 4326)` whatever the dataset's srid column says, so a
+/// geometry in anything else has to be transformed before it is sent.
+const PTOLEMY_SRID: u32 = 4326;
+
 /// What writing one table's features came to.
 pub struct FeatureFile {
     pub source_table: String,
-    /// Named relative to the extraction directory.
-    pub path: String,
+    /// Named relative to the extraction directory. Absent when none of this
+    /// table's features can go to ptolemy at all, in which case `losses` is
+    /// the one reason why and no file was written.
+    pub path: Option<String>,
     pub features: usize,
     /// What the write itself dropped, in the words the log will use.
     pub losses: Vec<String>,
@@ -161,6 +180,57 @@ fn media(relationship: &Relationship, tables: &[(&str, &str)]) -> Option<Media> 
 
 // ─── Features ───────────────────────────────────────────────────────
 
+/// How one table's geometry gets to the reference ptolemy stores.
+enum Projection {
+    /// Nothing to transform: the layer is already EPSG:4326, or holds no
+    /// geometry at all.
+    Straight,
+    /// Every geometry through this, by GDAL. Named so the log can say what it
+    /// came out of.
+    Through(Box<CoordTransform>, String),
+    /// These features cannot go to ptolemy, and this is why.
+    Refused(String),
+}
+
+/// What has to happen to a layer's geometry, decided once per table.
+///
+/// A layer with no spatial reference is refused rather than passed through.
+/// ptolemy would read the numbers as degrees, and coordinates whose meaning
+/// verne cannot state must not be committed as though it could: on a projected
+/// source that is metres or feet read as longitude, which is not a small error
+/// but a meaningless one.
+fn projection(layer: &Layer<'_>, table: &Table) -> Projection {
+    if table.geometry.is_none() {
+        return Projection::Straight;
+    }
+    let Some(mut from) = layer.spatial_ref() else {
+        return Projection::Refused(format!(
+            "{} names no spatial reference, so there is nothing to transform out of, and ptolemy would read the coordinates as EPSG:4326 degrees whatever they are; none were written and they are in the GeoPackage as they stand",
+            table.name
+        ));
+    };
+    let named = from.name().unwrap_or_else(|| "an unnamed reference".into());
+    if table.srid == Some(PTOLEMY_SRID as i32) {
+        return Projection::Straight;
+    }
+    let Ok(mut to) = SpatialRef::from_epsg(PTOLEMY_SRID) else {
+        return Projection::Refused(format!(
+            "GDAL could not build EPSG:{PTOLEMY_SRID} to transform {named} into, so nothing was written"
+        ));
+    };
+    // both ends in x/y order, so what GDAL is handed and what it gives back are
+    // easting/northing and longitude/latitude rather than the axis order the
+    // authority declares
+    from.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    to.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    match CoordTransform::new(&from, &to) {
+        Ok(transform) => Projection::Through(Box::new(transform), named),
+        Err(error) => Projection::Refused(format!(
+            "GDAL knows no transformation from {named} to EPSG:{PTOLEMY_SRID} ({error}), and ptolemy stores geometry as {PTOLEMY_SRID} and nothing else, so none of these features were written; they are in the GeoPackage in their own reference"
+        )),
+    }
+}
+
 /// One table's rows as insert operations, and the keys of the features that
 /// came out when the caller asked for them.
 fn write_table(
@@ -169,6 +239,34 @@ fn write_table(
     directory: &Path,
     key_field: Option<&str>,
 ) -> Result<(FeatureFile, Option<BTreeMap<String, String>>), GdbError> {
+    let mut layer = source
+        .layer_by_name(&table.name)
+        .map_err(|error| GdbError::Features {
+            table: table.name.clone(),
+            message: error.to_string(),
+        })?;
+    // the GeoPackage was written from these same layers and left every cursor
+    // at the end of its table, so without this the file comes out empty
+    layer.reset_feature_reading();
+
+    // decided before a file is opened: a refused table gets no feature file
+    // rather than an empty one, so the sidecar names nothing for it
+    let (transform, transformed_from) = match projection(&layer, table) {
+        Projection::Straight => (None, None),
+        Projection::Through(transform, named) => (Some(transform), Some(named)),
+        Projection::Refused(reason) => {
+            return Ok((
+                FeatureFile {
+                    source_table: table.name.clone(),
+                    path: None,
+                    features: 0,
+                    losses: vec![reason],
+                },
+                None,
+            ));
+        }
+    };
+
     let relative = format!("{FEATURES_DIR}/{}.ndjson", file_name(&table.name));
     let path = directory.join(&relative);
     if let Some(parent) = path.parent() {
@@ -182,16 +280,6 @@ fn write_table(
         source,
     })?;
     let mut out = BufWriter::new(file);
-
-    let mut layer = source
-        .layer_by_name(&table.name)
-        .map_err(|error| GdbError::Features {
-            table: table.name.clone(),
-            message: error.to_string(),
-        })?;
-    // the GeoPackage was written from these same layers and left every cursor
-    // at the end of its table, so without this the file comes out empty
-    layer.reset_feature_reading();
 
     // the columns that can be read at all, with the ptolemy type each was
     // declared as on the schema, so a value cannot arrive as a type the schema
@@ -215,10 +303,14 @@ fn write_table(
     for feature in layer.features() {
         tally.read += 1;
         let id = uuid::Uuid::now_v7().to_string();
-        let geometry = match feature.geometry().map(wkb_hex) {
+        let geometry = match feature
+            .geometry()
+            .map(|geometry| wkb_hex(geometry, transform.as_deref()))
+        {
             Some(Ok(hex)) => hex,
-            // a geometry GDAL will not export is still a row, and the row is
-            // carried with the shape left out rather than dropped
+            // a geometry GDAL will not transform or will not export is still a
+            // row, and the row is carried with the shape left out rather than
+            // dropped
             Some(Err(_)) => {
                 tally.unwritable += 1;
                 EMPTY_GEOMETRY.to_string()
@@ -271,9 +363,9 @@ fn write_table(
     Ok((
         FeatureFile {
             source_table: table.name.clone(),
-            path: relative,
+            path: Some(relative),
             features: tally.written,
-            losses: feature_losses(table, &tally),
+            losses: feature_losses(table, &tally, transformed_from.as_deref()),
         },
         minted,
     ))
@@ -296,8 +388,15 @@ struct Tally {
 /// report already says what a binary column, an srid that is not 4326 and a
 /// table with no geometry at all cost, because those are true of the table
 /// before a single row is read.
-fn feature_losses(table: &Table, tally: &Tally) -> Vec<String> {
+fn feature_losses(table: &Table, tally: &Tally, transformed_from: Option<&str>) -> Vec<String> {
     let mut losses = Vec::new();
+    // the one place the two outputs are said to differ, against the file that
+    // differs from the other
+    if let Some(from) = transformed_from {
+        losses.push(format!(
+            "every geometry here was transformed out of {from} into EPSG:{PTOLEMY_SRID} by GDAL, because that is the only reference ptolemy stores; {GEOPACKAGE_FILE} beside it keeps the class in {from}, so the two files hold different coordinates for the same features on purpose"
+        ));
+    }
     // a shapeless row in a table that has no geometry column is what the
     // report already calls out; this is about the ones that were meant to have
     // a shape
@@ -315,9 +414,13 @@ fn feature_losses(table: &Table, tally: &Tally) -> Vec<String> {
     }
     if tally.oversized > 0 {
         losses.push(format!(
-            "an insert bigger than the {MAX_FEATURE_BYTES} bytes ptolemy takes in a request on {}, the largest {} bytes, so they are in the GeoPackage and not in the feature file and no load will create them",
+            "an insert bigger than the {MAX_FEATURE_BYTES} bytes ptolemy takes in a request on {}, {}, so they are in the GeoPackage and not in the feature file and no load will create them",
             of_rows(tally.oversized, tally.read),
-            tally.largest
+            if tally.oversized == 1 {
+                format!("which is {} bytes", tally.largest)
+            } else {
+                format!("the largest {} bytes", tally.largest)
+            }
         ));
     }
     losses
@@ -326,7 +429,11 @@ fn feature_losses(table: &Table, tally: &Tally) -> Vec<String> {
 /// "3 of the 40 rows", as a noun phrase with no verb after it: a loss that
 /// reads "1 of 1 rows carry" is a loss nobody trusts the rest of.
 fn of_rows(some: usize, all: usize) -> String {
-    format!("{some} of the {all} row{}", plural(all))
+    match (some, all) {
+        (_, 1) => "the one row".to_string(),
+        (some, all) if some == all => format!("all {all} rows"),
+        (some, all) => format!("{some} of the {all} rows"),
+    }
 }
 
 /// One field as JSON, in the type the schema declared the column as.
@@ -372,9 +479,37 @@ fn feature_key(feature: &Feature<'_>, field: &str) -> Option<String> {
 
 /// A geometry as hex WKB, in the ISO encoding, which is what says Z and M in
 /// the type code rather than in a flag PostGIS would have to guess at.
-fn wkb_hex(geometry: &gdal::vector::Geometry) -> Result<String, ()> {
+///
+/// With a transform the geometry is cloned and the clone transformed, because
+/// the one the feature holds is the source's and this file writes nothing back
+/// to the source. georust/gdal wraps neither call, so both are the C API.
+fn wkb_hex(
+    geometry: &gdal::vector::Geometry,
+    transform: Option<&CoordTransform>,
+) -> Result<String, ()> {
+    let Some(transform) = transform else {
+        return unsafe { export_wkb(geometry.c_geometry()) };
+    };
     unsafe {
-        let handle = geometry.c_geometry();
+        let clone = gdal_sys::OGR_G_Clone(geometry.c_geometry());
+        if clone.is_null() {
+            return Err(());
+        }
+        let moved = gdal_sys::OGR_G_Transform(clone, transform.to_c_hct());
+        let out = if moved == gdal_sys::OGRErr::OGRERR_NONE {
+            export_wkb(clone)
+        } else {
+            Err(())
+        };
+        gdal_sys::OGR_G_DestroyGeometry(clone);
+        out
+    }
+}
+
+/// # Safety
+/// `handle` must be a live geometry.
+unsafe fn export_wkb(handle: gdal_sys::OGRGeometryH) -> Result<String, ()> {
+    unsafe {
         let size = gdal_sys::OGR_G_WkbSizeEx(handle);
         if size == 0 {
             return Err(());

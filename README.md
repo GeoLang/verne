@@ -115,12 +115,14 @@ what did not survive.
 `verne extract` writes four things into the directory it is given:
 
 ```
-features.gpkg — the features and attributes, converted by GDAL's own vector
-                translate. -preserve_fid is always on, because a geodatabase
-                keys its relationship classes on OBJECTID and OpenFileGDB gives
-                that as the feature id rather than as a field.
+features.gpkg — the features and attributes in the source's own spatial
+                reference, converted by GDAL's own vector translate.
+                -preserve_fid is always on, because a geodatabase keys its
+                relationship classes on OBJECTID and OpenFileGDB gives that as
+                the feature id rather than as a field.
 features/     — one file per dataset, one line of JSON per feature, each line a
-                whole insert operation of ptolemy's commit route
+                whole insert operation of ptolemy's commit route, transformed
+                to EPSG:4326 because that is the only reference ptolemy holds
 attachments/  — the blobs out of the __ATTACH tables, one file each
 sidecar.json  — the datasets, their column schemas, coded and range domains,
                 subtypes, relationship classes and attachments to create in
@@ -245,15 +247,54 @@ a type the schema does not declare is left out at extraction rather than sent.
 On one USGS geodatabase (41 tables, 8.3 MB) the extraction takes 0.4 seconds and
 the load 9.4, for 29,602 features in 100 commits.
 
-Two things about a geometry that arrives. Z and M survive: the WKB is written in
-the ISO encoding, which says both in the type code, and PostGIS keeps them, so
-the loss the report names there is the narrow one it says it is, that
-`geometry_type` on the dataset names 2D shapes only and nothing in ptolemy
-records that the dataset holds them. The spatial reference does not: ptolemy's
-commit reads every geometry as EPSG:4326 whatever the dataset's `srid` column
-says, so a class in anything else arrives with its coordinates unchanged under a
-label that is not theirs. That is a loss on every class of the USGS file, which
-is NAD83.
+Z and M survive: the WKB is written in the ISO encoding, which says both in the
+type code, and PostGIS keeps them, so the loss the report names there is the
+narrow one it says it is, that `geometry_type` on the dataset names 2D shapes
+only and nothing in ptolemy records that the dataset holds them.
+
+### The two outputs hold different coordinates
+
+ptolemy's commit hands every WKB to `ST_GeomFromWKB(..., 4326)`, on insert and
+on update, so EPSG:4326 is not a default that could be talked out of: it is the
+only thing the geometry column ever holds. **The features that go to ptolemy are
+transformed into 4326 by GDAL. The GeoPackage is not touched and keeps the
+source's own reference.** A GeoPackage holds any CRS and it is the artefact a
+reader keeps, so reprojecting it would be a loss taken for nothing. The two
+files therefore hold different coordinates for the same features, on purpose,
+and the log says so on every class it is true of.
+
+Sending the source's coordinates unchanged, which is what verne did before, is
+only nearly harmless when the source is geographic. The USGS file is NAD83 in
+degrees, so passing it through was out by a datum shift. Most Esri data is
+projected, state plane or UTM, and passing that through sends metres or feet to
+be read as degrees, which is not an error of a few metres but a coordinate with
+no meaning. `crates/verne-gdb/tests/fixture.py` builds a NAD83 / UTM zone 19N
+class for exactly this, one point on the zone's central meridian at easting
+500000, and the test asserts what the loader would send is near 69 degrees west
+rather than anywhere near 500000.
+
+Every dataset therefore declares `srid` 4326, because that is what its geometry
+is by the time ptolemy has it. What the class was in is in the GeoPackage and in
+the extraction log, and the report names losing it.
+
+The transformation itself is the cost, and it is GDAL's: verne does no
+coordinate arithmetic. PROJ picks the coordinate operation for the pair of
+references, and picks it by area, so two classes covering different places can
+be transformed by different operations. NAD83 to WGS 84 involves no grid files;
+PROJ has 53 candidate operations for it and they declare accuracies from 1.5 m
+to 4 m, and on the fixture's point in northern Maine it uses `NAD83 to WGS 84
+(6)`, declared at 1.5 m, which moves the point about 0.4 m. That is the honest
+size of it for this source. It is not a general figure: a source on an older
+datum with no grid installed is worse, and neither GDAL nor verne reports the
+accuracy of the operation it chose, so the report says what is lost without
+naming a number it cannot get.
+
+A class verne cannot reproject is not sent at all. A layer with no spatial
+reference has nothing to transform out of and its numbers would be read as
+degrees, and a pair GDAL knows no operation for cannot be transformed either.
+Both are skipped for the load with the reason, counted in the log, and both are
+still in the GeoPackage: the dataset, its schema, its domains and its subtypes
+are all still created, and only the features are refused.
 
 The token comes from `VERNE_PTOLEMY_TOKEN` and is never an argument, which would
 put it in the process list. ptolemy grants the creator of a dataset an admin row

@@ -429,6 +429,27 @@ impl ExtractionLog {
         });
     }
 
+    /// Something the extraction did not do, for a reason no verdict covers.
+    /// The counterpart of [`Self::converted`]: a whole class whose features
+    /// could not be sent is not an absence, it is an entry saying so.
+    pub fn not_converted(
+        &mut self,
+        location: impl Into<String>,
+        kind: ItemKind,
+        detail: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.entries.push(LogEntry {
+            location: location.into(),
+            kind,
+            detail: detail.into(),
+            action: Action::Skipped {
+                reason: reason.into(),
+            },
+            destination: None,
+        });
+    }
+
     fn push(&mut self, item: &Item, action: Action, destination: Option<String>) {
         self.entries.push(LogEntry {
             location: item.location.clone(),

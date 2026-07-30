@@ -53,6 +53,28 @@ def build(path):
     # says otherwise, which is patched in below
     ds.CreateLayer("well_labels", srs, ogr.wkbPolygon)
 
+    # a projected class, which is what most Esri data is. Its coordinates are
+    # metres, and ptolemy reads whatever it is committed as degrees, so this is
+    # the layer that proves an extraction transforms rather than passes through.
+    # Easting 500000 is the central meridian of UTM zone 19, which is -69.
+    utm = osr.SpatialReference()
+    utm.ImportFromEPSG(26919)
+    plots = ds.CreateLayer("plots", utm, ogr.wkbPoint)
+    plots.CreateField(ogr.FieldDefn("plot_id", ogr.OFTInteger))
+    plot = ogr.Feature(plots.GetLayerDefn())
+    plot.SetField("plot_id", 1)
+    plot.SetGeometry(ogr.CreateGeometryFromWkt("POINT (500000 5150000)"))
+    plots.CreateFeature(plot)
+
+    # a class with geometry and no spatial reference at all, which cannot be
+    # transformed and must not be sent
+    stray = ds.CreateLayer("stray_points", None, ogr.wkbPoint)
+    stray.CreateField(ogr.FieldDefn("note", ogr.OFTString))
+    lost = ogr.Feature(stray.GetLayerDefn())
+    lost.SetField("note", "no reference")
+    lost.SetGeometry(ogr.CreateGeometryFromWkt("POINT (7 8)"))
+    stray.CreateFeature(lost)
+
     inspections = ds.CreateLayer("inspections", None, ogr.wkbNone)
     inspections.CreateField(ogr.FieldDefn("well_id", ogr.OFTInteger))
     inspections.CreateField(ogr.FieldDefn("note", ogr.OFTString))
@@ -222,7 +244,16 @@ def verify(path):
     says so itself."""
     ds = gdal.OpenEx(path, gdal.OF_VECTOR, open_options=["LIST_ALL_TABLES=YES"])
     expected = {
-        "layers": ["wells", "pads", "well_labels", "inspections", "wells__ATTACH", "pads__ATTACH"],
+        "layers": [
+            "wells",
+            "pads",
+            "well_labels",
+            "plots",
+            "stray_points",
+            "inspections",
+            "wells__ATTACH",
+            "pads__ATTACH",
+        ],
         "domains": ["status_codes", "depth_range"],
         "relationships": ["wells_inspections", "wells_attach"],
     }

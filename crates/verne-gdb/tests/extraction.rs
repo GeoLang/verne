@@ -163,7 +163,17 @@ fn every_user_table_becomes_a_dataset() {
         .iter()
         .map(|plan| plan.dataset.name.as_str())
         .collect();
-    assert_eq!(names, ["wells", "pads", "well_labels", "inspections"]);
+    assert_eq!(
+        names,
+        [
+            "wells",
+            "pads",
+            "well_labels",
+            "plots",
+            "stray_points",
+            "inspections"
+        ]
+    );
 
     let wells = extracted.sidecar.dataset("wells").expect("wells");
     assert_eq!(wells.source_table, "wells");
@@ -414,9 +424,23 @@ fn the_geopackage_holds_one_layer_per_dataset() {
             .collect();
         (names, written.layer_count())
     });
-    assert_eq!(names, ["wells", "pads", "well_labels", "inspections"]);
+    // a GeoPackage lists its layers in its own order, spatial ones first, so
+    // this is a set and not a sequence
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        [
+            "inspections",
+            "pads",
+            "plots",
+            "stray_points",
+            "well_labels",
+            "wells"
+        ]
+    );
     // the system and attachment tables were not asked for
-    assert_eq!(count, 4);
+    assert_eq!(count, 6);
 }
 
 /// OBJECTID is the geodatabase's feature id rather than a field, and a
@@ -465,7 +489,7 @@ fn the_log_reports_the_geopackage_separately_from_the_dataset() {
                 .is_some_and(|to| to.starts_with("features.gpkg"))
         })
         .collect();
-    assert_eq!(rows.len(), 4, "one per dataset: {rows:#?}");
+    assert_eq!(rows.len(), 6, "one per dataset: {rows:#?}");
 
     let wells = rows
         .iter()
@@ -519,7 +543,7 @@ fn many_threads_can_extract_at_once() {
             .collect()
     });
 
-    assert_eq!(extracted, vec![4; 8]);
+    assert_eq!(extracted, vec![6; 8]);
 }
 
 // ─── The dataset schema ─────────────────────────────────────────────
@@ -658,10 +682,12 @@ fn features(extracted: &Extracted, dataset: &str) -> Vec<serde_json::Value> {
 fn every_dataset_names_a_file_of_insert_operations() {
     let extracted = extract();
     for plan in &extracted.sidecar.datasets {
+        // stray_points has no spatial reference, so nothing of it can be sent
+        let expected = (plan.source_table != "stray_points")
+            .then(|| format!("features/{}.ndjson", plan.source_table));
         assert_eq!(
-            plan.features.as_deref(),
-            Some(format!("features/{}.ndjson", plan.source_table).as_str()),
-            "{} names no feature file",
+            plan.features, expected,
+            "{} names the wrong feature file",
             plan.source_table
         );
     }
@@ -756,4 +782,161 @@ fn an_orphan_attachment_table_is_skipped_with_the_reason() {
     };
     assert!(reason.contains("will not guess"), "{reason}");
     assert!(orphan.destination.is_none(), "{orphan:?}");
+}
+
+// ─── Getting to the one reference ptolemy stores ────────────────────
+
+/// The longitude and latitude out of a point's hex WKB, little endian.
+fn point(hex: &str) -> (f64, f64) {
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+        .collect();
+    assert_eq!(bytes[0], 1, "little endian");
+    assert_eq!(bytes[1], 1, "a point");
+    let at =
+        |start: usize| f64::from_le_bytes(bytes[start..start + 8].try_into().expect("8 bytes"));
+    (at(5), at(13))
+}
+
+/// The case that was catastrophic and had no cover: a projected class.
+///
+/// ptolemy reads every geometry it is committed as EPSG:4326, so a class in
+/// metres sent unchanged has its eastings read as degrees of longitude, which
+/// is not an error of a metre or two but a coordinate with no meaning. The
+/// fixture's `plots` is NAD83 / UTM zone 19N and its one point sits on the
+/// zone's central meridian, 500000 easting, which is 69 degrees west.
+#[test]
+fn a_projected_class_reaches_ptolemy_in_degrees_and_not_in_metres() {
+    let extracted = extract();
+    let plots = features(&extracted, "plots");
+    assert_eq!(plots.len(), 1);
+
+    let (longitude, latitude) = point(
+        plots[0]["geometry_wkb_hex"]
+            .as_str()
+            .expect("a hex geometry"),
+    );
+
+    // the easting and northing as they stand would be these, and they are what
+    // used to be sent
+    assert!(
+        !(400_000.0..600_000.0).contains(&longitude),
+        "the easting was committed as a longitude: {longitude}"
+    );
+    assert!((-69.01..-68.99).contains(&longitude), "{longitude}");
+    assert!((46.4..46.6).contains(&latitude), "{latitude}");
+
+    // and the GeoPackage keeps the class as it was, so the two outputs differ
+    // on purpose
+    let (easting, northing) = serialised(|| {
+        use gdal::vector::LayerAccess;
+        let written = gdal::Dataset::open(&extracted.geopackage).expect("the GeoPackage opens");
+        let mut layer = written.layer_by_name("plots").expect("plots");
+        let feature = layer.features().next().expect("one plot");
+        let geometry = feature.geometry().expect("a point").get_point(0);
+        (geometry.0, geometry.1)
+    });
+    assert_eq!(easting, 500_000.0);
+    assert_eq!(northing, 5_150_000.0);
+}
+
+/// The report and the log have to say the two outputs differ, because a reader
+/// who takes the GeoPackage and the ptolemy dataset for copies of each other
+/// is wrong about both.
+#[test]
+fn the_log_says_which_output_holds_which_coordinates() {
+    let extracted = extract();
+
+    let plots = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "plots",
+    );
+    let shortfall = plots.verdict.shortfall();
+    assert!(shortfall.contains("EPSG:26919"), "{shortfall}");
+    assert!(shortfall.contains("transformed out of"), "{shortfall}");
+
+    let written = extracted
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .find(|entry| entry.destination.as_deref() == Some("features/plots.ndjson"))
+        .expect("the feature file is logged");
+    let Action::CarriedWithLoss { losses } = &written.action else {
+        panic!("a transformation is a loss: {written:?}");
+    };
+    assert!(
+        losses
+            .iter()
+            .any(|loss| loss.contains("features.gpkg beside it keeps the class in")),
+        "{losses:?}"
+    );
+
+    // a class already in 4326 is transformed out of nothing and says nothing
+    let wells = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "wells",
+    );
+    assert!(
+        !wells.verdict.shortfall().contains("transformed out of"),
+        "{}",
+        wells.verdict.shortfall()
+    );
+}
+
+/// A class with no spatial reference cannot be transformed, and unknown
+/// coordinates committed as degrees are worse than none: it is skipped, and
+/// both the report and the log say so.
+#[test]
+fn a_class_with_no_spatial_reference_is_not_sent_at_all() {
+    let extracted = extract();
+    let stray = extracted
+        .sidecar
+        .dataset("stray_points")
+        .expect("stray_points is still a dataset");
+    assert!(stray.features.is_none(), "{:?}", stray.features);
+    // the dataset, its schema and its layer are all still there: only the
+    // features are refused
+    assert_eq!(stray.layer.as_deref(), Some("stray_points"));
+    assert_eq!(stray.schema.fields.len(), 1);
+
+    let item = only(
+        &extracted.report.items,
+        ItemKind::FeatureCollection,
+        "stray_points",
+    );
+    assert!(
+        item.verdict
+            .shortfall()
+            .contains("names no spatial reference"),
+        "{}",
+        item.verdict.shortfall()
+    );
+
+    let skipped = extracted
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .find(|entry| entry.location == "stray_points" && entry.detail == "0 features")
+        .expect("the refusal is logged");
+    let Action::Skipped { reason } = &skipped.action else {
+        panic!("nothing was written: {skipped:?}");
+    };
+    assert!(reason.contains("nothing to transform out of"), "{reason}");
+    assert!(skipped.destination.is_none(), "{skipped:?}");
+}
+
+/// Every dataset says 4326, because that is what its geometry is once it gets
+/// there. Saying the source's code instead would have the dataset describe
+/// coordinates it does not hold.
+#[test]
+fn every_dataset_declares_the_reference_its_geometry_arrives_in() {
+    let extracted = extract();
+    for plan in &extracted.sidecar.datasets {
+        assert_eq!(plan.dataset.srid, 4326, "{}", plan.source_table);
+    }
 }

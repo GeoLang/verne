@@ -24,10 +24,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # no GDAL on this runner, so the default features are the whole build
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --all
+
+  gdal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ubuntu 24.04 ships GDAL 3.8, and the adapter needs 3.8 or later; the
+      # python bindings are what builds the test geodatabases
+      - name: Install GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev python3-gdal
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all
+        run: cargo test --all --all-features
 
   deny:
     runs-on: ubuntu-latest
@@ -49,6 +69,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - name: Install GDAL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev python3-gdal
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

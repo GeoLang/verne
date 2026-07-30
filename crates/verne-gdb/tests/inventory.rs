@@ -47,6 +47,10 @@ fn inventory(path: &Path) -> Vec<Item> {
                 assert!(!reason.is_empty(), "{} gives no reason", item.location);
                 assert_eq!(item.verdict.target(), None);
             }
+            Verdict::NotApplicable { reason } => {
+                assert!(!reason.is_empty(), "{} gives no reason", item.location);
+                assert_eq!(item.verdict.target(), None);
+            }
             Verdict::Faithful { .. } => {}
         }
     }
@@ -215,4 +219,143 @@ fn a_composite_relationship_names_the_cascade_it_loses() {
     let shortfall = related.verdict.shortfall();
     assert!(shortfall.contains("is_composite"), "{shortfall}");
     assert!(shortfall.contains("origin_primary_key"), "{shortfall}");
+}
+
+#[test]
+fn subtypes_come_through_the_definition_xml() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let subtypes = only_matching(&items, ItemKind::AttributeSchema, "subtypes on");
+    assert!(
+        subtypes.detail.contains("2 subtypes on wells.status"),
+        "{}",
+        subtypes.detail
+    );
+    assert!(
+        subtypes.detail.contains("1 Active well"),
+        "{}",
+        subtypes.detail
+    );
+    assert!(subtypes.detail.contains("default 1"), "{}", subtypes.detail);
+    assert_eq!(subtypes.verdict.outcome(), Outcome::Approximated);
+    let shortfall = subtypes.verdict.shortfall();
+    assert!(
+        shortfall.contains("which code is the default"),
+        "{shortfall}"
+    );
+    assert!(shortfall.contains("depth_range"), "{shortfall}");
+}
+
+#[test]
+fn an_annotation_class_keeps_its_data_and_loses_its_graphics() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    // the geometry and fields are an ordinary layer, and say where the rest went
+    let layer = only_matching(&items, ItemKind::FeatureCollection, "well_labels");
+    assert!(
+        layer.detail.contains("graphics reported below"),
+        "{}",
+        layer.detail
+    );
+
+    let graphics = only_matching(&items, ItemKind::Styling, "esriFTAnnotation");
+    assert_eq!(graphics.location, "well_labels");
+    assert_eq!(graphics.verdict.outcome(), Outcome::Unsupported);
+    assert!(graphics.verdict.shortfall().contains("placement"));
+}
+
+#[test]
+fn an_attachment_table_goes_to_the_attachments_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let attachments = only_matching(&items, ItemKind::EmbeddedResource, "wells__ATTACH");
+    assert!(
+        attachments.detail.contains("attachments on wells"),
+        "{}",
+        attachments.detail
+    );
+    assert!(
+        attachments.detail.contains("1 row"),
+        "{}",
+        attachments.detail
+    );
+    assert_eq!(attachments.verdict.outcome(), Outcome::Approximated);
+    assert!(attachments.verdict.shortfall().contains("branch"));
+
+    // the media relationship is reported here, not a second time as a class
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.kind == ItemKind::Relationship && item.detail.contains("wells_attach")),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn a_feature_dataset_is_a_grouping_ptolemy_has_no_container_for() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let group = only_matching(&items, ItemKind::Hierarchy, "Water");
+    assert!(group.detail.contains("pads"), "{}", group.detail);
+    assert_eq!(group.verdict.outcome(), Outcome::Approximated);
+    assert!(
+        group
+            .verdict
+            .shortfall()
+            .contains("no container above a dataset")
+    );
+}
+
+#[test]
+fn a_metadata_record_is_carried_as_catalogue_fields() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let metadata = only_matching(&items, ItemKind::Metadata, "ISO or FGDC");
+    assert_eq!(metadata.location, "wells");
+    assert_eq!(metadata.verdict.outcome(), Outcome::Approximated);
+    assert!(metadata.verdict.shortfall().contains("lineage"));
+}
+
+#[test]
+fn an_item_gdal_cannot_read_is_named_and_nothing_more() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let items = inventory(&fixture(dir.path()));
+
+    let topology = only_matching(&items, ItemKind::DataModel, "DETopology");
+    assert_eq!(topology.location, "Water_Topology");
+    assert_eq!(topology.verdict.outcome(), Outcome::Unsupported);
+
+    // a domain is read through the C API, so it is not an item verne failed on
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.kind == ItemKind::DataModel && item.detail.contains("status_codes")),
+        "{items:#?}"
+    );
+}
+
+#[test]
+fn versioning_does_not_arise_for_a_file_geodatabase() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = fixture(dir.path());
+    let items = inventory(&path);
+
+    let versioning = only_matching(&items, ItemKind::Temporal, "versioning");
+    assert_eq!(versioning.verdict.outcome(), Outcome::NotApplicable);
+    assert_eq!(versioning.verdict.target(), None);
+    assert!(versioning.verdict.shortfall().contains("enterprise"));
+
+    let source = GdbSource::open(&path).expect("opens");
+    let report = verne_core::Report::build(&source).expect("builds");
+    assert_eq!(report.summary.not_applicable, 1);
+    assert!(
+        report.summary.sentence().contains("1 not applicable"),
+        "{}",
+        report.summary.sentence()
+    );
 }

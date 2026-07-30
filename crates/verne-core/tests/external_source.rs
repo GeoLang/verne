@@ -75,6 +75,12 @@ impl Source for Atlas {
                 "title \"a | b\"\nsecond line",
                 Verdict::faithful(Target::Geogit),
             ),
+            Item::new(
+                "sheet 5",
+                ItemKind::Temporal,
+                "edit history",
+                Verdict::not_applicable("an atlas volume is printed once and never revised"),
+            ),
         ])
     }
 }
@@ -91,26 +97,33 @@ fn table_rows(markdown: &str) -> Vec<&str> {
 fn summary_counts_the_items() {
     let report = Report::build(&Atlas::ok()).expect("the atlas reads");
     let summary = report.summary;
-    assert_eq!(summary.total, 4);
+    assert_eq!(summary.total, 5);
     assert_eq!(summary.faithful, 2);
     assert_eq!(summary.approximated, 1);
     assert_eq!(summary.unsupported, 1);
+    assert_eq!(summary.not_applicable, 1);
     assert_eq!(
         summary.total,
-        summary.faithful + summary.approximated + summary.unsupported
+        summary.faithful + summary.approximated + summary.unsupported + summary.not_applicable
     );
 
-    let mut counted = (0, 0, 0);
+    let mut counted = (0, 0, 0, 0);
     for item in &report.items {
         match item.verdict.outcome() {
             Outcome::Faithful => counted.0 += 1,
             Outcome::Approximated => counted.1 += 1,
             Outcome::Unsupported => counted.2 += 1,
+            Outcome::NotApplicable => counted.3 += 1,
         }
     }
     assert_eq!(
         counted,
-        (summary.faithful, summary.approximated, summary.unsupported)
+        (
+            summary.faithful,
+            summary.approximated,
+            summary.unsupported,
+            summary.not_applicable
+        )
     );
 }
 
@@ -118,7 +131,9 @@ fn summary_counts_the_items() {
 fn markdown_has_the_summary_and_one_row_per_item() {
     let report = Report::build(&Atlas::ok()).expect("the atlas reads");
     let markdown = report.to_markdown();
-    assert!(markdown.contains("4 items: 2 faithful, 1 approximated, 1 unsupported."));
+    assert!(
+        markdown.contains("5 items: 2 faithful, 1 approximated, 1 unsupported, 1 not applicable.")
+    );
     assert!(markdown.contains("Atlas volume. 3 sheets."));
     assert_eq!(table_rows(&markdown).len(), report.items.len());
 }
@@ -144,14 +159,27 @@ fn json_carries_the_summary_and_the_verdicts() {
     let report = Report::build(&Atlas::ok()).expect("the atlas reads");
     let json: serde_json::Value = serde_json::from_str(&report.to_json()).expect("valid json");
 
-    assert_eq!(json["summary"]["total"], 4);
+    assert_eq!(json["summary"]["total"], 5);
     assert_eq!(json["summary"]["faithful"], 2);
     assert_eq!(json["summary"]["approximated"], 1);
     assert_eq!(json["summary"]["unsupported"], 1);
+    assert_eq!(json["summary"]["not_applicable"], 1);
     assert_eq!(json["source"]["format"], "Atlas volume");
 
     let items = json["items"].as_array().expect("items is an array");
-    assert_eq!(items.len(), 4);
+    assert_eq!(items.len(), 5);
+
+    let not_applicable = items
+        .iter()
+        .find(|item| item["verdict"]["outcome"] == "not_applicable")
+        .expect("one not applicable item");
+    assert!(not_applicable["verdict"].get("target").is_none());
+    assert!(
+        not_applicable["verdict"]["reason"]
+            .as_str()
+            .expect("a reason")
+            .contains("printed once")
+    );
 
     let unsupported = items
         .iter()

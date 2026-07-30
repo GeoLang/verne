@@ -11,7 +11,13 @@ description = "Command line inventory of third-party geospatial sources"
 name = "verne"
 path = "src/main.rs"
 
+[features]
+# Off by default: GDAL is a system library, and the KML side needs none.
+default = []
+gdb = ["dep:verne-gdb", "verne-gdb/gdal"]
+
 [dependencies]
 verne-core = { path = "../verne-core" }
 verne-kml = { path = "../verne-kml" }
+verne-gdb = { path = "../verne-gdb", optional = true }
 clap = { version = "4", features = ["derive"] }

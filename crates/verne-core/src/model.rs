@@ -130,6 +130,9 @@ pub enum Verdict {
     Approximated { target: Target, losses: Losses },
     /// No home in GeoLang, and why.
     Unsupported { reason: String },
+    /// The question does not arise for this source, and why. Nothing is lost
+    /// and nothing is carried, so this is neither a success nor a shortfall.
+    NotApplicable { reason: String },
 }
 
 impl Verdict {
@@ -147,28 +150,35 @@ impl Verdict {
         }
     }
 
+    pub fn not_applicable(reason: impl Into<String>) -> Self {
+        Verdict::NotApplicable {
+            reason: reason.into(),
+        }
+    }
+
     pub fn outcome(&self) -> Outcome {
         match self {
             Verdict::Faithful { .. } => Outcome::Faithful,
             Verdict::Approximated { .. } => Outcome::Approximated,
             Verdict::Unsupported { .. } => Outcome::Unsupported,
+            Verdict::NotApplicable { .. } => Outcome::NotApplicable,
         }
     }
 
     pub fn target(&self) -> Option<Target> {
         match self {
             Verdict::Faithful { target } | Verdict::Approximated { target, .. } => Some(*target),
-            Verdict::Unsupported { .. } => None,
+            Verdict::Unsupported { .. } | Verdict::NotApplicable { .. } => None,
         }
     }
 
-    /// What a conversion would lose: the named losses, or the reason there is
-    /// no home at all.
+    /// What a conversion would lose: the named losses, the reason there is no
+    /// home at all, or the reason the question does not arise.
     pub fn shortfall(&self) -> String {
         match self {
             Verdict::Faithful { .. } => String::new(),
             Verdict::Approximated { losses, .. } => losses.to_string(),
-            Verdict::Unsupported { reason } => reason.clone(),
+            Verdict::Unsupported { reason } | Verdict::NotApplicable { reason } => reason.clone(),
         }
     }
 }
@@ -179,6 +189,7 @@ pub enum Outcome {
     Faithful,
     Approximated,
     Unsupported,
+    NotApplicable,
 }
 
 impl Outcome {
@@ -187,6 +198,7 @@ impl Outcome {
             Outcome::Faithful => "faithful",
             Outcome::Approximated => "approximated",
             Outcome::Unsupported => "unsupported",
+            Outcome::NotApplicable => "not applicable",
         }
     }
 }
@@ -228,6 +240,9 @@ pub enum ItemKind {
     Mesh,
     /// A typed association between the rows of two tables.
     Relationship,
+    /// Structure declared over other datasets: topologies, networks, fabrics,
+    /// terrains and the rules that go with them.
+    DataModel,
 }
 
 impl ItemKind {
@@ -245,6 +260,7 @@ impl ItemKind {
             ItemKind::ViewDependentDisplay => "view-dependent display",
             ItemKind::Mesh => "mesh",
             ItemKind::Relationship => "relationship",
+            ItemKind::DataModel => "data model",
         }
     }
 }

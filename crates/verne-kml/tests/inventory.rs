@@ -25,6 +25,11 @@ fn inventory(xml: &str) -> Vec<Item> {
                 assert!(!reason.is_empty(), "{} gives no reason", item.location);
                 assert_eq!(item.verdict.target(), None);
             }
+            // KML has no feature a KML file cannot have, so nothing in it can
+            // be beside the question
+            Verdict::NotApplicable { .. } => {
+                panic!("{} came back as not applicable", item.location)
+            }
             Verdict::Faithful { .. } => {}
         }
     }

@@ -11,6 +11,8 @@ pub struct Counts {
     pub faithful: usize,
     pub approximated: usize,
     pub unsupported: usize,
+    /// Things the source cannot have, so nothing was carried or lost.
+    pub not_applicable: usize,
 }
 
 impl Counts {
@@ -20,22 +22,31 @@ impl Counts {
             faithful: 0,
             approximated: 0,
             unsupported: 0,
+            not_applicable: 0,
         };
         for item in items {
             match item.verdict.outcome() {
                 Outcome::Faithful => counts.faithful += 1,
                 Outcome::Approximated => counts.approximated += 1,
                 Outcome::Unsupported => counts.unsupported += 1,
+                Outcome::NotApplicable => counts.not_applicable += 1,
             }
         }
         counts
     }
 
     pub fn sentence(&self) -> String {
-        format!(
-            "{} items: {} faithful, {} approximated, {} unsupported.",
+        let mut sentence = format!(
+            "{} items: {} faithful, {} approximated, {} unsupported",
             self.total, self.faithful, self.approximated, self.unsupported
-        )
+        );
+        // only said when there is one, so a report on a source where the
+        // question never arises does not carry a zero about it
+        if self.not_applicable > 0 {
+            sentence.push_str(&format!(", {} not applicable", self.not_applicable));
+        }
+        sentence.push('.');
+        sentence
     }
 }
 

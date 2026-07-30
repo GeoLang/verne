@@ -27,11 +27,241 @@ fn verdict_for(target: Target, losses: Vec<String>) -> Verdict {
 
 pub fn items(scan: &Scan) -> Vec<Item> {
     let mut items = Vec::new();
+    feature_datasets(scan, &mut items);
     tables(scan, &mut items);
+    drawn_classes(scan, &mut items);
+    subtypes(scan, &mut items);
     domains(scan, &mut items);
     relationships(scan, &mut items);
+    attachments(scan, &mut items);
+    layer_metadata(scan, &mut items);
+    catalog(scan, &mut items);
     system_tables(scan, &mut items);
+    versioning(&mut items);
     items
+}
+
+/// A feature dataset groups feature classes and holds them to one spatial
+/// reference. ptolemy has no container above a dataset.
+fn feature_datasets(scan: &Scan, items: &mut Vec<Item>) {
+    for (name, members) in scan.feature_datasets() {
+        items.push(Item::new(
+            format!("\\{name}"),
+            ItemKind::Hierarchy,
+            format!(
+                "feature dataset holding {} class{}: {}",
+                members.len(),
+                if members.len() == 1 { "" } else { "es" },
+                members.join(", ")
+            ),
+            Verdict::approximated(
+                Target::Ptolemy,
+                Losses::one(
+                    "ptolemy has no container above a dataset, so the grouping survives as a tag on each dataset rather than as a thing that can be opened, moved or granted as a whole",
+                )
+                .and(
+                    "a feature dataset holds its members to one spatial reference, and nothing in ptolemy enforces that across datasets",
+                ),
+            ),
+        ));
+    }
+}
+
+/// Annotation and dimension classes: the geometry and fields are reported with
+/// the other tables, so this row is about the graphics that come with them.
+fn drawn_classes(scan: &Scan, items: &mut Vec<Item>) {
+    for table in scan.user_tables() {
+        let Some(kind) = table.definition.drawn_feature_type() else {
+            continue;
+        };
+        items.push(Item::new(
+            table.name.clone(),
+            ItemKind::Styling,
+            format!("{kind} graphics"),
+            Verdict::unsupported(
+                "the text, font, symbol and placement of an annotation or dimension class sit in a class extension that GDAL does not read, so verne cannot see them at all; jung places labels itself from the text and an anchor, so a per-feature graphic placed by hand has nothing to be carried into either",
+            ),
+        ));
+    }
+}
+
+/// Esri subtypes go to ptolemy's subtypes table. GDAL does not model them, so
+/// they come out of the layer definition XML.
+fn subtypes(scan: &Scan, items: &mut Vec<Item>) {
+    for table in scan.user_tables() {
+        let definition = &table.definition;
+        if definition.subtypes.is_empty() {
+            continue;
+        }
+        let Some(field) = &definition.subtype_field else {
+            continue;
+        };
+        let listed: Vec<String> = definition
+            .subtypes
+            .iter()
+            .map(|subtype| format!("{} {}", subtype.code, subtype.name))
+            .collect();
+        let mut detail = format!(
+            "{} subtype{} on {}.{}: {}",
+            definition.subtypes.len(),
+            plural(definition.subtypes.len()),
+            table.name,
+            field,
+            listed.join(", ")
+        );
+        if let Some(default) = &definition.default_subtype {
+            detail.push_str(&format!(", default {default}"));
+        }
+
+        let mut losses = Vec::new();
+        if definition.default_subtype.is_some() {
+            losses.push(
+                "ptolemy's subtypes table has no column saying which code is the default, so a new feature gets no subtype unless something else picks one".to_string(),
+            );
+        }
+        let assigned: Vec<String> = definition
+            .subtypes
+            .iter()
+            .flat_map(|subtype| subtype.fields.iter())
+            .filter_map(|field| field.domain.clone())
+            .collect();
+        if !assigned.is_empty() {
+            losses.push(format!(
+                "the per-subtype domain assignments name domains ({}), and ptolemy's domain_assignments holds the id of a domain row, so the domains have to be loaded first and their names swapped for ids",
+                dedup(assigned).join(", ")
+            ));
+        }
+        items.push(Item::new(
+            table.name.clone(),
+            ItemKind::AttributeSchema,
+            detail,
+            verdict_for(Target::Ptolemy, losses),
+        ));
+    }
+}
+
+fn dedup(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+/// An attachment relationship and the blob table behind it go to ptolemy's
+/// attachments table.
+fn attachments(scan: &Scan, items: &mut Vec<Item>) {
+    for relationship in scan.relationships.iter().filter(is_media) {
+        let table = relationship
+            .right_table
+            .as_deref()
+            .and_then(|name| scan.table(name));
+        let mut detail = format!(
+            "{}: attachments on {}",
+            relationship.name,
+            relationship
+                .left_table
+                .as_deref()
+                .unwrap_or("an unnamed table")
+        );
+        if let Some(table) = table {
+            detail.push_str(&format!(
+                ", held in {} ({})",
+                table.name,
+                match table.features {
+                    Some(count) => format!("{count} row{}", plural_u64(count)),
+                    None => "row count not read".to_string(),
+                }
+            ));
+        }
+        items.push(Item::new(
+            relationship
+                .right_table
+                .clone()
+                .unwrap_or_else(|| relationship.name.clone()),
+            ItemKind::EmbeddedResource,
+            detail,
+            Verdict::approximated(
+                Target::Ptolemy,
+                Losses::one(
+                    "ptolemy's attachments carry the bytes, the name, the content type and the size, and the row is tied to a feature id and a branch, so the OBJECTID or GlobalID this table relates on has to be swapped for the id of the loaded feature",
+                )
+                .and(
+                    "verne reads the table's shape and its row count, never the blobs themselves, so nothing here is a claim about what the files are",
+                ),
+            ),
+        ));
+    }
+}
+
+fn is_media(relationship: &&Relationship) -> bool {
+    relationship.related_table_type.as_deref() == Some("media")
+}
+
+/// An ISO or FGDC record on a layer, which ptolemy holds as a handful of
+/// catalogue fields rather than as a record.
+fn layer_metadata(scan: &Scan, items: &mut Vec<Item>) {
+    for table in scan.user_tables().filter(|table| table.metadata) {
+        items.push(Item::new(
+            table.name.clone(),
+            ItemKind::Metadata,
+            "ISO or FGDC metadata record".to_string(),
+            Verdict::approximated(
+                Target::Ptolemy,
+                Losses::one(
+                    "ptolemy's dataset_metadata holds a description, a source, a licence, an attribution and keywords, so what maps onto those is kept and the rest of the record, its lineage, contacts, extents, dates and the standard it follows, has nowhere to go",
+                ),
+            ),
+        ));
+    }
+}
+
+/// Catalogue items GDAL reads no definition for. Naming them is the whole of
+/// what verne can do here.
+fn catalog(scan: &Scan, items: &mut Vec<Item>) {
+    for item in &scan.catalog {
+        let named = if item.name.is_empty() {
+            "unnamed".to_string()
+        } else {
+            item.name.clone()
+        };
+        if item.kind == "DERasterDataset" {
+            items.push(Item::new(
+                named.clone(),
+                ItemKind::RasterOverlay,
+                format!("{named} ({})", item.kind),
+                Verdict::approximated(
+                    Target::Terrano,
+                    Losses::one(
+                        "terrano holds it as a GeoTIFF, and verne does not open the raster, so its size, bands, nodata and georeferencing are unverified",
+                    )
+                    .and(
+                        "the pyramids and the raster catalogue the geodatabase keeps around it are the container's own, and a GeoTIFF carries neither",
+                    ),
+                ),
+            ));
+            continue;
+        }
+        items.push(Item::new(
+            named.clone(),
+            ItemKind::DataModel,
+            format!("{named} ({})", item.kind),
+            Verdict::unsupported(
+                "GDAL's OpenFileGDB driver reads no definition for this kind of item, so verne can name it and nothing else; what it holds cannot be judged from what the driver gives",
+            ),
+        ));
+    }
+}
+
+/// Versioning and archiving are enterprise geodatabase features. A file
+/// geodatabase cannot have them, so there is nothing to carry or lose.
+fn versioning(items: &mut Vec<Item>) {
+    items.push(Item::new(
+        ROOT,
+        ItemKind::Temporal,
+        "versioning and archiving",
+        Verdict::not_applicable(
+            "a file geodatabase has neither: both are enterprise geodatabase features, so nothing here needs geogit's branches or ptolemy's valid time",
+        ),
+    ));
 }
 
 fn tables(scan: &Scan, items: &mut Vec<Item>) {
@@ -59,6 +289,11 @@ fn detail(table: &Table) -> String {
         table.fields.len(),
         plural(table.fields.len())
     ));
+    // the graphics of an annotation class get a row of their own, so this row
+    // must not read as though the whole class came across
+    if table.definition.drawn_feature_type().is_some() {
+        detail.push_str(", graphics reported below");
+    }
     // a field bound to a domain is named with it, so the row says which fields
     // the domain rows below are about
     let named: Vec<String> = table
@@ -212,7 +447,8 @@ fn domain_losses(domain: &Domain, users: &[String]) -> Vec<String> {
 /// A relationship class goes to ptolemy's relationship_classes. The table has
 /// more columns than the create route fills, so some of this stops at the API.
 fn relationships(scan: &Scan, items: &mut Vec<Item>) {
-    for relationship in &scan.relationships {
+    // an attachment relationship is reported with its blob table instead
+    for relationship in scan.relationships.iter().filter(|held| !is_media(held)) {
         items.push(Item::new(
             ROOT,
             ItemKind::Relationship,

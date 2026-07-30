@@ -40,7 +40,12 @@ def build(path):
     feature.SetGeometry(ogr.CreateGeometryFromWkt("POINT (1 2)"))
     wells.CreateFeature(feature)
 
-    ds.CreateLayer("pads", srs, ogr.wkbPolygon)
+    # a feature dataset, which is the geodatabase's grouping of classes
+    ds.CreateLayer("pads", srs, ogr.wkbPolygon, options=["FEATURE_DATASET=Water"])
+
+    # an annotation class is an ordinary polygon layer until its definition
+    # says otherwise, which is patched in below
+    ds.CreateLayer("well_labels", srs, ogr.wkbPolygon)
 
     inspections = ds.CreateLayer("inspections", None, ogr.wkbNone)
     inspections.CreateField(ogr.FieldDefn("well_id", ogr.OFTInteger))
@@ -99,6 +104,82 @@ def build(path):
     media.SetRelatedTableType("media")
     ds.AddRelationship(media)
 
+    ds = None
+
+    patch_definitions(path)
+
+
+# GDAL cannot write Esri subtypes, an annotation class or a topology, and it
+# does not read what it cannot write. What it does do is hand back the
+# definition blob whole, so these are written into the catalogue by hand, to
+# Esri's geodatabase XML schema, and read back through the driver like any
+# other definition.
+SUBTYPES = """  <SubtypeFieldName>status</SubtypeFieldName>
+  <DefaultSubtypeCode>1</DefaultSubtypeCode>
+  <Subtypes xsi:type="typens:ArrayOfSubtype">
+    <Subtype xsi:type="typens:Subtype">
+      <SubtypeName>Active well</SubtypeName>
+      <SubtypeCode>1</SubtypeCode>
+      <FieldInfos xsi:type="typens:ArrayOfSubtypeFieldInfo">
+        <SubtypeFieldInfo xsi:type="typens:SubtypeFieldInfo">
+          <FieldName>depth</FieldName>
+          <DomainName>depth_range</DomainName>
+          <DefaultValue xsi:type="xs:int">100</DefaultValue>
+        </SubtypeFieldInfo>
+      </FieldInfos>
+    </Subtype>
+    <Subtype xsi:type="typens:Subtype">
+      <SubtypeName>Plugged well</SubtypeName>
+      <SubtypeCode>2</SubtypeCode>
+    </Subtype>
+  </Subtypes>
+"""
+
+METADATA = (
+    "<metadata><dataIdInfo><idAbs>The wells of the fixture</idAbs>"
+    "</dataIdInfo></metadata>"
+)
+
+TOPOLOGY = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<typens:DETopology xmlns:typens="http://www.esri.com/schemas/ArcGIS/10.3">'
+    "<Name>Water_Topology</Name><DatasetType>esriDTTopology</DatasetType>"
+    "</typens:DETopology>"
+)
+
+
+def patch_definitions(path):
+    ds = gdal.OpenEx(
+        path, gdal.OF_VECTOR | gdal.OF_UPDATE, open_options=["LIST_ALL_TABLES=YES"]
+    )
+    items = ds.GetLayerByName("GDB_Items")
+    end = "</typens:DEFeatureClassInfo>"
+    for item in items:
+        name = item.GetField("Name")
+        definition = item.GetField("Definition")
+        if not definition:
+            continue
+        if name == "wells":
+            item.SetField("Definition", definition.replace(end, SUBTYPES + end))
+            item.SetField("Documentation", METADATA)
+            items.SetFeature(item)
+        elif name == "well_labels":
+            item.SetField(
+                "Definition",
+                definition.replace(
+                    "<FeatureType>esriFTSimple</FeatureType>",
+                    "<FeatureType>esriFTAnnotation</FeatureType>",
+                ),
+            )
+            items.SetFeature(item)
+
+    topology = ogr.Feature(items.GetLayerDefn())
+    topology.SetField("Name", "Water_Topology")
+    # the catalogue keys an item by its type GUID; the value is not read back,
+    # only the definition is, so any well-formed GUID does here
+    topology.SetField("Type", "{B7E2E7A5-1C1D-4E3C-9D8B-3A5A6E7C8D90}")
+    topology.SetField("Definition", TOPOLOGY)
+    items.CreateFeature(topology)
     ds = None
 
 

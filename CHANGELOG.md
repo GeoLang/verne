@@ -38,3 +38,8 @@ All notable changes to this project will be documented in this file.
 - A FeatureServer URL ending in a layer id scopes inspect and extract to that
   one layer, which is the shape a portal's item URLs come in, so the listing
   pipes straight into `verne inspect`.
+- MapServer roots read through the same contract: group layers become
+  hierarchy rows and their members flat datasets, raster layers are named for
+  terrano and not fetched, per-layer `isDataVersioned` reaches the versioning
+  row, and an object id declared only as a field still orders the pages and
+  keys the native pass.

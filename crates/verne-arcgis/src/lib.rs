@@ -131,7 +131,7 @@ impl ArcgisSource {
     /// and extracted, and a relationship whose other side is out of scope is
     /// reported rather than followed.
     pub fn open_with(fetch: Box<dyn Fetch>, url: &str) -> Result<Self, ArcgisError> {
-        let (url, scope) = normalize(url)?;
+        let (url, format, scope) = normalize(url)?;
         let root = client::json(fetch.as_ref(), &url, &[])?;
         let (head, ids) =
             service::parse_service(&root).map_err(|message| ArcgisError::BadShape {
@@ -159,7 +159,11 @@ impl ArcgisSource {
                     route: route.clone(),
                     message,
                 })?;
-            layer.count = count(fetch.as_ref(), &url, layer.id);
+            // a group or raster layer holds no rows to count, and a real
+            // MapServer refuses the question
+            if layer.queryable() {
+                layer.count = count(fetch.as_ref(), &url, layer.id);
+            }
             layers.push(layer);
         }
         if layers.is_empty() {
@@ -168,6 +172,7 @@ impl ArcgisSource {
         Ok(ArcgisSource {
             service: Service {
                 url,
+                format,
                 scope,
                 description: head.description,
                 versioned: head.versioned,
@@ -198,11 +203,11 @@ fn count(fetch: &dyn Fetch, url: &str, id: i64) -> Option<u64> {
     value.get("count").and_then(serde_json::Value::as_u64)
 }
 
-/// The FeatureServer root, and the one layer the URL scoped verne to when it
-/// ended in a layer id, which is how a portal names its items. A MapServer is
-/// refused: it answers to a different contract than the one verne was written
-/// against.
-fn normalize(url: &str) -> Result<(String, Option<i64>), ArcgisError> {
+/// The FeatureServer or MapServer root, what to call it, and the one layer
+/// the URL scoped verne to when it ended in a layer id, which is how a portal
+/// names its items. Both roots answer the same layer and query contract; what
+/// a MapServer adds is group and raster layers, which the verdicts handle.
+fn normalize(url: &str) -> Result<(String, &'static str, Option<i64>), ArcgisError> {
     let trimmed = url.trim_end_matches('/');
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(ArcgisError::BadUrl(
@@ -219,31 +224,55 @@ fn normalize(url: &str) -> Result<(String, Option<i64>), ArcgisError> {
         }
         _ => (trimmed, None),
     };
-    if root.rsplit('/').next() != Some("FeatureServer") {
-        return Err(ArcgisError::BadUrl(
-            url.to_string(),
-            "expected a URL ending in /FeatureServer, or in /FeatureServer/<layer id>".into(),
-        ));
-    }
-    Ok((root.to_string(), scope))
+    let format = match root.rsplit('/').next() {
+        Some("FeatureServer") => "ArcGIS Feature Service",
+        Some("MapServer") => "ArcGIS Map Service",
+        _ => {
+            return Err(ArcgisError::BadUrl(
+                url.to_string(),
+                "expected a URL ending in /FeatureServer or /MapServer, with or without a layer id"
+                    .into(),
+            ));
+        }
+    };
+    Ok((root.to_string(), format, scope))
 }
 
 impl Source for ArcgisSource {
     type Error = ArcgisError;
 
     fn describe(&self) -> SourceDescription {
-        let layers = self
-            .service
-            .layers
-            .iter()
-            .filter(|layer| layer.geometry_type.is_some())
-            .count();
-        let tables = self.service.layers.len() - layers;
+        // counted by what each is, so a map service's groups and rasters are
+        // not mistaken for tables
+        let mut layers = 0;
+        let mut tables = 0;
+        let mut groups = 0;
+        let mut rasters = 0;
+        for layer in &self.service.layers {
+            match (layer.kind.as_deref(), &layer.geometry_type) {
+                (Some("Group Layer"), _) => groups += 1,
+                (Some("Raster Layer"), _) => rasters += 1,
+                (_, Some(_)) => layers += 1,
+                (_, None) => tables += 1,
+            }
+        }
         let mut detail = format!(
             "{layers} layer{}, {tables} table{}",
             if layers == 1 { "" } else { "s" },
             if tables == 1 { "" } else { "s" }
         );
+        if groups > 0 {
+            detail.push_str(&format!(
+                ", {groups} group layer{}",
+                if groups == 1 { "" } else { "s" }
+            ));
+        }
+        if rasters > 0 {
+            detail.push_str(&format!(
+                ", {rasters} raster layer{}",
+                if rasters == 1 { "" } else { "s" }
+            ));
+        }
         if let Some(description) = &self.service.description {
             detail.push_str(&format!(". {description}"));
         }
@@ -253,7 +282,7 @@ impl Source for ArcgisSource {
             Some(id) => format!("{}/{id}", self.service.url),
             None => self.service.url.clone(),
         };
-        SourceDescription::new("ArcGIS Feature Service", location).with_detail(detail)
+        SourceDescription::new(self.service.format, location).with_detail(detail)
     }
 
     fn inventory(&self) -> Result<Vec<Item>, Self::Error> {
@@ -273,23 +302,34 @@ mod tests {
     /// than being refused.
     #[test]
     fn a_layer_url_scopes_the_source_to_that_layer() {
-        let (root, scope) =
+        let (root, _, scope) =
             normalize("https://host/arcgis/rest/services/x/FeatureServer/3").expect("accepted");
         assert_eq!(root, "https://host/arcgis/rest/services/x/FeatureServer");
         assert_eq!(scope, Some(3));
     }
 
+    /// Both roots answer the same layer and query contract, and the format
+    /// names which one was given.
     #[test]
-    fn a_mapserver_url_is_refused() {
-        assert!(normalize("https://host/arcgis/rest/services/x/MapServer").is_err());
-        assert!(normalize("https://host/arcgis/rest/services/x/MapServer/3").is_err());
+    fn a_mapserver_url_is_accepted_and_named() {
+        let (root, format, scope) =
+            normalize("https://host/arcgis/rest/services/x/MapServer/3").expect("accepted");
+        assert_eq!(root, "https://host/arcgis/rest/services/x/MapServer");
+        assert_eq!(format, "ArcGIS Map Service");
+        assert_eq!(scope, Some(3));
+    }
+
+    #[test]
+    fn an_imageserver_url_is_refused() {
+        assert!(normalize("https://host/arcgis/rest/services/x/ImageServer").is_err());
     }
 
     #[test]
     fn a_trailing_slash_is_trimmed() {
-        let (url, scope) =
+        let (url, format, scope) =
             normalize("https://host/rest/services/x/FeatureServer/").expect("accepted");
         assert_eq!(url, "https://host/rest/services/x/FeatureServer");
+        assert_eq!(format, "ArcGIS Feature Service");
         assert_eq!(scope, None);
     }
 }

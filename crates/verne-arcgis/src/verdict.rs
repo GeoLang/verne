@@ -34,6 +34,22 @@ fn verdict_for(target: Target, losses: Vec<String>) -> Verdict {
 pub fn items(service: &Service) -> Vec<Item> {
     let mut items = Vec::new();
     for layer in &service.layers {
+        // a map service's tree holds layers that are not feature tables, and
+        // each gets the one row that says what it is
+        match layer.kind.as_deref() {
+            Some("Group Layer") => {
+                items.push(group_item(layer));
+                continue;
+            }
+            Some("Raster Layer") => {
+                items.push(raster_item(layer));
+                continue;
+            }
+            Some("Annotation Layer") | Some("Dimension Layer") => {
+                items.push(graphics_item(layer));
+            }
+            _ => {}
+        }
         items.push(layer_item(layer));
         if let Some(item) = subtype_item(layer) {
             items.push(item);
@@ -55,6 +71,59 @@ pub fn items(service: &Service) -> Vec<Item> {
     items.extend(relationship_items(service));
     items.push(versioning_item(service));
     items
+}
+
+/// A group layer is the map's tree, and ptolemy has no container above a
+/// dataset, so the grouping survives only as this row.
+fn group_item(layer: &Layer) -> Item {
+    Item::new(
+        layer.name.clone(),
+        ItemKind::Hierarchy,
+        format!(
+            "group layer holding {} member{}: {}",
+            layer.sub_layers.len(),
+            plural(layer.sub_layers.len()),
+            layer.sub_layers.join(", ")
+        ),
+        Verdict::approximated(
+            Target::Ptolemy,
+            Losses::one(
+                "ptolemy has no container above a dataset, so each member that holds features becomes its own dataset and the grouping is not a thing that can be opened, moved or granted as a whole",
+            ),
+        ),
+    )
+}
+
+/// A raster layer in a map service. verne does not open it, so naming it is
+/// the whole of what happens.
+fn raster_item(layer: &Layer) -> Item {
+    Item::new(
+        layer.name.clone(),
+        ItemKind::RasterOverlay,
+        "raster layer".to_string(),
+        Verdict::approximated(
+            Target::Terrano,
+            Losses::one(
+                "terrano would hold it as a GeoTIFF, and verne does not fetch or open the raster, so it is named here and nothing is extracted; its size, bands and georeferencing are unverified",
+            ),
+        ),
+    )
+}
+
+/// The graphics of an annotation or dimension layer. The fields and shapes
+/// are reported with the layer itself; this row is about what draws them.
+fn graphics_item(layer: &Layer) -> Item {
+    Item::new(
+        layer.name.clone(),
+        ItemKind::Styling,
+        format!(
+            "{} graphics",
+            layer.kind.as_deref().unwrap_or("placed").to_lowercase()
+        ),
+        Verdict::unsupported(
+            "the text, font, symbol and placement of an annotation or dimension layer are the service's own graphics; jung places labels itself from text and an anchor, so a per-feature graphic placed by hand has nothing to be carried into",
+        ),
+    )
 }
 
 // ─── Layers ─────────────────────────────────────────────────────────
@@ -584,9 +653,17 @@ fn metadata_item(layer: &Layer) -> Item {
 
 /// Versioning is a fact about the geodatabase behind the service. A hosted
 /// layer has none; an enterprise service can, and verne reads only the
-/// version the service answers with.
+/// version the service answers with. A FeatureServer says it once at the
+/// root, a MapServer says it per layer, and either way the answer is the
+/// same: the current version comes across and the tree does not.
 fn versioning_item(service: &Service) -> Item {
-    let verdict = if service.versioned {
+    let versioned: Vec<&str> = service
+        .layers
+        .iter()
+        .filter(|layer| layer.versioned)
+        .map(|layer| layer.name.as_str())
+        .collect();
+    let verdict = if service.versioned || !versioned.is_empty() {
         Verdict::unsupported(
             "the service fronts versioned data and verne queries only the default version it answers with; the version tree, its edits and its conflicts are not read, so nothing here reaches geogit's branches",
         )
@@ -595,10 +672,13 @@ fn versioning_item(service: &Service) -> Item {
             "the service reports no versioned data, so there is no version tree to carry",
         )
     };
-    Item::new(
-        ROOT,
-        ItemKind::Temporal,
-        "versioning and archiving",
-        verdict,
-    )
+    let detail = if versioned.is_empty() {
+        "versioning and archiving".to_string()
+    } else {
+        format!(
+            "versioning and archiving, versioned data behind {}",
+            versioned.join(", ")
+        )
+    };
+    Item::new(ROOT, ItemKind::Temporal, detail, verdict)
 }

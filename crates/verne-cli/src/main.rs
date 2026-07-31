@@ -22,7 +22,7 @@ enum Command {
     /// Report what a source holds and how much of it GeoLang could keep
     Inspect {
         /// Path to a .kml or .kmz file or a .gdb directory, or the URL of an
-        /// ArcGIS FeatureServer, whole or scoped to one layer id
+        /// ArcGIS FeatureServer or MapServer, whole or scoped to one layer id
         source: String,
         /// Also write the report as JSON to this path
         #[arg(long, value_name = "PATH")]
@@ -31,8 +31,8 @@ enum Command {
     /// Write a source out as a sidecar ptolemy can load: a geodatabase also
     /// gets a GeoPackage, a feature service is fetched over REST
     Extract {
-        /// Path to a .gdb directory, or the URL of an ArcGIS FeatureServer,
-        /// whole or scoped to one layer id
+        /// Path to a .gdb directory, or the URL of an ArcGIS FeatureServer or
+        /// MapServer, whole or scoped to one layer id
         source: String,
         /// Directory to write the features, the attachment blobs, the sidecar
         /// and the log into (and the GeoPackage, from a geodatabase)

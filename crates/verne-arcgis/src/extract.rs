@@ -64,12 +64,20 @@ impl ArcgisSource {
         let mut placed: Vec<(Item, Placed)> = Vec::new();
         let mut conversions: Vec<Conversion> = Vec::new();
 
-        // one plan per layer, in layer order, so the two walk together by index
-        let mut datasets = dataset_plans(service, operator, &mut placed, &mut conversions);
-        let relationships = relationship_classes(service, &datasets, &mut placed);
+        // group and raster layers get a report row and no dataset: neither
+        // answers /query with features
+        let planned: Vec<&Layer> = service
+            .layers
+            .iter()
+            .filter(|layer| layer.queryable())
+            .collect();
+        // one plan per planned layer, in layer order, so the two walk
+        // together by index
+        let mut datasets = dataset_plans(&planned, operator, &mut placed, &mut conversions);
+        let relationships = relationship_classes(service, &planned, &datasets, &mut placed);
 
         let mut attachments = Vec::new();
-        for (plan_index, layer) in service.layers.iter().enumerate() {
+        for (plan_index, layer) in planned.iter().copied().enumerate() {
             // files are named after the dataset, not the layer: dataset names
             // are unique where duplicate layer names were suffixed, and a file
             // per layer name would have the second layer overwrite the first
@@ -186,6 +194,12 @@ fn left_behind(kind: ItemKind) -> &'static str {
         ItemKind::Metadata => {
             "ptolemy takes a metadata record through a route of its own, which this extraction does not use"
         }
+        ItemKind::Hierarchy => {
+            "ptolemy has no container above a dataset, so there is nothing to create for the grouping itself; each member that holds features became its own dataset"
+        }
+        ItemKind::RasterOverlay => {
+            "verne does not fetch or open the raster, so it is named in the report and nothing was extracted"
+        }
         _ => {
             "this extraction writes datasets, domains, subtypes, relationship classes, features and attachments, and nothing else"
         }
@@ -195,13 +209,13 @@ fn left_behind(kind: ItemKind) -> &'static str {
 // ─── Datasets, domains and subtypes ─────────────────────────────────
 
 fn dataset_plans(
-    service: &crate::Service,
+    planned: &[&Layer],
     operator: &str,
     placed: &mut Vec<(Item, Placed)>,
     conversions: &mut Vec<Conversion>,
 ) -> Vec<DatasetPlan> {
     let mut plans: Vec<DatasetPlan> = Vec::new();
-    for layer in &service.layers {
+    for layer in planned.iter().copied() {
         // two layers may share a name across the layer and table lists, and
         // ptolemy datasets are told apart by name
         let mut name = layer.name.clone();
@@ -445,13 +459,13 @@ fn subtypes_of(layer: &Layer, conversions: &mut Vec<Conversion>) -> Vec<NewSubty
 
 fn relationship_classes(
     service: &crate::Service,
+    planned: &[&Layer],
     plans: &[DatasetPlan],
     placed: &mut Vec<(Item, Placed)>,
 ) -> Vec<NewRelationship> {
     // the class names ptolemy datasets, which are the plans' names, not the
     // layers': the two differ where a duplicate layer name was suffixed
-    let names: BTreeMap<i64, &str> = service
-        .layers
+    let names: BTreeMap<i64, &str> = planned
         .iter()
         .zip(plans)
         .map(|(layer, plan)| (layer.id, plan.dataset.name.as_str()))

@@ -130,15 +130,23 @@ what did not survive.
 
 ## Feature services
 
-`verne inspect` and `verne extract` take a FeatureServer URL and read it
-through the documented REST API: the service resource, each layer and table,
-`/query` for the features, and the attachment routes for the blobs. A URL
-ending in a layer id, which is how a portal names its items and how `verne
-services` prints them, scopes verne to that one layer: only it is read, and a
-relationship whose other side is out of scope is reported rather than
-followed. The scope is the operator's own services with their own
+`verne inspect` and `verne extract` take a FeatureServer or MapServer URL and
+read it through the documented REST API: the service resource, each layer and
+table, `/query` for the features, and the attachment routes for the blobs. A
+URL ending in a layer id, which is how a portal names its items and how
+`verne services` prints them, scopes verne to that one layer: only it is
+read, and a relationship whose other side is out of scope is reported rather
+than followed. The scope is the operator's own services with their own
 credentials: verne records who ran the extraction and touches nothing it is
 not pointed at.
+
+A map service adds three things a feature service does not have, and each
+gets its row. A group layer is the map's tree: ptolemy has no container above
+a dataset, so the grouping survives as a report row and its members become
+flat datasets. A raster layer is named for terrano and not fetched. And a
+MapServer states versioning per layer rather than once at the root, so the
+report names exactly which layers front versioned data; verne reads only the
+version the service answers with, and says so.
 
 Credentials come from the environment, never arguments. A ready token in
 `VERNE_ARCGIS_TOKEN` wins; failing that, `VERNE_ARCGIS_CLIENT_ID` and

@@ -9,11 +9,14 @@
 
 use serde::Deserialize;
 
-/// A feature service, its layers and tables already fetched.
+/// A feature or map service, its layers and tables already fetched.
 #[derive(Debug)]
 pub struct Service {
-    /// The FeatureServer root, no trailing slash.
+    /// The FeatureServer or MapServer root, no trailing slash.
     pub url: String,
+    /// What an operator would call the service: "ArcGIS Feature Service" or
+    /// "ArcGIS Map Service", decided by the root the URL named.
+    pub format: &'static str,
     /// The one layer the operator's URL scoped verne to, when it named one.
     /// `layers` then holds it and nothing else.
     pub scope: Option<i64>,
@@ -30,11 +33,35 @@ impl Service {
     }
 }
 
-/// One layer or table of the service, from `FeatureServer/{id}?f=json`.
+impl Layer {
+    /// Whether the layer holds rows verne can query for. A group layer is
+    /// structure and a raster layer is a picture: neither answers `/query`
+    /// with features.
+    pub fn queryable(&self) -> bool {
+        !matches!(
+            self.kind.as_deref(),
+            Some("Group Layer") | Some("Raster Layer")
+        )
+    }
+}
+
+/// One layer or table of the service, from `{root}/{id}?f=json`.
 #[derive(Debug)]
 pub struct Layer {
     pub id: i64,
     pub name: String,
+    /// The layer's `type`: `Feature Layer`, `Table`, `Group Layer`, `Raster
+    /// Layer` and so on. A FeatureServer usually omits it on tables; a
+    /// MapServer states it on everything, and it is what says a layer has no
+    /// features to ask for.
+    pub kind: Option<String>,
+    /// The group layer this one sits under, and the members when this is
+    /// itself a group: a MapServer's layer tree, flat on a FeatureServer.
+    pub parent_layer: Option<String>,
+    pub sub_layers: Vec<String>,
+    /// `isDataVersioned`: the data behind the layer is versioned in the
+    /// enterprise geodatabase serving it.
+    pub versioned: bool,
     /// `esriGeometry*`, absent on a table.
     pub geometry_type: Option<String>,
     pub has_z: bool,
@@ -123,6 +150,17 @@ pub struct RelationshipEnd {
 
 // ─── Raw JSON ───────────────────────────────────────────────────────
 
+/// The API writes `"fields": null` where it means none: a group layer's field
+/// list is an explicit null, not an absent key, and serde's `default` only
+/// covers absence.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawService {
@@ -148,6 +186,14 @@ struct RawListed {
 struct RawLayer {
     id: i64,
     name: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    parent_layer: Option<RawNamed>,
+    #[serde(default, deserialize_with = "null_default")]
+    sub_layers: Vec<RawNamed>,
+    #[serde(default)]
+    is_data_versioned: bool,
     #[serde(default)]
     geometry_type: Option<String>,
     #[serde(default)]
@@ -170,15 +216,15 @@ struct RawLayer {
     drawing_info: Option<RawDrawingInfo>,
     #[serde(default)]
     time_info: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     fields: Vec<RawField>,
     #[serde(default)]
     subtype_field: Option<String>,
     #[serde(default)]
     default_subtype_code: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     subtypes: Vec<RawSubtype>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     relationships: Vec<RawRelationship>,
 }
 
@@ -187,6 +233,13 @@ struct RawLayer {
 struct RawExtent {
     #[serde(default)]
     spatial_reference: Option<RawSpatialReference>,
+}
+
+/// A `{id, name}` pair, which is how a layer names its parent and members.
+#[derive(Deserialize)]
+struct RawNamed {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -249,11 +302,11 @@ struct RawDomain {
     kind: String,
     #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     coded_values: Vec<RawCodedValue>,
     /// The documented shape is `range: [min, max]`; `min`/`max` have been
     /// seen in renderings of the same page, so both are read.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     range: Vec<serde_json::Value>,
     #[serde(default)]
     min: Option<f64>,
@@ -273,9 +326,9 @@ struct RawCodedValue {
 struct RawSubtype {
     code: serde_json::Value,
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     default_values: serde_json::Map<String, serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     domains: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -336,8 +389,27 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
             supports_query_attachments: false,
         });
     let reference = raw.extent.and_then(|extent| extent.spatial_reference);
+    // a MapServer layer often leaves objectIdField empty and declares the
+    // object id only as a field, so the field is the fallback
+    let object_id_field = raw
+        .object_id_field
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            raw.fields
+                .iter()
+                .find(|field| field.kind == "esriFieldTypeOID")
+                .map(|field| field.name.clone())
+        });
     Ok(Layer {
         id: raw.id,
+        kind: raw.kind.filter(|kind| !kind.is_empty()),
+        parent_layer: raw.parent_layer.and_then(|held| held.name),
+        sub_layers: raw
+            .sub_layers
+            .into_iter()
+            .filter_map(|held| held.name)
+            .collect(),
+        versioned: raw.is_data_versioned,
         geometry_type: raw.geometry_type.filter(|kind| kind != "esriGeometryNull"),
         has_z: raw.has_z,
         has_m: raw.has_m,
@@ -347,7 +419,7 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
         crs_wkt: reference
             .and_then(|held| held.wkt)
             .filter(|wkt| !wkt.trim().is_empty()),
-        object_id_field: raw.object_id_field.filter(|name| !name.is_empty()),
+        object_id_field,
         max_record_count: raw.max_record_count,
         supports_pagination: capabilities.supports_pagination,
         supports_query_attachments: capabilities.supports_query_attachments,

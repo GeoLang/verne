@@ -157,6 +157,7 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
                 layer: Some("wells".into()),
                 features: Some("features/wells.ndjson".into()),
                 object_id_field: None,
+                drawing_info: None,
                 dataset: NewDataset {
                     name: wells.clone(),
                     srid: 4326,
@@ -209,6 +210,7 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
                 layer: Some("inspections".into()),
                 features: Some("features/inspections.ndjson".into()),
                 object_id_field: None,
+                drawing_info: None,
                 dataset: NewDataset {
                     name: inspections.clone(),
                     srid: 4326,

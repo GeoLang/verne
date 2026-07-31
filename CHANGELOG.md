@@ -49,6 +49,17 @@ All notable changes to this project will be documented in this file.
   terrano and not fetched, per-layer `isDataVersioned` reaches the versioning
   row, and an object id declared only as a field still orders the pages and
   keys the native pass.
+- A layer's whole `drawingInfo` is carried verbatim, from a feature service or a
+  MapServer alike: the renderer, its symbols, the label classes, the
+  transparency, everything the service sent, onto the dataset in the sidecar as
+  raw JSON. The load posts it as one symbology rule on that dataset, wrapped in
+  `{"format": "esri-drawing-info", "drawingInfo": ...}` at priority 0 with no
+  scale bounds, and `verne load`'s summary counts the rules. The field is
+  optional, so a sidecar written before it, and every geodatabase and KML
+  extraction, still loads. Nothing in the platform reads the format yet, which
+  is the one thing the report row now says: it used to say verne read the
+  renderer's type and left the symbols on the service. A delta carries no
+  drawing info and posts none, because the style the full load created stands.
 - `verne extract --since <dir>` diffs a feature service against an earlier
   full extraction and writes only the insert, update and delete operations of
   ptolemy's commit route, paired by object id with a hash deciding changed

@@ -3,10 +3,12 @@
 //! A thin client, on purpose. Every request body is a struct out of
 //! `verne_core::sidecar` serialised as it stands, so there is no place for the
 //! sidecar's shape and ptolemy's to drift apart without the compiler noticing.
-//! Three bodies are not. A subtype's `domain_assignments` and a relationship
+//! Four bodies are not. A subtype's `domain_assignments` and a relationship
 //! class's two sides name ptolemy rows by id, and no id exists until the load
 //! is running. An attachment's bytes are a file beside the sidecar, and the
-//! upload route wants them base64ed into the body. Those are the only three
+//! upload route wants them base64ed into the body. A dataset's drawing info is
+//! the source's own document, and ptolemy's symbol is free-form JSON, so it goes
+//! up wrapped in the tag that says what format it is in. Those are the only four
 //! places a body is built rather than sent, and they are named as such.
 //!
 //! No GDAL: the sidecar is JSON, the features are JSON lines beside it, and the
@@ -14,11 +16,12 @@
 //!
 //! # Order and authorisation
 //!
-//! Datasets first, then the domains and subtypes that hang off one, then the
-//! relationship classes, which name two datasets and cannot be created before
-//! both exist. Each dataset also gets a branch, because a dataset with no
-//! branch cannot be committed to and its features have nowhere to go, and the
-//! attachments come last: each hangs off a feature on a branch.
+//! Datasets first, then the schema, the symbology and the domains that hang off
+//! one, then the subtypes, then the relationship classes, which name two
+//! datasets and cannot be created before both exist. Each dataset also gets a
+//! branch, because a dataset with no branch cannot be committed to and its
+//! features have nowhere to go, and the attachments come last: each hangs off a
+//! feature on a branch.
 //!
 //! ptolemy grants the creator of a dataset an admin row on it and enforces a
 //! write ladder on every mutating route thereafter, so the loader has to create
@@ -41,6 +44,12 @@ const API: &str = "/api/v1";
 /// The branch a load commits its features to. ptolemy creates no branch with a
 /// dataset, so this is the first one the dataset has.
 const BRANCH: &str = "main";
+
+/// What the one symbology rule a load creates is called, and the tag inside it
+/// that says which format the document is in. One name for both, because the
+/// rule holds exactly one kind of thing: the source's own drawing rules,
+/// untouched. Whatever comes to read them looks for this tag.
+const ESRI_DRAWING_INFO: &str = "esri-drawing-info";
 
 /// How many features go in one commit. The batch is also flushed when the next
 /// feature would take it past [`MAX_FEATURE_BYTES`], which is what stops a
@@ -117,6 +126,9 @@ pub struct Loaded {
     pub subtypes: BTreeMap<(String, String), String>,
     /// Relationship class name to its id.
     pub relationships: BTreeMap<String, String>,
+    /// Dataset name to the id of the symbology rule its drawing info became. A
+    /// dataset whose source said nothing about drawing is not in here.
+    pub symbology: BTreeMap<String, String>,
     /// Dataset name to the id of the branch its features were committed to.
     pub branches: BTreeMap<String, String>,
     /// Dataset name to how many features were committed, and in how many
@@ -154,12 +166,13 @@ impl Loaded {
     pub fn sentence(&self) -> String {
         format!(
             "{} datasets, {} schemas, {} domains, {} subtypes, {} relationship classes, \
-             {} features in {} commits, {} attachments.",
+             {} symbology rules, {} features in {} commits, {} attachments.",
             self.datasets.len(),
             self.schemas.len(),
             self.domains.len(),
             self.subtypes.len(),
             self.relationships.len(),
+            self.symbology.len(),
             self.features
                 .values()
                 .map(|held| held.features)
@@ -238,6 +251,9 @@ impl Loader {
                     .schemas
                     .insert(plan.dataset.name.clone(), plan.schema.fields.len());
             }
+            if let Some(rule) = self.create_symbology(plan, &id)? {
+                loaded.symbology.insert(plan.dataset.name.clone(), rule);
+            }
             self.create_domains(plan, &id, &mut loaded)?;
             let branch = self.create_branch(plan, &id)?;
             loaded
@@ -277,6 +293,10 @@ impl Loader {
     /// says were added, replaced or deleted, and those are applied after the
     /// features, because an attachment added in the same window as the feature
     /// it hangs off has nowhere to go until that feature is committed.
+    ///
+    /// The symbology is not re-sent. A delta is feature operations, the style
+    /// the full load created stands, and a delta's sidecar carries no drawing
+    /// info to send in any case.
     fn load_incremental(&self, sidecar: &Sidecar, directory: &Path) -> Result<Loaded, LoadError> {
         let mut loaded = Loaded::default();
         let held = self.get(&format!("{API}/datasets"))?;
@@ -427,6 +447,38 @@ impl Loader {
         }
         self.put(&format!("{API}/datasets/{dataset_id}/schema"), schema)?;
         Ok(true)
+    }
+
+    /// The source's own drawing rules as one symbology rule, or `None` where
+    /// the source said nothing about drawing.
+    ///
+    /// The document goes up as it came off the source, wrapped in the tag that
+    /// says which format it is in: ptolemy's `symbol` is free-form JSON and
+    /// stores whatever it is handed, so nothing here has to understand an Esri
+    /// symbol to carry one. One rule per dataset, at priority 0, because the
+    /// document is the source's whole answer about drawing and there is nothing
+    /// to order it against.
+    fn create_symbology(
+        &self,
+        plan: &DatasetPlan,
+        dataset_id: &str,
+    ) -> Result<Option<String>, LoadError> {
+        let Some(drawing_info) = &plan.drawing_info else {
+            return Ok(None);
+        };
+        let route = format!("{API}/datasets/{dataset_id}/symbology");
+        let body = self.post(
+            &route,
+            &SymbologyBody {
+                name: ESRI_DRAWING_INFO,
+                symbol: serde_json::json!({
+                    "format": ESRI_DRAWING_INFO,
+                    "drawingInfo": drawing_info,
+                }),
+                priority: 0,
+            },
+        )?;
+        id_of(&route, &body).map(Some)
     }
 
     /// The dataset's first branch. ptolemy creates none with a dataset, and a
@@ -798,6 +850,17 @@ fn base64(bytes: &[u8]) -> String {
 struct BranchBody<'a> {
     name: &'a str,
     created_by: &'a str,
+}
+
+/// `POST /api/v1/datasets/{id}/symbology`: the source's drawing info inside the
+/// tag naming its format. `min_scale`, `max_scale` and `filter_expression` are
+/// left out, which ptolemy reads as the rule applying at every scale to every
+/// feature, and that is what a layer's own drawing info says.
+#[derive(Serialize)]
+struct SymbologyBody<'a> {
+    name: &'a str,
+    symbol: serde_json::Value,
+    priority: i32,
 }
 
 /// `POST /api/v1/branches/{id}/commit`. The operations are the sidecar's

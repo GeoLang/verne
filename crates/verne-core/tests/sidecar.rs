@@ -192,6 +192,7 @@ fn a_sidecar() -> Sidecar {
             layer: Some("wells".into()),
             features: Some("features/wells.ndjson".into()),
             object_id_field: None,
+            drawing_info: Some(serde_json::json!({ "renderer": { "type": "simple" } })),
             dataset: NewDataset {
                 name: "wells".into(),
                 srid: 4326,
@@ -352,6 +353,32 @@ fn a_schema_serialises_as_the_request_body_ptolemy_takes() {
     assert!(json["fields"].is_array(), "{json}");
     assert_eq!(json["fields"][0]["name"], "depth");
     assert!(NewSchema { fields: Vec::new() }.is_empty());
+}
+
+/// A sidecar written before the drawing info was carried has no key for it, and
+/// absent is how a sidecar says the source said nothing about drawing. It has to
+/// load as it did: the extraction is on disk somewhere, and a style verne never
+/// read is no reason to refuse the features.
+#[test]
+fn an_old_shape_sidecar_reads_as_one_with_no_drawing_info() {
+    let mut json = serde_json::to_value(a_sidecar()).expect("serialises");
+    let plan = json["datasets"][0].as_object_mut().expect("an object");
+    assert!(plan.contains_key("drawing_info"), "{plan:#?}");
+    plan.remove("drawing_info");
+
+    let read = Sidecar::from_json(&json.to_string()).expect("an old sidecar still loads");
+    let wells = read.dataset("wells").expect("the plan");
+    assert_eq!(wells.drawing_info, None);
+    assert_eq!(wells.schema.fields.len(), 2);
+
+    // and one that carries it round-trips as the document it was handed, which
+    // is the whole point of holding it as raw JSON
+    let carried = a_sidecar();
+    let back = Sidecar::from_json(&carried.to_json()).expect("parses what it wrote");
+    assert_eq!(
+        back.dataset("wells").expect("the plan").drawing_info,
+        Some(serde_json::json!({ "renderer": { "type": "simple" } }))
+    );
 }
 
 /// A sidecar written before schemas existed would load with an empty one and

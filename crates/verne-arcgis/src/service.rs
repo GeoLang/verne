@@ -103,7 +103,13 @@ pub struct Layer {
     pub supports_query_attachments: bool,
     pub has_attachments: bool,
     pub has_metadata: bool,
-    /// The renderer's `type`, when the layer carries drawing info.
+    /// The layer's whole `drawingInfo` as the service sent it: the renderer,
+    /// the label classes, the transparency, and anything else in there. Kept
+    /// verbatim because nothing here reads it, and an Esri symbol has more in
+    /// it than any model verne could write down without losing some of it.
+    pub drawing_info: Option<serde_json::Value>,
+    /// The renderer's `type` out of that, which is the name the report calls
+    /// the drawing by.
     pub renderer: Option<String>,
     /// Whether the layer declares time awareness.
     pub time_aware: bool,
@@ -243,8 +249,10 @@ struct RawLayer {
     has_attachments: bool,
     #[serde(default)]
     has_metadata: bool,
+    /// Read as raw JSON rather than into a struct: it is carried verbatim, and
+    /// a struct would be a claim about which parts of an Esri symbol matter.
     #[serde(default)]
-    drawing_info: Option<RawDrawingInfo>,
+    drawing_info: Option<serde_json::Value>,
     #[serde(default)]
     time_info: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "null_default")]
@@ -291,19 +299,6 @@ struct RawQueryCapabilities {
     supports_pagination: bool,
     #[serde(default)]
     supports_query_attachments: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawDrawingInfo {
-    #[serde(default)]
-    renderer: Option<RawRenderer>,
-}
-
-#[derive(Deserialize)]
-struct RawRenderer {
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,6 +457,8 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
                 .find(|field| field.kind == "esriFieldTypeGlobalID")
                 .map(|field| field.name.clone())
         });
+    // an explicit null is how the API writes "none" here as well
+    let drawing_info = raw.drawing_info.filter(|info| !info.is_null());
     Ok(Layer {
         id: raw.id,
         kind: raw.kind.filter(|kind| !kind.is_empty()),
@@ -488,10 +485,13 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
         supports_query_attachments: capabilities.supports_query_attachments,
         has_attachments: raw.has_attachments,
         has_metadata: raw.has_metadata,
-        renderer: raw
-            .drawing_info
-            .and_then(|info| info.renderer)
-            .and_then(|renderer| renderer.kind),
+        renderer: drawing_info
+            .as_ref()
+            .and_then(|info| info.get("renderer"))
+            .and_then(|renderer| renderer.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        drawing_info,
         time_aware: raw.time_info.is_some_and(|info| !info.is_null()),
         fields: raw.fields.into_iter().map(field).collect(),
         subtype_field: raw.subtype_field.filter(|name| !name.is_empty()),

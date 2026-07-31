@@ -69,7 +69,17 @@ fn roads_layer() -> serde_json::Value {
         ],
         "extent": { "spatialReference": { "wkid": 4269, "latestWkid": 4269 } },
         "maxRecordCount": 1000,
-        "advancedQueryCapabilities": { "supportsPagination": true }
+        "advancedQueryCapabilities": { "supportsPagination": true },
+        "drawingInfo": {
+            "renderer": {
+                "type": "uniqueValue",
+                "field1": "name",
+                "uniqueValueInfos": [{
+                    "value": "Main",
+                    "symbol": { "type": "esriSLS", "color": [0, 0, 0, 255], "width": 2 }
+                }]
+            }
+        }
     })
 }
 
@@ -320,6 +330,34 @@ fn the_object_id_field_falls_back_to_the_field_declared_as_one() {
         "{:?}",
         written[0].native_geometry_wkb_hex
     );
+}
+
+/// A map service states drawing info per layer as a feature service does, and it
+/// is carried the same way: whole, onto the dataset that layer became.
+#[test]
+fn a_map_layers_drawing_info_is_carried_onto_its_dataset() {
+    let (extraction, _directory) = extract();
+    let roads = extraction.sidecar.dataset("Roads").expect("the road layer");
+    let carried = roads.drawing_info.as_ref().expect("the drawing info");
+    assert_eq!(carried["renderer"]["type"], "uniqueValue");
+    assert_eq!(
+        carried["renderer"]["uniqueValueInfos"][0]["symbol"]["width"],
+        2
+    );
+
+    let items = inventory();
+    assert_eq!(
+        only(&items, ItemKind::Styling).detail,
+        "uniqueValue renderer"
+    );
+    let entry = extraction
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .find(|entry| entry.kind == ItemKind::Styling)
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.log.entries));
+    assert_eq!(entry.destination.as_deref(), Some("symbology of Roads"));
 }
 
 #[test]

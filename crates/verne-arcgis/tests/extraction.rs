@@ -5,7 +5,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{Fake, ROOT, added, logs_table, service_root, wells_layer};
+use common::{Fake, ROOT, added, logs_table, service_root, wells_drawing_info, wells_layer};
 use serde_json::json;
 use verne_arcgis::{ArcgisSource, Extraction};
 use verne_core::{Action, ItemKind, NewFeature};
@@ -482,7 +482,7 @@ fn a_layer_that_supports_it_is_listed_in_one_query_attachments_call() {
 }
 
 #[test]
-fn the_log_names_the_reprojection_and_leaves_the_renderer_behind() {
+fn the_log_names_the_reprojection_and_where_the_drawing_went() {
     let (extraction, _directory) = run(fake());
     let entries = &extraction.sidecar.log.entries;
     assert_eq!(extraction.sidecar.log.operator, OPERATOR);
@@ -499,9 +499,52 @@ fn the_log_names_the_reprojection_and_leaves_the_renderer_behind() {
         .iter()
         .find(|entry| entry.kind == ItemKind::Styling)
         .unwrap_or_else(|| panic!("no styling entry: {entries:#?}"));
-    let Action::Skipped { reason } = &renderer.action else {
-        panic!("the renderer was not left behind: {renderer:#?}");
+    assert_eq!(renderer.detail, "simple renderer");
+    assert_eq!(renderer.destination.as_deref(), Some("symbology of Wells"));
+    // carried whole and still approximated: ptolemy holds the document and
+    // nothing in the platform reads the format yet
+    let Action::CarriedWithLoss { losses } = &renderer.action else {
+        panic!("the drawing info was not carried: {renderer:#?}");
     };
-    assert!(reason.contains("jung is not among its outputs"), "{reason}");
-    assert_eq!(renderer.destination, None);
+    assert!(
+        losses[0].contains("carried verbatim") && losses[0].contains("reads that format yet"),
+        "{losses:#?}"
+    );
+}
+
+/// The whole `drawingInfo` lands on the dataset plan, byte for byte, because
+/// nothing here reads it and a model of it would be a claim about which parts of
+/// an Esri symbol matter.
+#[test]
+fn the_drawing_info_is_carried_verbatim_onto_the_dataset() {
+    let (extraction, _directory) = run(fake());
+    let wells = extraction
+        .sidecar
+        .dataset("Wells")
+        .expect("the point layer");
+    assert_eq!(wells.drawing_info.as_ref(), Some(&wells_drawing_info()));
+    // the parts no field of verne's holds are in there too
+    let carried = wells.drawing_info.as_ref().expect("the drawing info");
+    assert_eq!(carried["renderer"]["symbol"]["style"], "esriSMSCircle");
+    assert_eq!(carried["labelingInfo"][0]["labelExpression"], "[objectid]");
+    assert_eq!(carried["transparency"], 25);
+
+    // a table that publishes none carries none, and absent is how the sidecar
+    // says the source said nothing about drawing
+    let logs = extraction.sidecar.dataset("Logs").expect("the table");
+    assert_eq!(logs.drawing_info, None);
+    let json = serde_json::to_value(&extraction.sidecar).expect("serialises");
+    let plan = json["datasets"]
+        .as_array()
+        .expect("the datasets")
+        .iter()
+        .find(|plan| plan["dataset"]["name"] == "Logs")
+        .expect("the table's plan");
+    assert!(
+        plan.as_object()
+            .expect("an object")
+            .get("drawing_info")
+            .is_none(),
+        "{plan}"
+    );
 }

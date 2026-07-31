@@ -1,18 +1,22 @@
 //! What an extraction produces: the datasets, domains, subtypes, relationship
-//! classes, features and attachments to create in ptolemy, and a log of what
-//! was taken and what was left behind. The features and the attachment bytes
-//! are files beside this one and are named from here rather than held in it.
+//! classes, features, attachments and symbology to create in ptolemy, and a log
+//! of what was taken and what was left behind. The features and the attachment
+//! bytes are files beside this one and are named from here rather than held in
+//! it.
 //!
 //! Every request-shaped struct here mirrors a ptolemy request body field for
 //! field, so loading is a POST of the struct rather than a translation that can
-//! drift from the API. Three fields cannot mirror one. A subtype's domain
+//! drift from the API. Four fields cannot mirror one. A subtype's domain
 //! assignments and a relationship's two sides name ptolemy rows by the id of a
 //! thing that does not exist until the load is running, so those carry the
 //! source's names and the loader does the swap; both are typed as maps and
 //! names rather than as ids, so the swap cannot be forgotten. The third is an
 //! attachment's bytes, which ptolemy takes as base64 in the body: keeping a
 //! blob in here would make the sidecar unreadable, so the bytes are a file
-//! beside it and the loader encodes them.
+//! beside it and the loader encodes them. The fourth is a dataset's drawing
+//! info, which is the source's own document and not a ptolemy shape at all: the
+//! loader wraps it in the tag that says which format it is in and posts that as
+//! ptolemy's free-form symbol.
 //!
 //! Pure serde: no GDAL, no HTTP, no filesystem.
 
@@ -438,6 +442,16 @@ pub struct DatasetPlan {
     /// from a new feature. Absent on sidecars written before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_id_field: Option<String>,
+    /// How the source drew this table, in the source's own words and untouched:
+    /// an ArcGIS layer's whole `drawingInfo`. The loader wraps it in a format
+    /// tag and posts it as one symbology rule, which is the fourth field here
+    /// that is not sent as it stands.
+    ///
+    /// Absent means the source said nothing about drawing, which is every
+    /// geodatabase and KML extraction and every sidecar written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drawing_info: Option<serde_json::Value>,
     pub dataset: NewDataset,
     /// No serde default: a sidecar written before schemas existed would
     /// otherwise load with an empty one and drop every alias without saying so,

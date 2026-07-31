@@ -8,13 +8,14 @@
 //!
 //! Every route the loader touches is scripted, and a route it asks for that is
 //! not here is a panic rather than a 404: a missing fixture must be louder than
-//! a wrong assertion.
+//! a wrong assertion. The socket itself is in `mock`.
+
+mod mock;
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
+use mock::{Ptolemy, Seen, created, no_content, ok};
 use verne_core::SourceDescription;
 use verne_core::sidecar::{
     AttachmentOp, DatasetPlan, DeleteAttachment, ExtractionLog, NewAttachment, NewDataset,
@@ -32,123 +33,32 @@ const TWIN: &str = "55555555-5555-5555-5555-555555555555";
 /// The bytes the delta carries for the replacement.
 const FRESH: &[u8] = b"the second copy";
 
-// ─── The scripted ptolemy ────────────────────────────────────────────
+// ─── The scripted routes ─────────────────────────────────────────────
 
-/// One request the loader made, as the socket saw it.
-#[derive(Debug, Clone)]
-struct Seen {
-    method: String,
-    path: String,
-    body: String,
+/// A ptolemy holding these attachments on the one feature, as `(id, name)`. What
+/// it holds is state: a delete takes one out and an upload puts one in, so a
+/// listing after either says what the load did.
+fn holding(held: &[(&str, &str)]) -> Ptolemy {
+    let attachments = Mutex::new(
+        held.iter()
+            .map(|(id, name)| ((*id).to_string(), (*name).to_string()))
+            .collect::<Vec<(String, String)>>(),
+    );
+    let uploads = Mutex::new(0usize);
+    Ptolemy::answering(move |request| answer(request, &attachments, &uploads))
 }
 
-/// A ptolemy that answers the routes a delta load asks for and remembers what it
-/// was asked. The attachments it holds are state: a delete takes one out and an
-/// upload puts one in, so a listing after either says what the load did.
-struct Ptolemy {
-    url: String,
-    seen: Arc<Mutex<Vec<Seen>>>,
-}
-
-impl Ptolemy {
-    /// A ptolemy holding these attachments on the one feature, as `(id, name)`.
-    fn holding(held: &[(&str, &str)]) -> Ptolemy {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
-        let url = format!("http://{}", listener.local_addr().expect("the address"));
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let attachments: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(
-            held.iter()
-                .map(|(id, name)| ((*id).to_string(), (*name).to_string()))
-                .collect(),
-        ));
-        let recorded = Arc::clone(&seen);
-        // detached: the test ends with the process, and a listener with nothing
-        // left to answer costs nothing
-        std::thread::spawn(move || {
-            let mut uploads = 0usize;
-            for stream in listener.incoming() {
-                let mut stream = stream.expect("a connection");
-                let Some(request) = read_request(&mut stream) else {
-                    continue;
-                };
-                recorded
-                    .lock()
-                    .expect("the request log")
-                    .push(request.clone());
-                let answer = answer(&request, &attachments, &mut uploads);
-                stream.write_all(answer.as_bytes()).expect("an answer");
-                stream.flush().expect("a flushed answer");
-            }
-        });
-        Ptolemy { url, seen }
-    }
-
-    /// What it was asked, as `(method, path)`, in order.
-    fn calls(&self) -> Vec<(String, String)> {
-        self.seen
-            .lock()
-            .expect("the request log")
-            .iter()
-            .map(|held| (held.method.clone(), held.path.clone()))
-            .collect()
-    }
-
-    /// The body of the one request that was `method path`.
-    fn body(&self, method: &str, path: &str) -> String {
-        self.seen
-            .lock()
-            .expect("the request log")
-            .iter()
-            .find(|held| held.method == method && held.path == path)
-            .map(|held| held.body.clone())
-            .unwrap_or_else(|| panic!("no {method} {path} was made: {:#?}", self.calls()))
-    }
-}
-
-fn read_request(stream: &mut std::net::TcpStream) -> Option<Seen> {
-    let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("a request line");
-    let mut words = line.split_whitespace();
-    let method = words.next()?.to_string();
-    let path = words.next()?.to_string();
-    let mut length = 0usize;
-    loop {
-        let mut header = String::new();
-        reader.read_line(&mut header).expect("a header");
-        let header = header.trim_end();
-        if header.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = header.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().expect("a content length");
-        }
-    }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).expect("the body");
-    Some(Seen {
-        method,
-        path,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
-}
-
-/// The one place the scripted routes are: what each answers, and what it does to
-/// the attachments the ptolemy holds.
+/// What each route answers, and what it does to the attachments held.
 fn answer(
     request: &Seen,
     attachments: &Mutex<Vec<(String, String)>>,
-    uploads: &mut usize,
+    uploads: &Mutex<usize>,
 ) -> String {
     let listing = format!("/api/v1/branches/{BRANCH}/features/{FEATURE}/attachments");
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/api/v1/datasets") => {
-            ok(&serde_json::json!([{ "id": DATASET, "name": "Wells" }]).to_string())
-        }
+        ("GET", "/api/v1/datasets") => ok(&serde_json::json!([{ "id": DATASET, "name": "Wells" }])),
         ("GET", path) if path == format!("/api/v1/datasets/{DATASET}/branches") => {
-            ok(&serde_json::json!([{ "id": BRANCH, "name": "main" }]).to_string())
+            ok(&serde_json::json!([{ "id": BRANCH, "name": "main" }]))
         }
         ("GET", path) if path == listing => {
             let held: Vec<serde_json::Value> = attachments
@@ -157,21 +67,18 @@ fn answer(
                 .iter()
                 .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
                 .collect();
-            ok(&serde_json::Value::Array(held).to_string())
+            ok(&serde_json::Value::Array(held))
         }
         ("POST", path) if path == listing => {
-            *uploads += 1;
-            let id = format!("uploaded-{uploads}");
-            let name = serde_json::from_str::<serde_json::Value>(&request.body)
-                .expect("an upload body")["name"]
-                .as_str()
-                .expect("a name")
-                .to_string();
+            let mut count = uploads.lock().expect("the upload count");
+            *count += 1;
+            let id = format!("uploaded-{count}");
+            let name = request.json()["name"].as_str().expect("a name").to_string();
             attachments
                 .lock()
                 .expect("the attachments")
                 .push((id.clone(), name));
-            ok(&serde_json::json!({ "id": id }).to_string())
+            created(&serde_json::json!({ "id": id }))
         }
         ("DELETE", path) => {
             let id = path
@@ -182,18 +89,10 @@ fn answer(
                 .lock()
                 .expect("the attachments")
                 .retain(|(held, _)| *held != id);
-            "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+            no_content()
         }
         (method, path) => panic!("no fixture for {method} {path}"),
     }
-}
-
-fn ok(body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: \
-         close\r\n\r\n{body}",
-        body.len()
-    )
 }
 
 // ─── The delta ───────────────────────────────────────────────────────
@@ -219,6 +118,7 @@ fn a_delta(ops: Vec<AttachmentOp>) -> (Sidecar, tempfile::TempDir) {
             // features, and an empty delta commits nothing
             features: None,
             object_id_field: Some("objectid".into()),
+            drawing_info: None,
             dataset: NewDataset {
                 name: "Wells".into(),
                 srid: 4326,
@@ -268,7 +168,7 @@ fn load(ptolemy: &Ptolemy, sidecar: &Sidecar, directory: &tempfile::TempDir) -> 
 /// with nothing to tell them apart, and the next delta pairs on that name.
 #[test]
 fn a_replacement_deletes_the_loaded_copy_before_uploading_the_new_bytes() {
-    let ptolemy = Ptolemy::holding(&[(LOADED, "photo.png")]);
+    let ptolemy = holding(&[(LOADED, "photo.png")]);
     let (sidecar, directory) = a_delta(vec![replacement("photo.png")]);
 
     let loaded = load(&ptolemy, &sidecar, &directory);
@@ -297,8 +197,7 @@ fn a_replacement_deletes_the_loaded_copy_before_uploading_the_new_bytes() {
 
     // the bytes that went up are the delta's, base64ed into the body ptolemy
     // takes
-    let body: serde_json::Value =
-        serde_json::from_str(&ptolemy.body("POST", &listing)).expect("the upload body");
+    let body = ptolemy.call("POST", &listing).json();
     assert_eq!(body["name"], "photo.png");
     assert_eq!(body["data"], base64(FRESH));
     assert_eq!(body["content_type"], "image/png");
@@ -312,7 +211,7 @@ fn a_replacement_deletes_the_loaded_copy_before_uploading_the_new_bytes() {
 /// A delete finds the loaded copy the same way and uploads nothing.
 #[test]
 fn a_delete_removes_the_loaded_copy_and_uploads_nothing() {
-    let ptolemy = Ptolemy::holding(&[(LOADED, "photo.png")]);
+    let ptolemy = holding(&[(LOADED, "photo.png")]);
     let (sidecar, directory) = a_delta(vec![AttachmentOp::Delete(DeleteAttachment {
         dataset: "Wells".into(),
         feature_id: FEATURE.into(),
@@ -347,7 +246,7 @@ fn a_delete_removes_the_loaded_copy_and_uploads_nothing() {
 /// rest of the delta still loads.
 #[test]
 fn two_attachments_of_one_name_refuse_the_operation() {
-    let ptolemy = Ptolemy::holding(&[(LOADED, "twin.png"), (TWIN, "twin.png")]);
+    let ptolemy = holding(&[(LOADED, "twin.png"), (TWIN, "twin.png")]);
     let (sidecar, directory) = a_delta(vec![replacement("twin.png")]);
 
     let loaded = load(&ptolemy, &sidecar, &directory);
@@ -373,7 +272,7 @@ fn two_attachments_of_one_name_refuse_the_operation() {
 /// An addition is an upload and nothing else: there is no loaded copy to find.
 #[test]
 fn an_addition_uploads_without_listing_anything() {
-    let ptolemy = Ptolemy::holding(&[]);
+    let ptolemy = holding(&[]);
     let (sidecar, directory) = a_delta(vec![AttachmentOp::Add(NewAttachment {
         dataset: "Wells".into(),
         feature_id: FEATURE.into(),
@@ -398,8 +297,7 @@ fn an_addition_uploads_without_listing_anything() {
     // the metadata rides along, which is where everything ptolemy has no field
     // for is kept
     let listing = format!("/api/v1/branches/{BRANCH}/features/{FEATURE}/attachments");
-    let body: serde_json::Value =
-        serde_json::from_str(&ptolemy.body("POST", &listing)).expect("the upload body");
+    let body = ptolemy.call("POST", &listing).json();
     assert_eq!(body["metadata"]["source_layer"], "Wells");
     // no content type is no key on the wire, so ptolemy's own default stands
     assert!(
@@ -415,7 +313,7 @@ fn an_addition_uploads_without_listing_anything() {
 /// is what the caller prints.
 #[test]
 fn a_delta_of_several_operations_counts_each_kind() {
-    let ptolemy = Ptolemy::holding(&[(LOADED, "photo.png"), (TWIN, "notes.txt")]);
+    let ptolemy = holding(&[(LOADED, "photo.png"), (TWIN, "notes.txt")]);
     let (sidecar, directory) = a_delta(vec![
         replacement("photo.png"),
         AttachmentOp::Delete(DeleteAttachment {

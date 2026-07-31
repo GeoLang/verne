@@ -628,19 +628,24 @@ pub fn attachment_item(layer: &Layer) -> Item {
 
 // ─── The rest of the layer ──────────────────────────────────────────
 
-/// A renderer is how the layer is drawn, and jung is where drawing lives.
-/// verne reads the renderer's type and nothing below it, so the row says the
-/// symbols stay behind.
-fn renderer_item(layer: &Layer) -> Option<Item> {
-    let kind = layer.renderer.as_deref()?;
+/// How the layer is drawn. The whole `drawingInfo` reaches ptolemy verbatim as
+/// one style document, symbols, class breaks and label classes and all, so
+/// nothing about it is left on the service. What no part of the platform does
+/// yet is read it: it is stored and served back as the Esri document it is.
+pub fn renderer_item(layer: &Layer) -> Option<Item> {
+    layer.drawing_info.as_ref()?;
+    let detail = match layer.renderer.as_deref() {
+        Some(kind) => format!("{kind} renderer"),
+        None => "drawing info with no renderer".to_string(),
+    };
     Some(Item::new(
         layer.name.clone(),
         ItemKind::Styling,
-        format!("{kind} renderer"),
+        detail,
         Verdict::approximated(
-            Target::Jung,
+            Target::Ptolemy,
             Losses::one(
-                "verne reads the renderer's type and nothing below it, so the symbols, colours, class breaks and label classes stay on the service and recreating them in jung is by hand",
+                "the layer's whole drawingInfo is carried verbatim as one symbology rule, tagged with the format it is in, and nothing in the platform reads that format yet: ptolemy stores it and serves it back, so what draws with it is whatever client knows Esri's symbols",
             ),
         ),
     ))

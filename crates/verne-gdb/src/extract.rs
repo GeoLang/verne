@@ -373,6 +373,9 @@ fn dataset_plans(
             layer: None,
             features: None,
             object_id_field: None,
+            // a geodatabase keeps its drawing in the layer files beside it,
+            // which verne does not read
+            drawing_info: None,
             dataset: NewDataset {
                 name: table.name.clone(),
                 srid: PTOLEMY_SRID,
@@ -766,6 +769,7 @@ mod tests {
                 layer: None,
                 features: None,
                 object_id_field: None,
+                drawing_info: None,
                 dataset: NewDataset {
                     name: (*name).to_string(),
                     srid: PTOLEMY_SRID,

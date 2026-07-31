@@ -272,21 +272,21 @@ fn attachments_are_a_row_of_their_own() {
     );
 }
 
+/// The drawing info reaches ptolemy whole, so the row is approximated for one
+/// reason only: nothing in the platform reads the format yet.
 #[test]
-fn the_renderer_goes_to_jung_with_only_its_type_read() {
+fn the_drawing_info_goes_to_ptolemy_verbatim() {
     let items = inventory();
     let styling = only(&items, ItemKind::Styling);
     assert_eq!(styling.detail, "simple renderer");
     assert_eq!(styling.verdict.outcome(), Outcome::Approximated);
     assert_eq!(
         styling.verdict.target().map(|target| target.component()),
-        Some("jung")
+        Some("ptolemy")
     );
-    assert!(
-        styling.verdict.shortfall().contains("class breaks"),
-        "{}",
-        styling.verdict.shortfall()
-    );
+    let shortfall = styling.verdict.shortfall();
+    assert!(shortfall.contains("carried verbatim"), "{shortfall}");
+    assert!(shortfall.contains("reads that format yet"), "{shortfall}");
 }
 
 #[test]

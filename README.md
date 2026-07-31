@@ -160,8 +160,9 @@ body and nowhere else: not in a URL, an error, or a log line.
 What is inventoried: layers and tables with their fields, aliases and domain
 bindings, coded and range domains, subtypes with their defaults and per-subtype
 domain assignments, relationships as both of their ends tell them, attachments,
-renderers by name, time awareness, metadata records, and whether the service
-fronts versioned data (verne reads only the version the service answers with).
+the drawing info each layer publishes, time awareness, metadata records, and
+whether the service fronts versioned data (verne reads only the version the
+service answers with).
 
 Three things differ from a geodatabase on disk, and the report names each:
 
@@ -295,8 +296,8 @@ features/     — one file per dataset, one line of JSON per feature, each line 
                 original beside it named by EPSG code or by WKT
 attachments/  — the blobs out of the __ATTACH tables, one file each
 sidecar.json  — the datasets, their column schemas, coded and range domains,
-                subtypes, relationship classes and attachments to create in
-                ptolemy, plus the log
+                subtypes, relationship classes, attachments and symbology to
+                create in ptolemy, plus the log
 ```
 
 From a feature service the GeoPackage is absent and everything else is the
@@ -310,12 +311,15 @@ attachment under. Nothing but a later delta reads any of them.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the
-API. Three fields cannot mirror one. Two are ids of rows that do not exist until
+API. Four fields cannot mirror one. Two are ids of rows that do not exist until
 the load is running: a subtype's `domain_assignments` names its domains, and a
 relationship class names its two datasets, so both are typed as names and the
 loader swaps them. The third is an attachment's bytes, which ptolemy takes as
 base64 in the body: a blob in `sidecar.json` would make the file unreadable, so
-the sidecar names a file beside it and the loader encodes it.
+the sidecar names a file beside it and the loader encodes it. The fourth is a
+dataset's drawing info, which is not a ptolemy shape at all but the source's own
+document, so the loader wraps it in the tag naming its format and posts that as
+ptolemy's free-form symbol.
 
 ### The features, twice
 
@@ -375,6 +379,29 @@ carries a domain into a GeoPackage only where it can see a field using it, and a
 domain reached through a subtype is invisible to it. On a real geodatabase that
 is most of them — see below.
 
+### Symbology
+
+A feature or map service publishes a layer's `drawingInfo`: the renderer, its
+symbols, its class breaks or unique values, the label classes and the
+transparency. The whole object is written into the sidecar on the dataset,
+verbatim, and the load posts it as one symbology rule on that dataset, wrapped in
+`{"format": "esri-drawing-info", "drawingInfo": ...}` so whatever comes to read
+it knows what it is looking at. `min_scale`, `max_scale` and `filter_expression`
+are left off, which ptolemy reads as every scale and every feature, and that is
+what a layer's own drawing info says.
+
+Verbatim is the point. An Esri symbol has more in it than any model verne could
+write down without deciding which parts matter, and nothing in the platform reads
+the format yet, so there is nothing to decide for. ptolemy stores the document
+and serves it back; what draws with it is whatever client knows Esri's symbols.
+The report row says exactly that, so nobody reads a carried style as a rendered
+one.
+
+A geodatabase carries none of this: its drawing lives in the layer files beside
+it, which verne does not read. A delta does not carry it either, because the
+style the full load created stands and a second rule would be a second style on
+the dataset.
+
 ### Field aliases
 
 An Esri field carries a name and a human label beside it, and the label is what
@@ -413,11 +440,11 @@ required rather than optional: an extraction has to be able to say who made it.
 
 ## Loading
 
-`verne load` creates datasets first, each with its schema, then the domains that
-hang off it, then a branch and the features on it, then the subtypes, which name
-a domain by id, then the relationship classes, which name two datasets and
-cannot be created before both exist, and last the attachments, each of which
-hangs off a feature on a branch.
+`verne load` creates datasets first, each with its schema and the one symbology
+rule its drawing info becomes, then the domains that hang off it, then a branch
+and the features on it, then the subtypes, which name a domain by id, then the
+relationship classes, which name two datasets and cannot be created before both
+exist, and last the attachments, each of which hangs off a feature on a branch.
 
 The branch is the loader's doing: ptolemy creates none with a dataset, and a
 dataset with no branch cannot be committed to, so the features would have

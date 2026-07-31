@@ -218,7 +218,13 @@ impl ArcgisSource {
             .collect();
         // one plan per planned layer, in layer order, so the two walk
         // together by index
-        let mut datasets = dataset_plans(&planned, operator, &mut placed, &mut conversions);
+        let mut datasets = dataset_plans(
+            &planned,
+            operator,
+            previous.is_some(),
+            &mut placed,
+            &mut conversions,
+        );
         // a delta carries feature operations only: the relationship classes
         // were created when the full extraction was loaded, and repeating
         // them here would have the loader create second copies
@@ -549,7 +555,7 @@ fn left_behind(kind: ItemKind) -> &'static str {
             "an attachment reaches ptolemy on the feature it belongs to, and this one names no feature this extraction created, so there is nothing to hang it off"
         }
         ItemKind::Styling => {
-            "the renderer stays on the service: this extraction writes datasets, domains, subtypes, relationship classes, features and attachments, and jung is not among its outputs"
+            "a style in ptolemy hangs off a dataset and this layer became none, so its drawing info had nowhere to go"
         }
         ItemKind::Metadata => {
             "ptolemy takes a metadata record through a route of its own, which this extraction does not use"
@@ -568,9 +574,16 @@ fn left_behind(kind: ItemKind) -> &'static str {
 
 // ─── Datasets, domains and subtypes ─────────────────────────────────
 
+/// One plan per planned layer, in layer order.
+///
+/// `incremental` decides what happens to the drawing info: a delta commits
+/// feature operations and creates nothing, so the style the full extraction
+/// loaded stands and this does not carry it again. Carrying it would put a
+/// document in the sidecar that no load reads.
 fn dataset_plans(
     planned: &[&Layer],
     operator: &str,
+    incremental: bool,
     placed: &mut Vec<(Item, Placed)>,
     conversions: &mut Vec<Conversion>,
 ) -> Vec<DatasetPlan> {
@@ -606,6 +619,18 @@ fn dataset_plans(
             verdict::layer_item(layer),
             Placed::At(format!("dataset {name}")),
         ));
+        if let Some(item) = verdict::renderer_item(layer) {
+            placed.push((
+                item,
+                if incremental {
+                    Placed::Left(
+                        "the drawing info was carried and loaded with the full extraction, and a delta commits feature operations only, so it is not sent again".into(),
+                    )
+                } else {
+                    Placed::At(format!("symbology of {name}"))
+                },
+            ));
+        }
         let domains = domains_of(layer, conversions);
         let subtypes = subtypes_of(layer, conversions);
         if let Some(item) = verdict::subtype_item(layer) {
@@ -629,6 +654,7 @@ fn dataset_plans(
             layer: None,
             features: None,
             object_id_field: layer.object_id_field.clone(),
+            drawing_info: (!incremental).then(|| layer.drawing_info.clone()).flatten(),
             dataset: NewDataset {
                 name,
                 srid: PTOLEMY_SRID,

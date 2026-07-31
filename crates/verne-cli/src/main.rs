@@ -276,6 +276,9 @@ fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
     for (name, id) in &loaded.relationships {
         println!("  relationship class {name} {id}");
     }
+    for (name, id) in &loaded.symbology {
+        println!("  symbology of {name} {id}");
+    }
     Ok(())
 }
 

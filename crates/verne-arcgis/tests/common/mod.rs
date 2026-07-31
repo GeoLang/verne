@@ -177,7 +177,26 @@ pub fn wells_layer() -> serde_json::Value {
             "supportsPagination": true,
             "supportsQueryAttachments": false
         },
-        "drawingInfo": { "renderer": { "type": "simple" } },
+        // more than the renderer: what the extraction carries is the whole
+        // object, so the fixture has parts of one no model of verne's holds
+        "drawingInfo": {
+            "renderer": {
+                "type": "simple",
+                "symbol": {
+                    "type": "esriSMS",
+                    "style": "esriSMSCircle",
+                    "color": [255, 0, 0, 255],
+                    "size": 8,
+                    "outline": { "color": [0, 0, 0, 255], "width": 0.5 }
+                },
+                "label": "Well"
+            },
+            "labelingInfo": [{
+                "labelExpression": "[objectid]",
+                "symbol": { "type": "esriTS", "color": [0, 0, 0, 255] }
+            }],
+            "transparency": 25
+        },
         "fields": [
             { "name": "objectid", "type": "esriFieldTypeOID", "alias": "OBJECTID" },
             {
@@ -278,4 +297,10 @@ pub fn added(op: &AttachmentOp) -> &NewAttachment {
         AttachmentOp::Add(held) => held,
         other => panic!("expected an upload: {other:#?}"),
     }
+}
+
+/// The whole `drawingInfo` the point layer publishes, which is what an
+/// extraction has to write down unchanged.
+pub fn wells_drawing_info() -> serde_json::Value {
+    wells_layer()["drawingInfo"].clone()
 }

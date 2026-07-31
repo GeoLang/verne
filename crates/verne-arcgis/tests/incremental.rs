@@ -271,12 +271,12 @@ fn an_unchanged_table_is_an_empty_delta_with_its_rows_counted() {
     assert!(counted, "{:#?}", extraction.sidecar.log.entries);
 }
 
-/// The relationship classes were created when the full extraction was loaded,
-/// and a local diff learns nothing about attachments: it reads the features
-/// again, and the service says nothing about a blob on the way. The log says
-/// where both stand.
+/// The relationship classes and the style were created when the full extraction
+/// was loaded, and a local diff learns nothing about attachments: it reads the
+/// features again, and the service says nothing about a blob on the way. The log
+/// says where each of the three stands.
 #[test]
-fn a_delta_repeats_no_relationships_and_fetches_no_attachments() {
+fn a_delta_repeats_no_relationships_style_or_attachments() {
     let full = tempfile::tempdir().expect("tempdir");
     let delta = tempfile::tempdir().expect("tempdir");
     extract_full(full.path());
@@ -284,7 +284,26 @@ fn a_delta_repeats_no_relationships_and_fetches_no_attachments() {
 
     assert!(extraction.sidecar.relationships.is_empty());
     assert!(extraction.sidecar.attachments.is_empty());
+    // no drawing info either, so a delta load has nothing to re-post and the
+    // sidecar holds no document no load reads
+    assert!(
+        extraction
+            .sidecar
+            .datasets
+            .iter()
+            .all(|plan| plan.drawing_info.is_none()),
+        "{:#?}",
+        extraction.sidecar.datasets
+    );
     let entries = &extraction.sidecar.log.entries;
+    let styling = entries
+        .iter()
+        .find(|entry| entry.kind == ItemKind::Styling)
+        .unwrap_or_else(|| panic!("no styling entry: {entries:#?}"));
+    assert!(
+        matches!(&styling.action, Action::Skipped { reason } if reason.contains("not sent again")),
+        "{styling:#?}"
+    );
     let relationship = entries
         .iter()
         .find(|entry| entry.kind == ItemKind::Relationship)

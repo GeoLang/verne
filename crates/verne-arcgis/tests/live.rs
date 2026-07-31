@@ -13,7 +13,7 @@
 //! ```
 
 use verne_arcgis::{ArcgisSource, Credentials, TOKEN_VAR};
-use verne_core::Source;
+use verne_core::{AttachmentOp, Source};
 
 #[test]
 fn a_live_feature_service_inventories_and_extracts() {
@@ -58,7 +58,11 @@ fn a_live_feature_service_inventories_and_extracts() {
             plan.dataset.name
         );
     }
-    for attachment in &extraction.sidecar.attachments {
+    for op in &extraction.sidecar.attachments {
+        // a full extraction writes uploads and nothing else
+        let AttachmentOp::Add(attachment) = op else {
+            panic!("a full extraction wrote an attachment operation of its own: {op:#?}");
+        };
         let path = extraction.directory.join(&attachment.file);
         assert!(
             path.is_file(),

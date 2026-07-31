@@ -2,9 +2,14 @@
 //!
 //! The fixture's second state is the one `incremental.rs` diffs locally, so the
 //! operations a change file leads to can be held against the ones the local
-//! diff writes: 1 got deeper, 2 is as it was, 3 vanished, 4 is new. What
-//! differs is how they were found, and how many rows had to be fetched to find
-//! them.
+//! diff writes: 1 got deeper, 2 is as it was, 3 vanished, 4 is new, and 5 never
+//! moves in any window, which is what makes it the parent an attachment can be
+//! added to without its own row being fetched. What differs is how they were
+//! found, and how many rows had to be fetched to find them.
+//!
+//! The window also carries attachment edits, which is the other half of what a
+//! change file says: one added, one replaced, and one deleted that nothing was
+//! ever loaded under.
 //!
 //! Every route here is a fixture. The one part that is tested against a socket
 //! is the client's own: a result URL redirects to a signed file on a host that
@@ -18,18 +23,36 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::thread::JoinHandle;
 
-use common::{Fake, ROOT, logs_table, service_root, tracking_root, wells_layer};
+use common::{
+    Fake, ROOT, added, logs_table, service_root, tracked_wells_layer, tracking_root, well_guid,
+};
 use serde_json::json;
 use verne_arcgis::{
-    ArcgisError, ArcgisSource, Credentials, Extraction, Fetch, HttpFetch, OBJECT_IDS_DIR,
-    SERVER_GENS_FILE,
+    ATTACHMENT_IDS_DIR, ArcgisError, ArcgisSource, Credentials, Extraction, Fetch, HttpFetch,
+    OBJECT_IDS_DIR, SERVER_GENS_FILE,
 };
-use verne_core::{Action, FeatureOp, NewFeature};
+use verne_core::{Action, AttachmentOp, FeatureOp, NewFeature};
 
 const OPERATOR: &str = "verne-arcgis test";
 
 /// A Date attribute as the service sends it, epoch milliseconds.
 const DRILLED: i64 = 1743630690000;
+
+/// The attachment the full extraction carries, on well 1: the id the service
+/// knows it by, and the bytes at that point.
+const PHOTO: &str = "{A1B2C3D4-0000-0000-0000-000000000001}";
+const PHOTO_BYTES: &[u8] = b"\x89PNG the first";
+
+/// The bytes the same attachment holds after the window, which is what a
+/// replacement has to end up with.
+const PHOTO_AGAIN: &[u8] = b"\x89PNG the second";
+
+/// The attachment the first window adds, to a well that did not itself change.
+const LOGS: &str = "{A1B2C3D4-0000-0000-0000-000000000002}";
+const LOGS_BYTES: &[u8] = b"%PDF logs";
+
+/// An attachment the service says is gone that nothing was ever loaded under.
+const NEVER_LOADED: &str = "{A1B2C3D4-0000-0000-0000-00000000ffff}";
 
 /// The generation the full extraction reads at, and the one the change file's
 /// window ends at.
@@ -50,25 +73,57 @@ fn param<'a>(params: &'a [(&str, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+/// A row of the point layer, in the shape the query route answers with. Every
+/// row carries its global id, because the layer declares one.
+fn row(oid: i64, depth: f64, drilled: Option<i64>, x: f64, y: f64) -> serde_json::Value {
+    json!({
+        "attributes": {
+            "objectid": oid,
+            "globalid": well_guid(oid),
+            "status": if oid == 2 { 2 } else { 1 },
+            "depth": depth,
+            "drilled": drilled
+        },
+        "geometry": { "x": x, "y": y }
+    })
+}
+
+/// Well 5 never changes in any window, which makes it the parent an attachment
+/// can be added to without the feature itself being fetched.
+fn quiet_row() -> serde_json::Value {
+    row(5, 60.0, None, 3.9, 50.5)
+}
+
 /// The rows of the point layer's second state, by object id.
 fn changed_row(oid: i64) -> serde_json::Value {
     match oid {
-        1 => json!({
-            "attributes": { "objectid": 1, "status": 1, "depth": 13.0, "drilled": DRILLED },
-            "geometry": { "x": 3.5, "y": 50.1 }
-        }),
-        2 => json!({
-            "attributes": { "objectid": 2, "status": 2, "depth": 30.0, "drilled": null },
-            "geometry": { "x": 3.6, "y": 50.2 }
-        }),
-        4 => json!({
-            "attributes": { "objectid": 4, "status": 1, "depth": 55.0, "drilled": null },
-            "geometry": { "x": 3.8, "y": 50.4 }
-        }),
+        1 => row(1, 13.0, Some(DRILLED), 3.5, 50.1),
+        2 => row(2, 30.0, None, 3.6, 50.2),
+        4 => row(4, 55.0, None, 3.8, 50.4),
+        5 => quiet_row(),
         other => panic!(
             "the extraction asked for object id {other}, which the second state has no row for"
         ),
     }
+}
+
+/// The layer answering `where globalid IN (...)`, which is how the parent of an
+/// added attachment is found when that feature did not itself change. Only the
+/// two columns the pairing needs come back, as the extraction asks.
+fn by_global_id(clause: &str) -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = (1..=5)
+        .filter(|oid| clause.contains(&well_guid(*oid)))
+        .map(|oid| json!({ "attributes": { "objectid": oid, "globalid": well_guid(oid) } }))
+        .collect();
+    serde_json::to_vec(&json!({ "objectIdFieldName": "objectid", "features": rows }))
+        .expect("the page serialises")
+}
+
+/// Whether a query is the global id pairing rather than a page or a count.
+fn pairing(params: &[(&str, String)]) -> Option<String> {
+    param(params, "where")
+        .filter(|clause| clause.starts_with("globalid IN"))
+        .map(str::to_string)
 }
 
 /// The native second pass: the rows again by object id, untransformed.
@@ -87,10 +142,10 @@ fn native_page(oids: &str) -> Vec<u8> {
         .expect("the native page serialises")
 }
 
-/// The first state of the point layer: features 1, 2 and 3, a page at a time.
+/// The first state of the point layer: features 1, 2, 3 and 5, a page at a time.
 fn wells_full(params: &[(&str, String)]) -> Vec<u8> {
     if param(params, "returnCountOnly").is_some() {
-        return serde_json::to_vec(&json!({ "count": 3 })).expect("the count serialises");
+        return serde_json::to_vec(&json!({ "count": 4 })).expect("the count serialises");
     }
     if let Some(oids) = param(params, "objectIds") {
         return native_page(oids);
@@ -98,24 +153,12 @@ fn wells_full(params: &[(&str, String)]) -> Vec<u8> {
     let page = match param(params, "resultOffset") {
         Some("0") => json!({
             "objectIdFieldName": "objectid",
-            "features": [
-                {
-                    "attributes": { "objectid": 1, "status": 1, "depth": 12.5, "drilled": DRILLED },
-                    "geometry": { "x": 3.5, "y": 50.1 }
-                },
-                {
-                    "attributes": { "objectid": 2, "status": 2, "depth": 30.0, "drilled": null },
-                    "geometry": { "x": 3.6, "y": 50.2 }
-                }
-            ],
+            "features": [row(1, 12.5, Some(DRILLED), 3.5, 50.1), row(2, 30.0, None, 3.6, 50.2)],
             "exceededTransferLimit": true
         }),
         Some("2") => json!({
             "objectIdFieldName": "objectid",
-            "features": [{
-                "attributes": { "objectid": 3, "status": 1, "depth": 40.0, "drilled": DRILLED },
-                "geometry": { "x": 3.7, "y": 50.3 }
-            }]
+            "features": [row(3, 40.0, Some(DRILLED), 3.7, 50.3), quiet_row()]
         }),
         other => panic!("the extraction asked for offset {other:?}"),
     };
@@ -128,7 +171,10 @@ fn wells_full(params: &[(&str, String)]) -> Vec<u8> {
 /// by asking for the object id column alone.
 fn wells_changed(params: &[(&str, String)]) -> Vec<u8> {
     if param(params, "returnCountOnly").is_some() {
-        return serde_json::to_vec(&json!({ "count": 3 })).expect("the count serialises");
+        return serde_json::to_vec(&json!({ "count": 4 })).expect("the count serialises");
+    }
+    if let Some(clause) = pairing(params) {
+        return by_global_id(&clause);
     }
     if let Some(oids) = param(params, "objectIds") {
         if param(params, "outFields") != Some("*") {
@@ -149,7 +195,7 @@ fn wells_changed(params: &[(&str, String)]) -> Vec<u8> {
         }),
         Some("2") => json!({
             "objectIdFieldName": "objectid",
-            "features": [changed_row(4)]
+            "features": [changed_row(4), changed_row(5)]
         }),
         other => panic!("the extraction asked for offset {other:?}"),
     };
@@ -172,10 +218,14 @@ fn logs_pages(params: &[(&str, String)]) -> Vec<u8> {
 }
 
 /// The change file the fixture's job writes: 4 added, 1 and 2 updated, 3
-/// deleted, and an attachment edit a delta does not carry.
+/// deleted, and three attachment edits.
 ///
 /// The add carries a depth the query route does not answer with, which is what
 /// proves the features themselves are fetched rather than read out of here.
+/// The attachment records are the shape a live service writes: the bytes are
+/// behind a URL on the service's own host, a delete names a global id and not
+/// the numeric id an add carries, and the feature an attachment hangs off is
+/// named by global id.
 fn change_file() -> serde_json::Value {
     json!({
         "edits": [
@@ -183,25 +233,41 @@ fn change_file() -> serde_json::Value {
                 "id": 0,
                 "features": {
                     "adds": [{
-                        "attributes": { "objectid": 4, "status": 1, "depth": 999.0, "drilled": null },
+                        "attributes": { "objectid": 4, "globalid": well_guid(4), "status": 1, "depth": 999.0, "drilled": null },
                         "geometry": { "x": 3.8, "y": 50.4 }
                     }],
                     "updates": [
                         {
-                            "attributes": { "objectid": 1, "status": 1, "depth": 999.0, "drilled": DRILLED },
+                            "attributes": { "objectid": 1, "globalid": well_guid(1), "status": 1, "depth": 999.0, "drilled": DRILLED },
                             "geometry": { "x": 3.5, "y": 50.1 }
                         },
                         {
-                            "attributes": { "objectid": 2, "status": 2, "depth": 999.0, "drilled": null },
+                            "attributes": { "objectid": 2, "globalid": well_guid(2), "status": 2, "depth": 999.0, "drilled": null },
                             "geometry": { "x": 3.6, "y": 50.2 }
                         }
                     ],
                     "deleteIds": [3]
                 },
                 "attachments": {
-                    "adds": [{ "id": 7, "globalId": "{7}", "parentGlobalId": "{4}" }],
-                    "updates": [],
-                    "deleteIds": [11]
+                    "adds": [{
+                        "attachmentId": 7,
+                        "globalId": LOGS,
+                        "parentGlobalId": well_guid(5),
+                        "contentType": "application/pdf",
+                        "name": "logs.pdf",
+                        "size": LOGS_BYTES.len(),
+                        "url": format!("{ROOT}/0/5/attachments/7")
+                    }],
+                    "updates": [{
+                        "attachmentId": 1,
+                        "globalId": PHOTO,
+                        "parentGlobalId": well_guid(1),
+                        "contentType": "image/png",
+                        "name": "photo.png",
+                        "size": PHOTO_AGAIN.len(),
+                        "url": format!("{ROOT}/0/1/attachments/1")
+                    }],
+                    "deleteIds": [NEVER_LOADED]
                 }
             },
             { "id": 1, "features": { "adds": [], "updates": [], "deleteIds": [] } }
@@ -213,17 +279,33 @@ fn change_file() -> serde_json::Value {
     })
 }
 
-/// The first state, tracking changes and publishing its generations.
+/// The first state, tracking changes and publishing its generations. Well 1
+/// carries the one attachment, and its global id is what a later window's edit
+/// to it pairs on.
 fn full_fake() -> Fake {
     Fake::new()
         .json("", tracking_root(FIRST_GEN))
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_full)
         .answering("/1/query", logs_pages)
-        .json("/0/1/attachments", json!({ "attachmentInfos": [] }))
+        .json(
+            "/0/1/attachments",
+            json!({
+                "attachmentInfos": [{
+                    "id": 1,
+                    "globalId": PHOTO,
+                    "parentGlobalId": well_guid(1),
+                    "name": "photo.png",
+                    "contentType": "image/png",
+                    "size": PHOTO_BYTES.len()
+                }]
+            }),
+        )
+        .answering("/0/1/attachments/1", |_| PHOTO_BYTES.to_vec())
         .json("/0/2/attachments", json!({ "attachmentInfos": [] }))
         .json("/0/3/attachments", json!({ "attachmentInfos": [] }))
+        .json("/0/5/attachments", json!({ "attachmentInfos": [] }))
 }
 
 /// The second state, with the job routes wired: the POST answers a status URL,
@@ -235,9 +317,15 @@ fn changed_fake() -> Fake {
 
 /// The second state with a scripted job status.
 fn job_fake(status: serde_json::Value) -> Fake {
+    changed_fake_with(status, change_file())
+}
+
+/// The second state with a scripted job status and change file, and the blob
+/// routes the file's attachment records point at.
+fn changed_fake_with(status: serde_json::Value, file: serde_json::Value) -> Fake {
     Fake::new()
         .json("", tracking_root(NEXT_GEN))
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_changed)
         .answering("/1/query", logs_pages)
@@ -246,7 +334,17 @@ fn job_fake(status: serde_json::Value) -> Fake {
             json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
         )
         .json(STATUS_URL, status)
-        .json(RESULT_URL, change_file())
+        .json(RESULT_URL, file)
+        .answering("/0/1/attachments/1", |_| PHOTO_AGAIN.to_vec())
+        .answering("/0/5/attachments/7", |_| LOGS_BYTES.to_vec())
+}
+
+/// The same second state answering a change file a test built itself.
+fn changed_file_fake(file: serde_json::Value) -> Fake {
+    changed_fake_with(
+        json!({ "status": "Completed", "resultUrl": format!("{ROOT}{RESULT_URL}") }),
+        file,
+    )
 }
 
 fn extract_full(directory: &Path) -> Extraction {
@@ -297,6 +395,67 @@ fn recorded(directory: &Path) -> Vec<(String, i64, u64)> {
         .collect()
 }
 
+/// The one attachment the full extraction carried, by the feature id it landed
+/// on.
+fn attached(extraction: &Extraction) -> (String, String) {
+    let held = added(&extraction.sidecar.attachments[0]);
+    (held.feature_id.clone(), held.name.clone())
+}
+
+/// The attachment index a delta left behind, as `(global id, feature id, name)`.
+fn attachment_index(directory: &Path) -> Vec<(String, String, String)> {
+    let path = directory.join(ATTACHMENT_IDS_DIR).join("Wells.ndjson");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let held: serde_json::Value = serde_json::from_str(line).expect("an index line");
+            (
+                held["global_id"].as_str().expect("a global id").to_string(),
+                held["feature_id"]
+                    .as_str()
+                    .expect("a feature id")
+                    .to_string(),
+                held["name"].as_str().expect("a name").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The report rows for the point layer's attachments: the row the inventory
+/// judged first, and the counts of what was carried after it, which is written
+/// only where something was.
+fn attachment_entries(extraction: &Extraction) -> Vec<&verne_core::LogEntry> {
+    extraction
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == verne_core::ItemKind::EmbeddedResource && entry.location == "Wells"
+        })
+        .collect()
+}
+
+/// The row saying how many attachment edits were carried.
+fn attachment_counts(extraction: &Extraction) -> &verne_core::LogEntry {
+    let entries = attachment_entries(extraction);
+    entries
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| panic!("no counts row: {entries:#?}"))
+}
+
+/// The row the inventory judged, which says whether anything was carried at all.
+fn attachment_verdict(extraction: &Extraction) -> &verne_core::LogEntry {
+    let entries = attachment_entries(extraction);
+    entries
+        .first()
+        .copied()
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.log.entries))
+}
+
 /// The reason the report gives for the delta path that ran, off the one entry
 /// the service root's change-tracking conversion writes.
 fn path_entry(extraction: &Extraction) -> &verne_core::LogEntry {
@@ -330,13 +489,14 @@ fn a_service_that_publishes_no_generations_records_no_file() {
     let full = tempfile::tempdir().expect("tempdir");
     let fake = Fake::new()
         .json("", service_root())
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_full)
         .answering("/1/query", logs_pages)
         .json("/0/1/attachments", json!({ "attachmentInfos": [] }))
         .json("/0/2/attachments", json!({ "attachmentInfos": [] }))
-        .json("/0/3/attachments", json!({ "attachmentInfos": [] }));
+        .json("/0/3/attachments", json!({ "attachmentInfos": [] }))
+        .json("/0/5/attachments", json!({ "attachmentInfos": [] }));
     ArcgisSource::open_with(Box::new(fake), ROOT)
         .expect("the fixture opens")
         .extract(full.path(), OPERATOR)
@@ -461,21 +621,22 @@ fn a_delta_with_recorded_generations_rides_extract_changes() {
     assert_eq!(entry.detail, "delta read from extractChanges");
     assert_eq!(entry.action, Action::Carried);
 
-    // the attachments the change file counted are named, because a full
-    // extraction is what would pick them up
-    let attachments = extraction
-        .sidecar
-        .log
-        .entries
-        .iter()
-        .find(|entry| entry.kind == verne_core::ItemKind::EmbeddedResource)
-        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.log.entries));
-    let Action::Skipped { reason } = &attachments.action else {
+    // the report says what became of the attachment edits, counted, and names
+    // the one that paired with nothing
+    let attachments = attachment_counts(&extraction);
+    assert_eq!(
+        attachments.detail,
+        "1 attachment added, 1 replaced, 0 deleted"
+    );
+    let Action::CarriedWithLoss { losses } = &attachments.action else {
         panic!("{attachments:#?}");
     };
     assert!(
-        reason.contains("1 added, 0 updated and 1 deleted attachment"),
-        "{reason}"
+        losses
+            .iter()
+            .any(|loss| loss.contains(NEVER_LOADED)
+                && loss.contains("nothing was written to delete it")),
+        "{losses:#?}"
     );
 }
 
@@ -491,7 +652,7 @@ fn a_running_job_is_polled_until_it_answers_completed() {
     let polls = std::cell::Cell::new(0usize);
     let fake = Fake::new()
         .json("", tracking_root(NEXT_GEN))
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_changed)
         .answering("/1/query", logs_pages)
@@ -507,7 +668,9 @@ fn a_running_job_is_polled_until_it_answers_completed() {
             };
             serde_json::to_vec(&status).expect("the status serialises")
         })
-        .json(RESULT_URL, change_file());
+        .json(RESULT_URL, change_file())
+        .answering("/0/1/attachments/1", |_| PHOTO_AGAIN.to_vec())
+        .answering("/0/5/attachments/7", |_| LOGS_BYTES.to_vec());
     let calls = fake.calls();
     ArcgisSource::open_with(Box::new(fake), ROOT)
         .expect("the fixture opens")
@@ -558,7 +721,7 @@ fn a_refused_request_falls_back_to_the_local_diff() {
 
     let fake = Fake::new()
         .json("", tracking_root(NEXT_GEN))
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_changed)
         .answering("/1/query", logs_pages)
@@ -639,7 +802,7 @@ fn a_service_that_stopped_tracking_falls_back_to_the_local_diff() {
 
     let fake = Fake::new()
         .json("", service_root())
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_changed)
         .answering("/1/query", logs_pages);
@@ -668,22 +831,7 @@ fn a_deleted_id_the_previous_extraction_lacks_is_dropped() {
 
     let mut file = change_file();
     file["edits"][0]["features"]["deleteIds"] = json!([3, 99]);
-    let fake = Fake::new()
-        .json("", tracking_root(NEXT_GEN))
-        .json("/0", wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_changed)
-        .answering("/1/query", logs_pages)
-        .json(
-            "/extractChanges",
-            json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
-        )
-        .json(
-            STATUS_URL,
-            json!({ "status": "Completed", "resultUrl": format!("{ROOT}{RESULT_URL}") }),
-        )
-        .json(RESULT_URL, file);
-    let extraction = ArcgisSource::open_with(Box::new(fake), ROOT)
+    let extraction = ArcgisSource::open_with(Box::new(changed_file_fake(file)), ROOT)
         .expect("the fixture opens")
         .extract_since(delta.path(), OPERATOR, full.path())
         .expect("the delta extraction runs");
@@ -707,16 +855,263 @@ fn a_deleted_id_the_previous_extraction_lacks_is_dropped() {
     assert!(said, "{:#?}", extraction.sidecar.log.entries);
 }
 
+// ─── Attachment edits ───────────────────────────────────────────────
+
+/// The delta of the standard window, and the full extraction it came off.
+fn attachment_delta(full: &Path, delta: &Path) -> (Extraction, Extraction) {
+    let first = extract_full(full);
+    let second = ArcgisSource::open_with(Box::new(changed_fake()), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta, OPERATOR, full)
+        .expect("the delta extraction runs");
+    (first, second)
+}
+
+/// An attachment added to a feature that did not itself change. Its parent is
+/// named by global id and that feature is not among the rows the delta fetched,
+/// so the service is asked which object id the global id belongs to, and the
+/// answer is paired with the feature the earlier extraction loaded.
+#[test]
+fn an_attachment_added_to_an_unchanged_feature_is_carried() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let fake = changed_fake();
+    let calls = fake.calls();
+    extract_full(full.path());
+    let extraction = ArcgisSource::open_with(Box::new(fake), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta extraction runs");
+
+    // the parent was asked for by global id, through the service's own where
+    let asked: Vec<String> = calls
+        .borrow()
+        .iter()
+        .filter_map(|call| call.param("where"))
+        .filter(|clause| clause.starts_with("globalid IN"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(asked.len(), 1, "{asked:#?}");
+    assert!(asked[0].contains(&well_guid(5)), "{}", asked[0]);
+    assert!(
+        !asked[0].contains(&well_guid(1)),
+        "a feature the delta already fetched was asked for again: {}",
+        asked[0]
+    );
+
+    let add = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .find_map(|op| match op {
+            AttachmentOp::Add(held) => Some(held),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.attachments));
+    assert_eq!(add.name, "logs.pdf");
+    assert_eq!(add.content_type.as_deref(), Some("application/pdf"));
+    assert_eq!(add.global_id.as_deref(), Some(LOGS));
+    assert_eq!(add.dataset, "Wells");
+    // the feature the full extraction minted for well 5, which is the only
+    // place that id is written down
+    assert_eq!(add.feature_id, minted(full.path())[&5]);
+    assert_eq!(add.metadata["parent_global_id"], well_guid(5));
+    assert_eq!(add.metadata["object_id"], "5");
+    // the bytes came off the URL the change file named
+    let bytes = std::fs::read(delta.path().join(&add.file)).expect("the blob");
+    assert_eq!(bytes, LOGS_BYTES);
+}
+
+/// A replacement pairs with the loaded copy through the basis: the change file
+/// names the attachment by global id, and the full extraction wrote that id down
+/// beside the feature and the name it went up under.
+#[test]
+fn an_attachment_replacement_pairs_through_the_basis() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let (first, extraction) = attachment_delta(full.path(), delta.path());
+    let (feature, name) = attached(&first);
+
+    let update = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .find_map(|op| match op {
+            AttachmentOp::Update(held) => Some(held),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.attachments));
+    assert_eq!(update.global_id.as_deref(), Some(PHOTO));
+    assert_eq!(update.feature_id, feature);
+    // the name ptolemy holds it under, which is what will find the copy to
+    // delete before the new bytes go up
+    assert_eq!(update.name, name);
+    assert_eq!(
+        std::fs::read(delta.path().join(&update.file)).expect("the blob"),
+        PHOTO_AGAIN
+    );
+}
+
+/// A deleted attachment pairs the same way and carries no bytes.
+#[test]
+fn a_deleted_attachment_is_carried_as_a_delete() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let first = extract_full(full.path());
+    let (feature, name) = attached(&first);
+    let mut file = change_file();
+    file["edits"][0]["attachments"] = json!({
+        "adds": [],
+        "updates": [],
+        "deleteIds": [PHOTO]
+    });
+    let extraction = ArcgisSource::open_with(Box::new(changed_file_fake(file)), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta extraction runs");
+
+    let [AttachmentOp::Delete(delete)] = extraction.sidecar.attachments.as_slice() else {
+        panic!("{:#?}", extraction.sidecar.attachments);
+    };
+    assert_eq!(delete.global_id.as_deref(), Some(PHOTO));
+    assert_eq!(delete.feature_id, feature);
+    assert_eq!(delete.name, name);
+    assert_eq!(delete.dataset, "Wells");
+    assert_eq!(
+        attachment_counts(&extraction).detail,
+        "0 attachments added, 0 replaced, 1 deleted"
+    );
+    // and it is out of the index, so the next delta of the chain does not think
+    // ptolemy still holds it
+    assert!(
+        attachment_index(delta.path())
+            .iter()
+            .all(|(global_id, _, _)| global_id != PHOTO),
+        "{:#?}",
+        attachment_index(delta.path())
+    );
+}
+
+/// An edit to an attachment nothing was loaded under cannot be placed. It is
+/// counted and named, and the rest of the window still lands: a window is not
+/// worth throwing away over one blob whose history verne never saw.
+#[test]
+fn an_unpairable_delete_is_counted_rather_than_fatal() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let (_, extraction) = attachment_delta(full.path(), delta.path());
+
+    let named: Vec<&AttachmentOp> = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .filter(|op| op.global_id() == Some(NEVER_LOADED))
+        .collect();
+    assert!(named.is_empty(), "{named:#?}");
+    let Action::CarriedWithLoss { losses } = &attachment_counts(&extraction).action else {
+        panic!("{:#?}", attachment_counts(&extraction));
+    };
+    assert!(
+        losses
+            .iter()
+            .any(|loss| loss.contains(NEVER_LOADED) && loss.contains("nothing written down")),
+        "{losses:#?}"
+    );
+    // the window still landed: the two edits that could be placed are there
+    assert_eq!(extraction.sidecar.attachments.len(), 2);
+    assert_eq!(ops(delta.path(), "features/Wells.ndjson").len(), 3);
+}
+
+/// A layer with no global id column cannot have an attachment edit paired with
+/// anything: the change file names every one of them by global id. The edits are
+/// reported and skipped, and the features still come across.
+#[test]
+fn a_layer_without_a_global_id_field_skips_its_attachment_edits() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    // the layer as it is everywhere else in the tests: no globalIdField
+    let bare = |root: serde_json::Value| {
+        Fake::new()
+            .json("", root)
+            .json("/0", common::wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_full)
+            .answering("/1/query", logs_pages)
+            .json("/0/1/attachments", json!({ "attachmentInfos": [] }))
+            .json("/0/2/attachments", json!({ "attachmentInfos": [] }))
+            .json("/0/3/attachments", json!({ "attachmentInfos": [] }))
+            .json("/0/5/attachments", json!({ "attachmentInfos": [] }))
+    };
+    ArcgisSource::open_with(Box::new(bare(tracking_root(FIRST_GEN))), ROOT)
+        .expect("the fixture opens")
+        .extract(full.path(), OPERATOR)
+        .expect("the full extraction runs");
+
+    let changed = Fake::new()
+        .json("", tracking_root(NEXT_GEN))
+        .json("/0", common::wells_layer())
+        .json("/1", logs_table())
+        .answering("/0/query", wells_changed)
+        .answering("/1/query", logs_pages)
+        .json(
+            "/extractChanges",
+            json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
+        )
+        .json(
+            STATUS_URL,
+            json!({ "status": "Completed", "resultUrl": format!("{ROOT}{RESULT_URL}") }),
+        )
+        .json(RESULT_URL, change_file());
+    let extraction = ArcgisSource::open_with(Box::new(changed), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta extraction runs");
+
+    assert!(
+        extraction.sidecar.attachments.is_empty(),
+        "{:#?}",
+        extraction.sidecar.attachments
+    );
+    let Action::Skipped { reason } = &attachment_verdict(&extraction).action else {
+        panic!("{:#?}", attachment_verdict(&extraction));
+    };
+    assert!(
+        reason.contains("declares no global id field") && reason.contains("3 edits"),
+        "{reason}"
+    );
+    assert_eq!(ops(delta.path(), "features/Wells.ndjson").len(), 3);
+}
+
+/// A local diff says nothing about attachments, and the row says that rather
+/// than claiming the loaded ones are current.
+#[test]
+fn a_local_diff_says_its_attachments_were_not_carried() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    std::fs::remove_file(full.path().join(SERVER_GENS_FILE)).expect("the recorded generations");
+    let extraction = ArcgisSource::open_with(Box::new(changed_fake()), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta runs");
+
+    assert!(extraction.sidecar.attachments.is_empty());
+    let Action::Skipped { reason } = &attachment_verdict(&extraction).action else {
+        panic!("{:#?}", attachment_verdict(&extraction));
+    };
+    assert!(
+        reason.contains("says nothing about attachments"),
+        "{reason}"
+    );
+}
+
 // ─── Chained deltas ─────────────────────────────────────────────────
 
 /// The third state: 1 got deeper again, and 4, which the first delta inserted,
 /// is gone. Nothing else moved, and nothing else is asked for.
 fn later_row(oid: i64) -> serde_json::Value {
     match oid {
-        1 => json!({
-            "attributes": { "objectid": 1, "status": 1, "depth": 14.0, "drilled": DRILLED },
-            "geometry": { "x": 3.5, "y": 50.1 }
-        }),
+        1 => row(1, 14.0, Some(DRILLED), 3.5, 50.1),
         other => panic!(
             "the extraction asked for object id {other}, which the third state does not change"
         ),
@@ -725,7 +1120,10 @@ fn later_row(oid: i64) -> serde_json::Value {
 
 fn wells_later(params: &[(&str, String)]) -> Vec<u8> {
     if param(params, "returnCountOnly").is_some() {
-        return serde_json::to_vec(&json!({ "count": 2 })).expect("the count serialises");
+        return serde_json::to_vec(&json!({ "count": 4 })).expect("the count serialises");
+    }
+    if let Some(clause) = pairing(params) {
+        return by_global_id(&clause);
     }
     let oids = param(params, "objectIds").expect("the third state is only asked by object id");
     if param(params, "outFields") != Some("*") {
@@ -739,7 +1137,8 @@ fn wells_later(params: &[(&str, String)]) -> Vec<u8> {
         .expect("the page serialises")
 }
 
-/// The second window's change file: 1 edited again, and 4 deleted.
+/// The second window's change file: 1 edited again, 4 deleted, and the
+/// attachment the first delta added deleted with it.
 fn later_change_file() -> serde_json::Value {
     json!({
         "edits": [
@@ -748,11 +1147,12 @@ fn later_change_file() -> serde_json::Value {
                 "features": {
                     "adds": [],
                     "updates": [{
-                        "attributes": { "objectid": 1, "status": 1, "depth": 999.0, "drilled": DRILLED },
+                        "attributes": { "objectid": 1, "globalid": well_guid(1), "status": 1, "depth": 999.0, "drilled": DRILLED },
                         "geometry": { "x": 3.5, "y": 50.1 }
                     }],
                     "deleteIds": [4]
-                }
+                },
+                "attachments": { "adds": [], "updates": [], "deleteIds": [LOGS] }
             },
             { "id": 1, "features": { "adds": [], "updates": [], "deleteIds": [] } }
         ],
@@ -766,7 +1166,7 @@ fn later_change_file() -> serde_json::Value {
 fn later_fake() -> Fake {
     Fake::new()
         .json("", tracking_root(LATER_GEN))
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_later)
         .answering("/1/query", logs_pages)
@@ -892,6 +1292,54 @@ fn a_delete_of_a_row_an_earlier_delta_inserted_resolves() {
     assert!(held.contains(&ids[&1]), "{held}");
 }
 
+/// An attachment one delta created and the next one deleted pairs through the
+/// attachment index the first delta wrote, which is the only place the feature it
+/// went onto and the name it went up under are written down: the first delta's
+/// sidecar says so too, but the second is not read against a sidecar.
+#[test]
+fn a_chained_delta_pairs_an_attachment_the_previous_delta_created() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    let extraction = chain(full.path(), first.path(), second.path());
+    let wells = minted(full.path());
+
+    // the first delta wrote both attachments down: the one it added, and the one
+    // the full extraction loaded and it replaced
+    let held = attachment_index(first.path());
+    assert_eq!(
+        held,
+        vec![
+            (
+                PHOTO.to_string(),
+                wells[&1].clone(),
+                "photo.png".to_string()
+            ),
+            (LOGS.to_string(), wells[&5].clone(), "logs.pdf".to_string()),
+        ]
+    );
+
+    let [AttachmentOp::Delete(delete)] = extraction.sidecar.attachments.as_slice() else {
+        panic!("{:#?}", extraction.sidecar.attachments);
+    };
+    assert_eq!(delete.global_id.as_deref(), Some(LOGS));
+    assert_eq!(
+        delete.feature_id, wells[&5],
+        "the delete did not name the feature the first delta attached it to"
+    );
+    assert_eq!(delete.name, "logs.pdf");
+    // the chain carries on: what the window took out is gone from the index and
+    // the attachment neither window touched is still in it
+    assert_eq!(
+        attachment_index(second.path()),
+        vec![(
+            PHOTO.to_string(),
+            wells[&1].clone(),
+            "photo.png".to_string()
+        )]
+    );
+}
+
 /// A delta written before the index existed has no index, and pairing against
 /// its feature files would read every row it left alone as new. It is refused
 /// by name, and nothing is asked of the service first.
@@ -946,7 +1394,7 @@ fn a_delta_is_refused_where_the_local_diff_would_run() {
 
     let untracked = Fake::new()
         .json("", service_root())
-        .json("/0", wells_layer())
+        .json("/0", tracked_wells_layer())
         .json("/1", logs_table())
         .answering("/0/query", wells_later)
         .answering("/1/query", logs_pages);

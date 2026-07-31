@@ -27,8 +27,9 @@ jobs:
       # no GDAL on this runner, so the default features are the whole build
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
-      # the loader's integration test needs a live ptolemy and skips without
-      # VERNE_PTOLEMY_URL, which nothing here sets: CI does not cover the loader
+      # the loader's live test needs a ptolemy and skips without
+      # VERNE_PTOLEMY_URL, which nothing here sets, so what CI covers of the
+      # loader is what a scripted ptolemy on a socket can answer for
       - name: Test
         run: cargo test --all
 

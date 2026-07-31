@@ -271,9 +271,10 @@ fn an_unchanged_table_is_an_empty_delta_with_its_rows_counted() {
     assert!(counted, "{:#?}", extraction.sidecar.log.entries);
 }
 
-/// The relationship classes and attachments were created when the full
-/// extraction was loaded; a delta carries feature operations only, and the
-/// log says where the rest stands.
+/// The relationship classes were created when the full extraction was loaded,
+/// and a local diff learns nothing about attachments: it reads the features
+/// again, and the service says nothing about a blob on the way. The log says
+/// where both stand.
 #[test]
 fn a_delta_repeats_no_relationships_and_fetches_no_attachments() {
     let full = tempfile::tempdir().expect("tempdir");
@@ -297,7 +298,7 @@ fn a_delta_repeats_no_relationships_and_fetches_no_attachments() {
         .find(|entry| entry.kind == ItemKind::EmbeddedResource)
         .unwrap_or_else(|| panic!("no attachment entry: {entries:#?}"));
     assert!(
-        matches!(&attachments.action, Action::Skipped { reason } if reason.contains("feature operations only")),
+        matches!(&attachments.action, Action::Skipped { reason } if reason.contains("says nothing about attachments")),
         "{attachments:#?}"
     );
 }

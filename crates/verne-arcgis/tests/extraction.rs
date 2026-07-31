@@ -5,7 +5,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{Fake, ROOT, logs_table, service_root, wells_layer};
+use common::{Fake, ROOT, added, logs_table, service_root, wells_layer};
 use serde_json::json;
 use verne_arcgis::{ArcgisSource, Extraction};
 use verne_core::{Action, ItemKind, NewFeature};
@@ -418,7 +418,7 @@ fn an_attachment_is_listed_per_feature_and_written_beside_the_sidecar() {
     );
 
     assert_eq!(extraction.sidecar.attachments.len(), 1);
-    let attachment = &extraction.sidecar.attachments[0];
+    let attachment = added(&extraction.sidecar.attachments[0]);
     assert_eq!(attachment.dataset, "Wells");
     assert_eq!(attachment.name, "pic.png");
     assert_eq!(attachment.content_type.as_deref(), Some("image/png"));
@@ -461,7 +461,7 @@ fn a_layer_that_supports_it_is_listed_in_one_query_attachments_call() {
     // the stray group named object id 99, which no feature was written for, so
     // there is nothing to attach it to and it is not in the sidecar
     assert_eq!(extraction.sidecar.attachments.len(), 1);
-    let attachment = &extraction.sidecar.attachments[0];
+    let attachment = added(&extraction.sidecar.attachments[0]);
     assert_eq!(attachment.name, "pic.png");
     assert_eq!(
         std::fs::read(directory.path().join(&attachment.file)).expect("the blob"),

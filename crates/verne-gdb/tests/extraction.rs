@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use verne_core::sidecar::Action;
-use verne_core::{Item, ItemKind, Report, SIDECAR_FILE, Sidecar, Verdict};
+use verne_core::{AttachmentOp, Item, ItemKind, Report, SIDECAR_FILE, Sidecar, Verdict};
 use verne_gdb::{GdbSource, serialised};
 
 fn fixture(dir: &Path) -> PathBuf {
@@ -742,7 +742,10 @@ fn a_row_with_no_geometry_carries_an_empty_geometry_collection() {
 fn an_attachment_names_a_feature_the_extraction_wrote() {
     let extracted = extract();
     assert_eq!(extracted.sidecar.attachments.len(), 1);
-    let attachment = &extracted.sidecar.attachments[0];
+    // a geodatabase is extracted whole, so every attachment in one is an upload
+    let AttachmentOp::Add(attachment) = &extracted.sidecar.attachments[0] else {
+        panic!("{:#?}", extracted.sidecar.attachments);
+    };
 
     assert_eq!(attachment.dataset, "wells");
     assert_eq!(attachment.name, "photo.png");
@@ -769,11 +772,9 @@ fn an_attachment_names_a_feature_the_extraction_wrote() {
 fn an_orphan_attachment_table_is_skipped_with_the_reason() {
     let extracted = extract();
     assert!(
-        extracted
-            .sidecar
-            .attachments
-            .iter()
-            .all(|held| held.file.contains("wells__ATTACH")),
+        extracted.sidecar.attachments.iter().all(
+            |held| matches!(held, AttachmentOp::Add(held) if held.file.contains("wells__ATTACH"))
+        ),
         "{:?}",
         extracted.sidecar.attachments
     );

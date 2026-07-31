@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 use serde_json::json;
 use verne_arcgis::{ArcgisError, Fetch};
+use verne_core::{AttachmentOp, NewAttachment};
 
 /// The FeatureServer root every route hangs off.
 pub const ROOT: &str = "https://example.invalid/arcgis/rest/services/Fixture/FeatureServer";
@@ -219,6 +220,26 @@ pub fn wells_layer() -> serde_json::Value {
     })
 }
 
+/// The same layer as a service that tracks changes publishes it. A service
+/// cannot track changes without a global id column, and that column is what
+/// pairs an attachment edit with the attachment already loaded: a change file
+/// names the feature an attachment hangs off by global id and never by object
+/// id.
+pub fn tracked_wells_layer() -> serde_json::Value {
+    let mut layer = wells_layer();
+    layer["globalIdField"] = json!("globalid");
+    layer["fields"]
+        .as_array_mut()
+        .expect("the field list")
+        .push(json!({ "name": "globalid", "type": "esriFieldTypeGlobalID" }));
+    layer
+}
+
+/// One well's global id, in the braces a service writes them in.
+pub fn well_guid(oid: i64) -> String {
+    format!("{{6B5A2E31-0F4E-4F79-9E5C-3C1E9B7A00{oid:02}}}")
+}
+
 /// The table: no `geometryType`, and the destination end of the same
 /// relationship, whose key field is the foreign key on this side.
 pub fn logs_table() -> serde_json::Value {
@@ -248,4 +269,13 @@ pub fn logs_table() -> serde_json::Value {
             "composite": true
         }]
     })
+}
+
+/// The upload one attachment operation is, which is all a full extraction
+/// writes.
+pub fn added(op: &AttachmentOp) -> &NewAttachment {
+    match op {
+        AttachmentOp::Add(held) => held,
+        other => panic!("expected an upload: {other:#?}"),
+    }
 }

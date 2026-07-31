@@ -93,6 +93,11 @@ pub struct Layer {
     /// stated when no code names it.
     pub crs_wkt: Option<String>,
     pub object_id_field: Option<String>,
+    /// The column holding the service's own row id, a GUID in braces. What a
+    /// change file names a feature by when it is talking about the attachments
+    /// hanging off it, so a layer without one cannot have its attachment edits
+    /// paired with anything.
+    pub global_id_field: Option<String>,
     pub max_record_count: Option<u64>,
     pub supports_pagination: bool,
     pub supports_query_attachments: bool,
@@ -228,6 +233,8 @@ struct RawLayer {
     extent: Option<RawExtent>,
     #[serde(default)]
     object_id_field: Option<String>,
+    #[serde(default)]
+    global_id_field: Option<String>,
     #[serde(default)]
     max_record_count: Option<u64>,
     #[serde(default)]
@@ -444,6 +451,17 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
                 .find(|field| field.kind == "esriFieldTypeOID")
                 .map(|field| field.name.clone())
         });
+    // stated as a field on layers that leave globalIdField out, the same way
+    // an object id is
+    let global_id_field = raw
+        .global_id_field
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            raw.fields
+                .iter()
+                .find(|field| field.kind == "esriFieldTypeGlobalID")
+                .map(|field| field.name.clone())
+        });
     Ok(Layer {
         id: raw.id,
         kind: raw.kind.filter(|kind| !kind.is_empty()),
@@ -464,6 +482,7 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
             .and_then(|held| held.wkt)
             .filter(|wkt| !wkt.trim().is_empty()),
         object_id_field,
+        global_id_field,
         max_record_count: raw.max_record_count,
         supports_pagination: capabilities.supports_pagination,
         supports_query_attachments: capabilities.supports_query_attachments,

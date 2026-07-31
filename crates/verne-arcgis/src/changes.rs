@@ -11,10 +11,12 @@
 //! that is not the service, which is why the client follows that redirect by
 //! hand.
 //!
-//! Only the object ids in that file are used. The features themselves come
-//! down `/query` the way every other extraction reads them, so the date
-//! rewriting, the reference the geometry arrives in, the untransformed
-//! originals and the feature file's format all stay on one code path.
+//! Of the features in that file only the object ids are used. The features
+//! themselves come down `/query` the way every other extraction reads them, so
+//! the date rewriting, the reference the geometry arrives in, the untransformed
+//! originals and the feature file's format all stay on one code path. The
+//! attachment records are read whole: the bytes are behind the URL each one
+//! names, and no other route would list the same window again.
 //!
 //! `returnIdsOnly=true` is not asked for: on a live service it answers with
 //! empty edits for windows the async job returns thousands of rows for, so the
@@ -24,7 +26,8 @@
 //! row per dataset. Its own feature files hold only the rows it touched, so
 //! nothing else in them could tell the next delta which feature id an object id
 //! belongs to, and without that a row edited two windows running would come
-//! back as a second copy of itself.
+//! back as a second copy of itself. The attachments get a second index for the
+//! same reason, keyed by the global id a change file names them by.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,6 +47,12 @@ pub const SERVER_GENS_FILE: &str = "server-gens.json";
 
 /// Where a delta writes down what ptolemy holds, one file per dataset.
 pub const OBJECT_IDS_DIR: &str = "object-ids";
+
+/// The same for the attachments, one file per dataset. A change file names an
+/// attachment edit by the service's `globalId`, and ptolemy knows nothing about
+/// one: this is where a delta writes which feature holds each attachment and
+/// under what name, so the next delta of the chain can pair an edit to it.
+pub const ATTACHMENT_IDS_DIR: &str = "attachment-ids";
 
 /// How often a running job is asked whether it is done. A hundred thousand
 /// edits took about a minute on a live service, so nothing is gained by
@@ -166,26 +175,34 @@ pub fn write_index(
     dataset: &str,
     rows: &BTreeMap<String, (String, u64)>,
 ) -> Result<(), ArcgisError> {
-    let path = index_path(directory, dataset);
+    write_lines(
+        &index_path(directory, dataset),
+        rows.iter().map(|(oid, (feature_id, hash))| {
+            serde_json::to_string(&Indexed {
+                oid: oid.clone(),
+                feature_id: feature_id.clone(),
+                hash: *hash,
+            })
+            .expect("an index row holds only text and a number")
+        }),
+    )
+}
+
+/// An index file, a line at a time, with the directory made if it is not there.
+fn write_lines(path: &Path, lines: impl Iterator<Item = String>) -> Result<(), ArcgisError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ArcgisError::Write {
             path: parent.display().to_string(),
             source,
         })?;
     }
-    let file = std::fs::File::create(&path).map_err(|source| ArcgisError::Write {
+    let file = std::fs::File::create(path).map_err(|source| ArcgisError::Write {
         path: path.display().to_string(),
         source,
     })?;
     use std::io::Write;
     let mut out = std::io::BufWriter::new(file);
-    for (oid, (feature_id, hash)) in rows {
-        let line = serde_json::to_string(&Indexed {
-            oid: oid.clone(),
-            feature_id: feature_id.clone(),
-            hash: *hash,
-        })
-        .expect("an index row holds only text and a number");
+    for line in lines {
         writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
             path: path.display().to_string(),
             source,
@@ -195,6 +212,76 @@ pub fn write_index(
         path: path.display().to_string(),
         source,
     })
+}
+
+/// One attachment as the index holds it: the id the service knows it by, the
+/// feature ptolemy hangs it off, and the name it was uploaded under, which is
+/// what the loader matches to find it again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedAttachment {
+    pub global_id: String,
+    pub feature_id: String,
+    pub name: String,
+}
+
+pub fn attachment_index_path(directory: &Path, dataset: &str) -> PathBuf {
+    directory
+        .join(ATTACHMENT_IDS_DIR)
+        .join(format!("{}.ndjson", safe_file_name(dataset)))
+}
+
+/// One dataset's attachment index, empty where the delta wrote none. Missing is
+/// not an error the way a missing object id index is: a delta written before
+/// attachments were carried has none, and an attachment edit that cannot be
+/// paired is counted rather than fatal.
+pub fn read_attachment_index(
+    directory: &Path,
+    dataset: &str,
+) -> Result<Vec<IndexedAttachment>, ArcgisError> {
+    let path = attachment_index_path(directory, dataset);
+    let held = match std::fs::read_to_string(&path) {
+        Ok(held) => held,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(ArcgisError::Read {
+                path: path.display().to_string(),
+                source,
+            });
+        }
+    };
+    let mut rows = Vec::new();
+    for (number, line) in held.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(
+            serde_json::from_str(line).map_err(|error| ArcgisError::BadPrevious {
+                path: path.display().to_string(),
+                message: format!("line {}: {error}", number + 1),
+            })?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Write one dataset's attachment index, keyed by global id, holding the
+/// feature it is on and the name it is under.
+pub fn write_attachment_index(
+    directory: &Path,
+    dataset: &str,
+    rows: &BTreeMap<String, (String, String)>,
+) -> Result<(), ArcgisError> {
+    write_lines(
+        &attachment_index_path(directory, dataset),
+        rows.iter().map(|(global_id, (feature_id, name))| {
+            serde_json::to_string(&IndexedAttachment {
+                global_id: global_id.clone(),
+                feature_id: feature_id.clone(),
+                name: name.clone(),
+            })
+            .expect("an index row holds only text")
+        }),
+    )
 }
 
 /// Ask the service what changed since `gens`, and get back the URL of the job
@@ -297,7 +384,7 @@ struct RawEdits {
     #[serde(default)]
     features: Option<RawEditSet>,
     #[serde(default)]
-    attachments: Option<RawEditSet>,
+    attachments: Option<RawAttachmentEdits>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -311,6 +398,48 @@ struct RawEditSet {
     delete_ids: Vec<serde_json::Value>,
 }
 
+/// The attachment half, which unlike the feature half is read for what is in
+/// it: an attachment's bytes are behind the URL each record names, and there is
+/// no second route that would list the same window again.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAttachmentEdits {
+    #[serde(default)]
+    adds: Vec<AttachmentRecord>,
+    #[serde(default)]
+    updates: Vec<AttachmentRecord>,
+    /// Attachment global ids, not the numeric ids the same file's `add`
+    /// records carry as `attachmentId`.
+    #[serde(default)]
+    delete_ids: Vec<serde_json::Value>,
+}
+
+/// One added or updated attachment, as a live service writes it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRecord {
+    #[serde(default)]
+    pub attachment_id: Option<i64>,
+    /// The service's own id for the attachment, a GUID in braces. What pairs
+    /// this edit with the copy an earlier extraction loaded.
+    #[serde(default)]
+    pub global_id: Option<String>,
+    /// The feature it hangs off, by the value of the layer's globalIdField
+    /// rather than by object id.
+    #[serde(default)]
+    pub parent_global_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// Where the bytes are: absolute, on the service's own host, and carrying
+    /// no signature, so the token rides as it does on every other request.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 /// What the service says changed on one layer.
 #[derive(Debug, Default)]
 pub struct LayerChanges {
@@ -322,19 +451,14 @@ pub struct LayerChanges {
     pub attachments: AttachmentEdits,
 }
 
-/// How many attachment edits the service counted in the window. A delta does
-/// not carry attachments, so these are reported rather than acted on.
-#[derive(Debug, Default, Clone, Copy)]
+/// The attachment edits the service named in the window, which a delta carries:
+/// the bytes of an add or an update come off the URL its record names, and a
+/// delete names the global id of what is gone.
+#[derive(Debug, Default, Clone)]
 pub struct AttachmentEdits {
-    pub added: usize,
-    pub updated: usize,
-    pub deleted: usize,
-}
-
-impl AttachmentEdits {
-    pub fn any(&self) -> bool {
-        self.added + self.updated + self.deleted > 0
-    }
+    pub adds: Vec<AttachmentRecord>,
+    pub updates: Vec<AttachmentRecord>,
+    pub deleted: Vec<String>,
 }
 
 impl ChangeFile {
@@ -345,8 +469,9 @@ impl ChangeFile {
             return LayerChanges::default();
         };
         let nothing = RawEditSet::default();
+        let no_attachments = RawAttachmentEdits::default();
         let features = edits.features.as_ref().unwrap_or(&nothing);
-        let attachments = edits.attachments.as_ref().unwrap_or(&nothing);
+        let attachments = edits.attachments.as_ref().unwrap_or(&no_attachments);
         // a set, so an id in both sections is fetched once
         let mut touched: BTreeSet<String> = BTreeSet::new();
         for row in features.adds.iter().chain(features.updates.iter()) {
@@ -361,9 +486,9 @@ impl ChangeFile {
             touched: touched.into_iter().collect(),
             deleted: features.delete_ids.iter().map(text).collect(),
             attachments: AttachmentEdits {
-                added: attachments.adds.len(),
-                updated: attachments.updates.len(),
-                deleted: attachments.delete_ids.len(),
+                adds: attachments.adds.clone(),
+                updates: attachments.updates.clone(),
+                deleted: attachments.delete_ids.iter().map(text).collect(),
             },
         }
     }

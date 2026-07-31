@@ -323,6 +323,99 @@ pub struct NewAttachment {
     /// the `__ATTACH` table held is dropped without being written down.
     pub metadata: serde_json::Value,
     pub created_by: String,
+    /// The id the source knows this attachment by, where it has one of its
+    /// own: an ArcGIS service's `globalId`. Not sent to ptolemy, which mints
+    /// its own id. It is here so a later delta can pair a change to this
+    /// attachment with the copy already loaded, and absent means unpairable,
+    /// which is what a sidecar written before this field held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_id: Option<String>,
+}
+
+/// One attachment to remove. ptolemy keys an attachment by an id of its own
+/// and an extraction never sees one, so what pairs the two is the file name on
+/// the feature: the loader lists that feature's attachments and matches it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteAttachment {
+    pub dataset: String,
+    pub feature_id: String,
+    pub name: String,
+    /// The source's own id for what was deleted, so the sidecar says which
+    /// attachment this was about and a later delta can pair against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global_id: Option<String>,
+}
+
+/// What to do about one attachment. A full extraction writes adds and nothing
+/// else, and a delta writes what the change file said happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum AttachmentOp {
+    Add(NewAttachment),
+    /// New bytes for an attachment already loaded. ptolemy has no update
+    /// route for one, so the loader deletes the copy this names and uploads
+    /// these bytes in its place, which is why the payload is an add's.
+    Update(NewAttachment),
+    Delete(DeleteAttachment),
+}
+
+/// By hand for the reason [`FeatureOp`]'s is, plus one of its own: a sidecar
+/// written before an attachment could change carries no tag, and every
+/// attachment in one is an add.
+impl<'de> Deserialize<'de> for AttachmentOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("op").and_then(serde_json::Value::as_str) {
+            None | Some("add") => serde_json::from_value(value).map(AttachmentOp::Add),
+            Some("update") => serde_json::from_value(value).map(AttachmentOp::Update),
+            Some("delete") => serde_json::from_value(value).map(AttachmentOp::Delete),
+            Some(other) => {
+                return Err(D::Error::unknown_variant(
+                    other,
+                    &["add", "update", "delete"],
+                ));
+            }
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
+impl AttachmentOp {
+    /// The dataset whose branch the operation goes to.
+    pub fn dataset(&self) -> &str {
+        match self {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => &held.dataset,
+            AttachmentOp::Delete(held) => &held.dataset,
+        }
+    }
+
+    /// The feature it hangs off.
+    pub fn feature_id(&self) -> &str {
+        match self {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => &held.feature_id,
+            AttachmentOp::Delete(held) => &held.feature_id,
+        }
+    }
+
+    /// The file name, which is what the loader matches an existing attachment
+    /// on and what an upload is named.
+    pub fn name(&self) -> &str {
+        match self {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => &held.name,
+            AttachmentOp::Delete(held) => &held.name,
+        }
+    }
+
+    pub fn global_id(&self) -> Option<&str> {
+        match self {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => held.global_id.as_deref(),
+            AttachmentOp::Delete(held) => held.global_id.as_deref(),
+        }
+    }
 }
 
 /// One dataset and everything ptolemy hangs off it.
@@ -377,11 +470,14 @@ pub struct Sidecar {
     pub geopackage: Option<String>,
     pub datasets: Vec<DatasetPlan>,
     pub relationships: Vec<NewRelationship>,
-    /// Every attachment that could be attributed to a feature. One that could
-    /// not is not in here: it is a skipped entry in the log with the reason.
-    /// Defaulted on the wire for the same reason `DatasetPlan::features` is.
+    /// Every attachment that could be attributed to a feature, as the
+    /// operation to apply to it: a full extraction's are all adds, and a
+    /// delta's are what the source said changed. One that could not be
+    /// attributed is not in here: it is a skipped entry in the log with the
+    /// reason. Defaulted on the wire for the same reason
+    /// `DatasetPlan::features` is.
     #[serde(default)]
-    pub attachments: Vec<NewAttachment>,
+    pub attachments: Vec<AttachmentOp>,
     pub log: ExtractionLog,
 }
 

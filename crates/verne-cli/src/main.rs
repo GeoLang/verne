@@ -258,8 +258,17 @@ fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .sum::<usize>(),
             loaded.datasets.len()
         );
+        let ops = &loaded.attachment_ops;
+        println!(
+            "  attachments: {} added, {} replaced, {} deleted",
+            ops.added, ops.replaced, ops.deleted
+        );
     } else {
         println!("loaded into {ptolemy}: {}", loaded.sentence());
+    }
+    // an attachment operation whose loaded copy could not be told apart
+    for reason in &loaded.attachment_ops.unmatched {
+        println!("  attachment: {reason}");
     }
     for (name, id) in &loaded.datasets {
         println!("  dataset {name} {id}");

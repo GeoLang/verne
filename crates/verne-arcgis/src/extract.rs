@@ -14,18 +14,19 @@
 //! A delta reads the same route: what a change file changes is which rows are
 //! asked for, not how they are read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use verne_core::{
-    ATTACHMENTS_DIR, DatasetPlan, DeleteFeature, ExtractionLog, FEATURES_DIR, FeatureOp, Item,
-    ItemKind, MAX_FEATURE_BYTES, NewAttachment, NewDataset, NewDomain, NewFeature, NewField,
-    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source, UpdateFeature,
-    safe_file_name,
+    ATTACHMENTS_DIR, AttachmentOp, DatasetPlan, DeleteAttachment, DeleteFeature, ExtractionLog,
+    FEATURES_DIR, FeatureOp, Item, ItemKind, MAX_FEATURE_BYTES, NewAttachment, NewDataset,
+    NewDomain, NewFeature, NewField, NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar,
+    Source, UpdateFeature, safe_file_name,
 };
 
 use crate::changes::{
-    self, AttachmentEdits, ChangeFile, LayerChanges, LayerGen, RecordedGen, RecordedGens,
+    self, AttachmentEdits, AttachmentRecord, ChangeFile, LayerChanges, LayerGen, RecordedGen,
+    RecordedGens,
 };
 use crate::client::{Fetch, json, json_post};
 use crate::geometry::{EMPTY_GEOMETRY, EsriGeometry, Position};
@@ -259,7 +260,9 @@ impl ArcgisSource {
                         if layer.has_attachments {
                             placed.push((
                                 verdict::attachment_item(layer),
-                                left_of_delta(AttachmentEdits::default()),
+                                Placed::Left(
+                                    "no delta was computed for this layer, so its attachment changes were not carried either; the attachments the full extraction carried stand".into(),
+                                ),
                             ));
                         }
                         continue;
@@ -274,10 +277,14 @@ impl ArcgisSource {
                 },
                 _ => None,
             };
-            let attachment_edits = changed
-                .as_ref()
-                .map(|changes| changes.attachments)
-                .unwrap_or_default();
+            // the attachment edits ride with the extraction they were named by,
+            // because carrying them needs the previous extraction as well: an
+            // edit says which attachment changed, not where it was loaded
+            let attachment_edits: Option<(&Previous, AttachmentEdits)> = match (&previous, &changed)
+            {
+                (Some(held), Some(changes)) => Some((held, changes.attachments.clone())),
+                _ => None,
+            };
             let pass = match (basis, changed) {
                 (None, _) => Pass::Full,
                 (Some(basis), None) => Pass::Diff(basis),
@@ -286,8 +293,7 @@ impl ArcgisSource {
                     previous: basis,
                 },
             };
-            let incremental = !matches!(pass, Pass::Full);
-            let (file, minted) = write_layer(
+            let written = write_layer(
                 self.fetch.as_ref(),
                 &service.url,
                 layer,
@@ -296,6 +302,7 @@ impl ArcgisSource {
                 directory,
                 pass,
             )?;
+            let file = written.file;
             datasets[plan_index].features = file.path.clone();
             conversions.push(Conversion {
                 location: layer.name.clone(),
@@ -311,24 +318,42 @@ impl ArcgisSource {
                 losses: file.losses,
             });
             if layer.has_attachments {
-                if incremental {
-                    // not diffed: what the full extraction attached stands,
-                    // and pairing attachment changes would need a second
-                    // listing pass this path does not make
-                    placed.push((
+                match (&previous, &attachment_edits) {
+                    (None, _) => {
+                        let carried = self.attachments(
+                            layer,
+                            &dataset_name,
+                            &written.minted,
+                            directory,
+                            operator,
+                            &mut attachments,
+                        )?;
+                        place_attachments(layer, carried, &mut placed, &mut conversions);
+                    }
+                    // a local diff never asked what changed, so there is
+                    // nothing about the attachments to act on
+                    (Some(_), None) => placed.push((
                         verdict::attachment_item(layer),
-                        left_of_delta(attachment_edits),
-                    ));
-                } else {
-                    let carried = self.attachments(
-                        layer,
-                        &dataset_name,
-                        &minted,
-                        directory,
-                        operator,
-                        &mut attachments,
-                    )?;
-                    place_attachments(layer, carried, &mut placed, &mut conversions);
+                        Placed::Left(
+                            "the delta was found by reading the service again and diffing it, which says nothing about attachments, so changes to them were not carried; the attachments the full extraction carried stand".into(),
+                        ),
+                    )),
+                    (Some(_), Some((held, edits))) => {
+                        let carried = self.attachment_delta(
+                            &AttachmentBasis {
+                                layer,
+                                dataset: &dataset_name,
+                                features: &written.features,
+                                global_ids: &written.global_ids,
+                                previous: held,
+                                directory,
+                                operator,
+                            },
+                            edits,
+                            &mut attachments,
+                        )?;
+                        place_attachment_delta(layer, carried, &mut placed, &mut conversions);
+                    }
                 }
             }
         }
@@ -514,24 +539,6 @@ enum DeltaPath {
     /// The whole service is read again and paired with the previous
     /// extraction's feature files, for the reason held here.
     LocalDiff(String),
-}
-
-/// Where a delta leaves a layer's attachments, and what the service said it
-/// missed by leaving them.
-fn left_of_delta(edits: AttachmentEdits) -> Placed {
-    let mut reason =
-        "a delta carries feature operations only; the attachments the full extraction carried stand, and changes to them are not diffed"
-            .to_string();
-    if edits.any() {
-        reason.push_str(&format!(
-            "; the service counted {} added, {} updated and {} deleted attachment{} in this window, which a full extraction would pick up",
-            edits.added,
-            edits.updated,
-            edits.deleted,
-            plural(edits.added + edits.updated + edits.deleted)
-        ));
-    }
-    Placed::Left(reason)
 }
 
 /// Why a thing the inventory judged was not written out, for a row that could
@@ -903,6 +910,23 @@ enum Pass {
     },
 }
 
+/// What writing one layer's features came to, and what the attachments hanging
+/// off them need to know about it.
+struct WrittenLayer {
+    file: FeatureFile,
+    /// Object id to the feature id minted for it, for the attachments of a full
+    /// extraction. Only the rows that were inserted, which on a full pass is
+    /// all of them.
+    minted: BTreeMap<String, String>,
+    /// Object id to the feature id ptolemy holds the row under once this delta
+    /// is loaded, off the index a change pass writes. Empty on the other
+    /// passes, which have no index and no attachment changes to place.
+    features: BTreeMap<String, String>,
+    /// Global id to object id for every row this pass fetched, which is how the
+    /// parent of an added attachment is found without asking the service again.
+    global_ids: BTreeMap<String, String>,
+}
+
 /// What writing one layer's features came to.
 struct FeatureFile {
     path: Option<String>,
@@ -1131,7 +1155,7 @@ fn write_layer(
     gdb_version: Option<&str>,
     directory: &Path,
     pass: Pass,
-) -> Result<(FeatureFile, BTreeMap<String, String>), ArcgisError> {
+) -> Result<WrittenLayer, ArcgisError> {
     let relative = format!("{FEATURES_DIR}/{}.ndjson", safe_file_name(dataset));
     let path = directory.join(&relative);
     if let Some(parent) = path.parent() {
@@ -1164,6 +1188,7 @@ fn write_layer(
         .collect();
 
     let mut minted = BTreeMap::new();
+    let mut global_ids = BTreeMap::new();
     let mut tally = Tally::default();
     let mut losses = Vec::new();
     let (mut previous, changed) = match pass {
@@ -1296,6 +1321,14 @@ fn write_layer(
                 .as_ref()
                 .and_then(|name| feature.attributes.get(name))
                 .map(text);
+            // recorded before any of the paths that skip a row, because a row
+            // this delta left alone is still the parent an attachment edit can
+            // name
+            if let (Some(field), Some(oid)) = (&layer.global_id_field, &oid)
+                && let Some(value) = feature.attributes.get(field)
+            {
+                global_ids.insert(text(value), oid.clone());
+            }
             // the hash decides changed from unchanged and is also what the
             // index writes down, so it is taken once per row and only where a
             // delta is what is being written
@@ -1408,8 +1441,8 @@ fn write_layer(
     }
 
     losses.extend(feature_losses(layer, original.as_ref(), &tally));
-    Ok((
-        FeatureFile {
+    Ok(WrittenLayer {
+        file: FeatureFile {
             path: Some(relative),
             features: tally.written,
             losses,
@@ -1421,7 +1454,15 @@ fn write_layer(
             }),
         },
         minted,
-    ))
+        features: index
+            .map(|held| {
+                held.into_iter()
+                    .map(|(oid, (feature_id, _))| (oid, feature_id))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        global_ids,
+    })
 }
 
 /// The feature an operation is of, which is one field under three names.
@@ -1838,6 +1879,11 @@ fn position(
 #[serde(rename_all = "camelCase")]
 struct RawAttachmentInfo {
     id: i64,
+    /// The service's own id for it, which only a layer with global ids on has.
+    /// A later delta pairs a change to this attachment on it, so it is written
+    /// into the sidecar. Without one that attachment cannot be paired.
+    #[serde(default)]
+    global_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -1876,6 +1922,104 @@ struct AttachmentsCarried {
     orphans: Vec<String>,
 }
 
+/// Everything one layer's attachment changes are worked out from, beside the
+/// changes themselves.
+struct AttachmentBasis<'a> {
+    layer: &'a Layer,
+    dataset: &'a str,
+    /// Object id to the feature id ptolemy holds it under, off the index the
+    /// feature pass wrote.
+    features: &'a BTreeMap<String, String>,
+    /// Global id to object id for the rows the feature pass fetched.
+    global_ids: &'a BTreeMap<String, String>,
+    previous: &'a Previous,
+    directory: &'a Path,
+    operator: &'a str,
+}
+
+/// What a delta did with one layer's attachment edits.
+#[derive(Default)]
+struct AttachmentDelta {
+    added: usize,
+    replaced: usize,
+    deleted: usize,
+    /// The edits it did not carry, each with the reason. An edit that pairs
+    /// with nothing is one of these, not an error: the window is still worth
+    /// loading.
+    left: Vec<String>,
+}
+
+/// What ptolemy holds of one dataset's attachments, by global id: the feature
+/// each is on and the name it went up under.
+///
+/// A delta wrote its own index, because its sidecar names only the attachments
+/// it changed. A full extraction's sidecar names every one it carried, which is
+/// the same statement made another way, so there is no index beside it to read.
+fn basis_attachments(
+    previous: &Previous,
+    dataset: &str,
+) -> Result<BTreeMap<String, (String, String)>, ArcgisError> {
+    if previous.sidecar.incremental {
+        return Ok(
+            changes::read_attachment_index(&previous.directory, dataset)?
+                .into_iter()
+                .map(|held| (held.global_id, (held.feature_id, held.name)))
+                .collect(),
+        );
+    }
+    Ok(previous
+        .sidecar
+        .attachments
+        .iter()
+        .filter(|op| op.dataset() == dataset)
+        .filter_map(|op| {
+            Some((
+                op.global_id()?.to_string(),
+                (op.feature_id().to_string(), op.name().to_string()),
+            ))
+        })
+        .collect())
+}
+
+/// What to call an attachment the change file named: its file name, or the ids
+/// it can be named by when it has none.
+fn attachment_named(record: &AttachmentRecord) -> String {
+    record.name.clone().unwrap_or_else(|| {
+        record
+            .global_id
+            .clone()
+            .or_else(|| record.attachment_id.map(|id| id.to_string()))
+            .unwrap_or_else(|| "an unnamed attachment".to_string())
+    })
+}
+
+/// What the change file said about an attachment beside its bytes, kept because
+/// ptolemy's attachment has no field for any of it.
+fn attachment_metadata(
+    record: &AttachmentRecord,
+    layer: &Layer,
+    oid: Option<&String>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("source_layer".into(), layer.name.clone().into());
+    if let Some(id) = record.attachment_id {
+        metadata.insert("attachment_id".into(), id.into());
+    }
+    if let Some(global_id) = &record.global_id {
+        metadata.insert("global_id".into(), global_id.clone().into());
+    }
+    if let Some(parent) = &record.parent_global_id {
+        metadata.insert("parent_global_id".into(), parent.clone().into());
+    }
+    if let Some(oid) = oid {
+        metadata.insert("object_id".into(), oid.clone().into());
+    }
+    if let Some(size) = record.size {
+        metadata.insert("size".into(), size.into());
+    }
+    serde_json::Value::Object(metadata)
+}
+
 impl ArcgisSource {
     /// One layer's attachments: listed, downloaded, written as files and named
     /// in the sidecar. A blob that cannot be attributed to a feature the
@@ -1887,7 +2031,7 @@ impl ArcgisSource {
         minted: &BTreeMap<String, String>,
         directory: &Path,
         operator: &str,
-        out: &mut Vec<NewAttachment>,
+        out: &mut Vec<AttachmentOp>,
     ) -> Result<AttachmentsCarried, ArcgisError> {
         let mut carried = AttachmentsCarried {
             carried: 0,
@@ -1942,7 +2086,7 @@ impl ArcgisSource {
             if let Some(keywords) = &info.keywords {
                 metadata.insert("keywords".into(), keywords.clone().into());
             }
-            out.push(NewAttachment {
+            out.push(AttachmentOp::Add(NewAttachment {
                 dataset: dataset.to_string(),
                 feature_id: feature_id.clone(),
                 name,
@@ -1950,10 +2094,248 @@ impl ArcgisSource {
                 file: blob,
                 metadata: serde_json::Value::Object(metadata),
                 created_by: operator.to_string(),
-            });
+                global_id: info.global_id.clone(),
+            }));
             carried.carried += 1;
         }
         Ok(carried)
+    }
+
+    /// One layer's attachment changes, carried.
+    ///
+    /// An add or a replacement is bytes: they come off the URL the change file
+    /// named, through the same client every other request goes through. A
+    /// replacement or a delete is a pairing: what ptolemy holds is written down
+    /// by global id, and the basis is the previous extraction's own record of
+    /// it, so an edit finds the feature and the name it was loaded under. An
+    /// edit that pairs with nothing is counted and named rather than guessed
+    /// onto a feature, and rather than failing the extraction.
+    ///
+    /// The index this leaves behind is the basis with these operations applied,
+    /// which is what the next delta of a chain pairs against. It is written
+    /// even where nothing changed and even where nothing could be paired: what
+    /// ptolemy holds does not stop being true because this window was quiet.
+    fn attachment_delta(
+        &self,
+        held: &AttachmentBasis<'_>,
+        edits: &AttachmentEdits,
+        out: &mut Vec<AttachmentOp>,
+    ) -> Result<AttachmentDelta, ArcgisError> {
+        let (layer, dataset) = (held.layer, held.dataset);
+        let mut delta = AttachmentDelta::default();
+        // global id to the feature ptolemy holds it on and the name it went up
+        // under, which together are the only handle the loader has on it
+        let mut index = basis_attachments(held.previous, dataset)?;
+        let Some(global_id_field) = &layer.global_id_field else {
+            delta.left.push(format!(
+                "a change file names every attachment edit by global id and {} declares no global id field, so the {} edit{} it named could not be paired with anything and none were carried",
+                layer.name,
+                edits.adds.len() + edits.updates.len() + edits.deleted.len(),
+                plural(edits.adds.len() + edits.updates.len() + edits.deleted.len())
+            ));
+            changes::write_attachment_index(held.directory, dataset, &index)?;
+            return Ok(delta);
+        };
+
+        // the parent of an added attachment is a feature that need not have
+        // changed itself, so one this pass did not fetch is asked for by name
+        let mut parents = held.global_ids.clone();
+        let wanted: Vec<String> = edits
+            .adds
+            .iter()
+            .filter_map(|record| record.parent_global_id.clone())
+            .filter(|guid| !parents.contains_key(guid))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        if !wanted.is_empty() {
+            parents.extend(self.oids_by_global_id(layer, global_id_field, &wanted)?);
+        }
+
+        let relative_dir = format!("{ATTACHMENTS_DIR}/{}", safe_file_name(dataset));
+        let blob_dir = held.directory.join(&relative_dir);
+        let mut row = 0usize;
+        let mut blob = |bytes: &[u8], name: &str| -> Result<String, ArcgisError> {
+            std::fs::create_dir_all(&blob_dir).map_err(|source| ArcgisError::Write {
+                path: blob_dir.display().to_string(),
+                source,
+            })?;
+            let blob = format!("{relative_dir}/{row}-{}", safe_file_name(name));
+            row += 1;
+            std::fs::write(held.directory.join(&blob), bytes).map_err(|source| {
+                ArcgisError::Write {
+                    path: blob.clone(),
+                    source,
+                }
+            })?;
+            Ok(blob)
+        };
+
+        for record in &edits.adds {
+            let named = attachment_named(record);
+            let Some(parent) = &record.parent_global_id else {
+                delta.left.push(format!(
+                    "the service says {named} was added and names no feature it hangs off, so there is nothing to attach it to"
+                ));
+                continue;
+            };
+            let Some(feature_id) = parents.get(parent).and_then(|oid| held.features.get(oid))
+            else {
+                delta.left.push(format!(
+                    "the service says {named} was added to the feature {parent}, which is not a feature this extraction or an earlier one wrote, so there is nothing to attach it to"
+                ));
+                continue;
+            };
+            let bytes = match self.attachment_bytes(record) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    delta.left.push(format!("{named} was added and {reason}"));
+                    continue;
+                }
+            };
+            let file = blob(&bytes, &named)?;
+            out.push(AttachmentOp::Add(NewAttachment {
+                dataset: dataset.to_string(),
+                feature_id: feature_id.clone(),
+                name: named.clone(),
+                content_type: record.content_type.clone(),
+                file,
+                metadata: attachment_metadata(record, layer, parents.get(parent)),
+                created_by: held.operator.to_string(),
+                global_id: record.global_id.clone(),
+            }));
+            if let Some(global_id) = &record.global_id {
+                index.insert(global_id.clone(), (feature_id.clone(), named));
+            }
+            delta.added += 1;
+        }
+
+        for record in &edits.updates {
+            let named = attachment_named(record);
+            let Some(global_id) = &record.global_id else {
+                delta.left.push(format!(
+                    "the service says {named} was changed and names no global id for it, so which loaded attachment it is cannot be told"
+                ));
+                continue;
+            };
+            let Some((feature_id, loaded_as)) = index.get(global_id).cloned() else {
+                delta.left.push(format!(
+                    "the service says the attachment {global_id} was changed, and nothing written down says which feature it was loaded onto, so the new bytes were not carried"
+                ));
+                continue;
+            };
+            let bytes = match self.attachment_bytes(record) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
+                    delta.left.push(format!("{named} was changed and {reason}"));
+                    continue;
+                }
+            };
+            // the name it was loaded under is what finds the copy to replace,
+            // so a rename in the same edit is not carried
+            if record
+                .name
+                .as_deref()
+                .is_some_and(|fresh| fresh != loaded_as)
+            {
+                delta.left.push(format!(
+                    "the service now calls the attachment {global_id} {named} and ptolemy holds it as {loaded_as}, which is what pairs the two, so the new bytes went up under the old name"
+                ));
+            }
+            let file = blob(&bytes, &loaded_as)?;
+            out.push(AttachmentOp::Update(NewAttachment {
+                dataset: dataset.to_string(),
+                feature_id,
+                name: loaded_as,
+                content_type: record.content_type.clone(),
+                file,
+                metadata: attachment_metadata(record, layer, None),
+                created_by: held.operator.to_string(),
+                global_id: Some(global_id.clone()),
+            }));
+            delta.replaced += 1;
+        }
+
+        for global_id in &edits.deleted {
+            let Some((feature_id, loaded_as)) = index.remove(global_id) else {
+                delta.left.push(format!(
+                    "the service says the attachment {global_id} is gone, and nothing written down says which feature it was loaded onto, so nothing was written to delete it"
+                ));
+                continue;
+            };
+            out.push(AttachmentOp::Delete(DeleteAttachment {
+                dataset: dataset.to_string(),
+                feature_id,
+                name: loaded_as,
+                global_id: Some(global_id.clone()),
+            }));
+            delta.deleted += 1;
+        }
+
+        changes::write_attachment_index(held.directory, dataset, &index)?;
+        Ok(delta)
+    }
+
+    /// The object ids of the features these global ids name, asked of the
+    /// service through the `where` support every real Esri server has. Batched
+    /// by the same count an attachment listing is, because what bounds it is
+    /// the length of the clause.
+    fn oids_by_global_id(
+        &self,
+        layer: &Layer,
+        global_id_field: &str,
+        guids: &[String],
+    ) -> Result<BTreeMap<String, String>, ArcgisError> {
+        let Some(oid_field) = layer.object_id_field.as_deref() else {
+            return Ok(BTreeMap::new());
+        };
+        let route = format!("{}/{}/query", self.service.url, layer.id);
+        let mut out = BTreeMap::new();
+        for batch in guids.chunks(ATTACHMENT_BATCH) {
+            let listed = batch
+                .iter()
+                .map(|guid| format!("'{}'", guid.replace('\'', "''")))
+                .collect::<Vec<String>>()
+                .join(",");
+            let mut params = vec![
+                ("where", format!("{global_id_field} IN ({listed})")),
+                ("outFields", format!("{global_id_field},{oid_field}")),
+                ("returnGeometry", "false".to_string()),
+            ];
+            if let Some(version) = &self.service.gdb_version {
+                params.push(("gdbVersion", version.clone()));
+            }
+            let value = json_post(self.fetch.as_ref(), &route, &params)?;
+            let page: RawPage =
+                serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+                    route: route.clone(),
+                    message: error.to_string(),
+                })?;
+            for feature in &page.features {
+                let (Some(guid), Some(oid)) = (
+                    feature.attributes.get(global_id_field),
+                    feature.attributes.get(oid_field),
+                ) else {
+                    continue;
+                };
+                out.insert(text(guid), text(oid));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One changed attachment's bytes. The URL is absolute and on the service's
+    /// own host, so the token rides on it the way it rides on every other
+    /// request. The error is a reason for the report rather than a failure,
+    /// because one blob the service will not hand over is not the run.
+    fn attachment_bytes(&self, record: &AttachmentRecord) -> Result<Vec<u8>, String> {
+        let url = record
+            .url
+            .as_deref()
+            .ok_or("the change file names no URL to fetch it from")?;
+        self.fetch
+            .get(url, &[])
+            .map_err(|error| format!("the service would not hand it over ({error})"))
     }
 
     /// Every attachment of the features that were written, as `(object id,
@@ -2050,6 +2432,46 @@ fn place_attachments(
             }),
         ));
     }
+}
+
+/// The log's account of one layer's attachment changes. The counts are what was
+/// carried, and the reasons are what was named and not.
+fn place_attachment_delta(
+    layer: &Layer,
+    delta: AttachmentDelta,
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) {
+    let item = verdict::attachment_item(layer);
+    if delta.added + delta.replaced + delta.deleted == 0 {
+        placed.push((
+            item,
+            Placed::Left(if delta.left.is_empty() {
+                format!(
+                    "the service names no attachment edit on {} in this window, so the attachments already loaded stand",
+                    layer.name
+                )
+            } else {
+                delta.left.join("; ")
+            }),
+        ));
+        return;
+    }
+    let destination = format!("attachments of {}", layer.name);
+    placed.push((item, Placed::At(destination.clone())));
+    conversions.push(Conversion {
+        location: layer.name.clone(),
+        kind: ItemKind::EmbeddedResource,
+        detail: format!(
+            "{} attachment{} added, {} replaced, {} deleted",
+            delta.added,
+            plural(delta.added),
+            delta.replaced,
+            delta.deleted
+        ),
+        destination: Some(destination),
+        losses: delta.left,
+    });
 }
 
 fn plural(count: usize) -> &'static str {

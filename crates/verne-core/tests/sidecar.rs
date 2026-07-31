@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 
 use verne_core::sidecar::{Action, ExtractionLog, LogEntry};
 use verne_core::{
-    DatasetPlan, DeleteFeature, FeatureOp, Item, ItemKind, Losses, NewAttachment, NewDataset,
-    NewDomain, NewFeature, NewField, NewRelationship, NewSchema, NewSubtype, Sidecar,
-    SourceDescription, Target, UpdateFeature, Verdict,
+    AttachmentOp, DatasetPlan, DeleteAttachment, DeleteFeature, FeatureOp, Item, ItemKind, Losses,
+    NewAttachment, NewDataset, NewDomain, NewFeature, NewField, NewRelationship, NewSchema,
+    NewSubtype, Sidecar, SourceDescription, Target, UpdateFeature, Verdict,
 };
 
 fn faithful(location: &str) -> Item {
@@ -236,7 +236,7 @@ fn a_sidecar() -> Sidecar {
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
         }],
-        attachments: vec![NewAttachment {
+        attachments: vec![AttachmentOp::Add(NewAttachment {
             dataset: "wells".into(),
             feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
             name: "photo.png".into(),
@@ -244,7 +244,8 @@ fn a_sidecar() -> Sidecar {
             file: "attachments/wells__ATTACH/0-photo.png".into(),
             metadata: serde_json::json!({ "REL_OBJECTID": "1" }),
             created_by: "operator@example.test".into(),
-        }],
+            global_id: None,
+        })],
         log,
     }
 }
@@ -458,6 +459,67 @@ fn a_delete_serialises_as_ptolemys_delete_operation() {
         serde_json::from_str(&serde_json::to_string(&delete).expect("serialises")).expect("json");
     assert_eq!(json["type"], "delete");
     assert_eq!(json["feature_id"], "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
+}
+
+/// An attachment operation reads back as what its tag says, the same way a
+/// feature line does.
+#[test]
+fn an_attachment_op_reads_back_by_its_tag() {
+    let blob = NewAttachment {
+        dataset: "wells".into(),
+        feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+        name: "photo.png".into(),
+        content_type: Some("image/png".into()),
+        file: "attachments/Wells/0-photo.png".into(),
+        metadata: serde_json::json!({}),
+        created_by: "operator".into(),
+        global_id: Some("{6B5A2E31-0F4E-4F79-9E5C-3C1E9B7A0011}".into()),
+    };
+    let ops = [
+        AttachmentOp::Add(blob.clone()),
+        AttachmentOp::Update(blob),
+        AttachmentOp::Delete(DeleteAttachment {
+            dataset: "wells".into(),
+            feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+            name: "photo.png".into(),
+            global_id: Some("{6B5A2E31-0F4E-4F79-9E5C-3C1E9B7A0011}".into()),
+        }),
+    ];
+    for op in &ops {
+        let line = serde_json::to_string(op).expect("serialises");
+        let read: AttachmentOp = serde_json::from_str(&line).expect("an operation reads back");
+        assert_eq!(&read, op, "{line}");
+    }
+    // the accessors are how the loader finds the branch and the copy to match,
+    // and they have to answer for all three
+    for op in &ops {
+        assert_eq!(op.dataset(), "wells");
+        assert_eq!(op.name(), "photo.png");
+        assert_eq!(op.feature_id(), "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
+        assert!(op.global_id().is_some());
+    }
+}
+
+/// A sidecar written before an attachment could change carries no operation tag
+/// and no global id, and every attachment in one is an upload. It has to load as
+/// it did, because the extraction that wrote it is on disk somewhere and a
+/// pairing verne cannot do is not a reason to refuse the blob.
+#[test]
+fn an_old_shape_sidecar_reads_its_attachments_as_uploads() {
+    let mut json = serde_json::to_value(a_sidecar()).expect("serialises");
+    let attachment = json["attachments"][0].as_object_mut().expect("an object");
+    attachment.remove("op");
+    attachment.remove("global_id");
+    assert!(!attachment.contains_key("op"), "{attachment:#?}");
+
+    let read = Sidecar::from_json(&json.to_string()).expect("an old sidecar still loads");
+    let [AttachmentOp::Add(held)] = read.attachments.as_slice() else {
+        panic!("{:#?}", read.attachments);
+    };
+    assert_eq!(held.name, "photo.png");
+    assert_eq!(held.file, "attachments/wells__ATTACH/0-photo.png");
+    // absent means unpairable, which is the truth about it
+    assert_eq!(held.global_id, None);
 }
 
 /// A feature file line reads back as the operation its tag says, so a delete

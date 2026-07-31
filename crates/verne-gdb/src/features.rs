@@ -680,6 +680,9 @@ impl Blobs<'_> {
                 file: blob,
                 metadata: row_metadata(&feature, table, &link.attach_table),
                 created_by: operator.to_string(),
+                // a geodatabase is always extracted whole, so nothing pairs a
+                // later change to this blob with the copy that was loaded
+                global_id: None,
             });
             file.carried += 1;
         }

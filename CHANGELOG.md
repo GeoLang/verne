@@ -53,11 +53,11 @@ All notable changes to this project will be documented in this file.
   full extraction and writes only the insert, update and delete operations of
   ptolemy's commit route, paired by object id with a hash deciding changed
   from unchanged; `verne load` commits the delta onto the datasets the first
-  load created and creates nothing. Attachments and relationship classes are
-  not diffed, and a layer without an object id field gets no delta, both said
-  in the log. serde_json's `float_roundtrip` is on throughout: its best-effort
-  parsing does not round-trip its own shortest output, which made
-  server-computed floats hash as changed on every delta.
+  load created and creates nothing. Relationship classes are not diffed, nor
+  are attachments on this path, and a layer without an object id field gets no
+  delta, all said in the log. serde_json's `float_roundtrip` is on throughout:
+  its best-effort parsing does not round-trip its own shortest output, which
+  made server-computed floats hash as changed on every delta.
 - A delta asks the service what changed where the service can say. A full
   extraction of a service that tracks changes and publishes
   `changeTrackingInfo.layerServerGens` records those generations in
@@ -72,8 +72,28 @@ All notable changes to this project will be documented in this file.
   - The local diff still runs where the server cannot answer, all or nothing
     per run: no generations recorded, change tracking gone, a queryable layer
     with no generation or no object id field, or a refused request. The report
-    row gives the reason, and a change file's attachment counts are reported
-    with the row saying attachments are not diffed.
+    row gives the reason, and its attachment row says they were not carried,
+    because reading the features again says nothing about a blob.
+  - A delta on the `extractChanges` path carries the attachment edits too. An
+    add or a replacement is fetched off the URL the change file's record names,
+    on the service's own host and through the same authed client; a replacement
+    or a delete pairs by the service's `globalId` against what the previous
+    extraction wrote down, which is why every extraction now records an
+    attachment's `globalId` beside it in the sidecar (optional, and absent means
+    unpairable, so an old sidecar loads unchanged). An add's parent is named by
+    global id, and one that did not itself change is resolved with the service's
+    own `where <globalIdField> IN (...)`. A delta's own attachment index lands in
+    `attachment-ids/` for the next delta of the chain to pair against. An edit
+    that pairs with nothing, and every attachment edit on a layer with no global
+    id column, is counted and named in the report rather than guessed at or
+    fatal. The report row that used to say attachments are not diffed now says
+    what was carried, with counts.
+  - `verne load` applies them: an add is an upload, and a replacement is the
+    loaded copy deleted and the new bytes uploaded in that order, since ptolemy
+    has no route that changes an attachment. The loaded copy is found by name on
+    the feature, because ptolemy minted its id and no extraction ever saw one, so
+    two attachments of one name on one feature refuses that operation with a
+    reason instead of picking one.
   - The token does not follow the result URL's redirect: it points at a signed
     file on storage, and reqwest only drops `Authorization` across a host
     boundary while the token rides in `X-Esri-Authorization`, so the redirect
@@ -87,8 +107,10 @@ All notable changes to this project will be documented in this file.
     with its own operations applied. Its feature files cannot serve: they hold
     only the rows it touched, so a row edited in two windows running would
     find no feature id and land as a second copy of itself. A delta with no
-    index, and a delta whose next run would fall back to the local diff, are
-    refused by name rather than mispaired.
+    object id index, and a delta whose next run would fall back to the local
+    diff, are refused by name rather than mispaired. A missing attachment index
+    is not refused: an attachment edit that pairs with nothing is a count and a
+    reason.
   - The change hash is FNV-1a rather than the standard library's hasher, whose
     value is documented as not to be relied on across releases: a chained
     delta compares against a hash an earlier run wrote down.

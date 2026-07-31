@@ -27,8 +27,9 @@ follow a NetworkLink or fetch an overlay image, so anything behind a URL in a
 file is reported as outside the inventory rather than inspected, and it never
 opens a raster. An inventory does not open an attachment blob either; an
 extraction does, because carrying one means writing the bytes out. A feature
-service is read over HTTP by nature, with GETs and nothing else, and its token
-comes from `VERNE_ARCGIS_TOKEN`, never an argument; a public service needs
+service is read over HTTP by nature, with reads and nothing else, some of them
+POSTed because a list of ids or a filter clause does not fit in a URL, and its
+token comes from `VERNE_ARCGIS_TOKEN`, never an argument; a public service needs
 none. `verne load` is still the only command that writes anywhere, and it
 writes to ptolemy.
 
@@ -221,16 +222,35 @@ generations in `server-gens.json` beside the sidecar, and a later `--since`
 sends them back to `extractChanges`: the job it starts answers with the object
 ids edited since, and only those rows are fetched. The delta records the
 generations the window ended at, so the next one carries on from there. There
-is no flag for this, and no change to the sidecar `verne load` reads.
+is no flag for this: `--since` picks the path, and either way what lands is a
+sidecar `verne load` reads.
+
+The attachment edits a change file names are carried too. An add or a
+replacement is bytes, fetched off the URL the record names, which is on the
+service's own host and carries no signature, so the token rides on it as it does
+everywhere else. A replacement or a delete is a pairing: the change file names an
+attachment by the service's `globalId`, and the extraction that loaded it wrote
+that id down beside the feature it went onto and the name it went up under, which
+is the only handle ptolemy leaves on it. An add names its feature by global id
+too, and a parent that did not itself change is not among the rows the delta
+fetched, so it is asked for with the service's own `where <globalIdField> IN
+(...)`. On the load an add is an upload, and a replacement is the loaded copy
+deleted and the new bytes uploaded in that order, because ptolemy has no route
+that changes an attachment. Two attachments of one name on one feature is a
+pairing the loader will not pick between, and it refuses that operation and says
+so. So does an edit to an attachment nothing was ever loaded under, and a layer
+with no global id column has all of its attachment edits skipped: each is a count
+and a reason in the report rather than a guess or a failed run.
 
 A delta on that path is a basis for the next one, so a migration window is a
-chain of cheap deltas rather than one. Two things have to carry over, and both
-are written into the delta's own directory: the generations, and an object id
-index in `object-ids/`, one line per row saying which feature id ptolemy holds
-it under and a hash of what was last written for it. The index is what the
-feature files cannot be, because they hold only the rows that delta touched,
-and without it a row edited in two windows running would come back as a second
-copy of itself. Each delta writes the index it was given with its own
+chain of cheap deltas rather than one. Three things have to carry over, and all
+of them are written into the delta's own directory: the generations, an object
+id index in `object-ids/`, one line per row saying which feature id ptolemy
+holds it under and a hash of what was last written for it, and an attachment
+index in `attachment-ids/` doing the same by global id. The indexes are what the
+feature files cannot be, because they hold only the rows that delta touched, and
+without them a row edited in two windows running would come back as a second
+copy of itself. Each delta writes the indexes it was given with its own
 operations applied.
 
 Otherwise the diff is verne's own: the full current state is fetched again and
@@ -243,14 +263,15 @@ stopped tracking changes, a queryable layer has no generation or no object id
 field, or the service refuses the request: one run is all one way, never half
 of each.
 
-What a delta does not carry is named in the log: attachments and relationship
-classes are not diffed, though a change file's attachment counts are reported
-so an operator knows a full re-extract would pick them up; a layer without an
-object id field cannot be paired at all; and a layer that vanished from the
-service keeps its features in ptolemy rather than having a diff delete a whole
-dataset. A delta is not a basis for a local diff, and not a basis at all
-without its index: both would read every row it left alone as vanished or as
-new, and it is refused by name rather than mispaired.
+What a delta does not carry is named in the log: relationship classes are not
+diffed, and neither are attachments on the local diff, which reads the features
+again and learns nothing about a blob on the way; a layer without an object id
+field cannot be paired at all; and a layer that vanished from the service keeps
+its features in ptolemy rather than having a diff delete a whole dataset. A delta
+is not a basis for a local diff, and not a basis at all without its object id
+index: both would read every row it left alone as vanished or as new, and it is
+refused by name rather than mispaired. A missing attachment index is not refused,
+because an attachment edit that pairs with nothing is a count and a reason.
 
 `demo/migration-loop.sh` runs the whole story against a live service and a
 scratch ptolemy: full extract, load, delta, delta load, then verifies
@@ -282,9 +303,10 @@ From a feature service the GeoPackage is absent and everything else is the
 same, so `verne load` reads both extractions without knowing which it was
 handed. A feature service that publishes a generation window leaves a fifth
 file, `server-gens.json`, which is the cursor the next `--since` sends back to
-`extractChanges`, and a delta that rode that path leaves `object-ids/` beside
-it, one file per dataset saying which feature id ptolemy holds each object id
-under. Nothing but a later delta reads either.
+`extractChanges`, and a delta that rode that path leaves `object-ids/` and
+`attachment-ids/` beside it, one file per dataset saying which feature id
+ptolemy holds each object id under and which feature and name it holds each
+attachment under. Nothing but a later delta reads any of them.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the
@@ -326,6 +348,14 @@ instead, but nothing in the geodatabase says which class they belong to, and an
 attachment on the wrong feature is a worse answer than one that did not arrive.
 An `__ATTACH` row whose key matches no feature the extraction wrote is skipped
 the same way. Both are counted in the log with the reason.
+
+Where the source has an id of its own for an attachment, a feature service's
+`globalId`, the sidecar records it beside the blob. ptolemy mints its own id and
+never tells the extraction, so that recorded id is the only thing a later delta
+can pair a change to the same attachment on; a sidecar with none, which is every
+geodatabase extraction and every service that keeps no global ids, says so by
+leaving the field out, and an edit to one of those attachments is reported as
+unpairable rather than guessed at.
 
 ptolemy reads an upload with axum's JSON extractor at its 2 MB default, so a
 blob much over 1.5 MB comes back 413 and the load stops there naming the route.

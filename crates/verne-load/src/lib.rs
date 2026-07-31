@@ -31,8 +31,8 @@ use std::path::Path;
 
 use serde::Serialize;
 use verne_core::sidecar::{
-    DatasetPlan, FeatureOp, MAX_FEATURE_BYTES, NewAttachment, NewRelationship, NewSchema,
-    NewSubtype, Sidecar,
+    AttachmentOp, DatasetPlan, FeatureOp, MAX_FEATURE_BYTES, NewAttachment, NewRelationship,
+    NewSchema, NewSubtype, Sidecar,
 };
 
 /// Prefix every ptolemy route shares.
@@ -124,6 +124,23 @@ pub struct Loaded {
     pub features: BTreeMap<String, Committed>,
     /// Attachment name to its id, one per blob that reached its feature.
     pub attachments: BTreeMap<String, String>,
+    /// What the attachment operations came to, which is only interesting on a
+    /// delta: a full load's are all uploads and are in `attachments`.
+    pub attachment_ops: AttachmentOps,
+}
+
+/// What a sidecar's attachment operations came to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachmentOps {
+    pub added: usize,
+    pub replaced: usize,
+    pub deleted: usize,
+    /// The operations whose loaded copy the loader could not put a finger on,
+    /// each with the reason and what it did instead. One name matching two
+    /// attachments on a feature is refused rather than applied to whichever came
+    /// first, and one matching none has nothing to delete. The caller prints
+    /// these.
+    pub unmatched: Vec<String>,
 }
 
 /// What one dataset's features cost to load.
@@ -245,19 +262,21 @@ impl Loader {
             let id = self.create_relationship(class, &loaded)?;
             loaded.relationships.insert(class.name.clone(), id);
         }
-        for attachment in &sidecar.attachments {
-            let id = self.upload_attachment(attachment, &loaded, directory)?;
-            loaded.attachments.insert(attachment.name.clone(), id);
-        }
+        self.apply_attachments(sidecar, directory, &mut loaded)?;
         Ok(loaded)
     }
 
     /// Commit a delta onto what a full load created. Nothing is created here:
-    /// the datasets, schemas, domains, subtypes, relationship classes and
-    /// attachments were made by the first load, and making them again would
-    /// either collide or fork a second copy of the data. Each dataset is
-    /// found by the name the sidecar gives it and the ops go onto its "main"
-    /// branch, which is the one [`Self::load`] created.
+    /// the datasets, schemas, domains, subtypes and relationship classes were
+    /// made by the first load, and making them again would either collide or
+    /// fork a second copy of the data. Each dataset is found by the name the
+    /// sidecar gives it and the ops go onto its "main" branch, which is the one
+    /// [`Self::load`] created.
+    ///
+    /// The attachments are the exception: a delta carries the ones the source
+    /// says were added, replaced or deleted, and those are applied after the
+    /// features, because an attachment added in the same window as the feature
+    /// it hangs off has nowhere to go until that feature is committed.
     fn load_incremental(&self, sidecar: &Sidecar, directory: &Path) -> Result<Loaded, LoadError> {
         let mut loaded = Loaded::default();
         let held = self.get(&format!("{API}/datasets"))?;
@@ -281,7 +300,115 @@ impl Loader {
                 loaded.features.insert(plan.dataset.name.clone(), committed);
             }
         }
+        self.apply_attachments(sidecar, directory, &mut loaded)?;
         Ok(loaded)
+    }
+
+    /// The sidecar's attachment operations, in the order it holds them.
+    ///
+    /// An add is an upload. ptolemy has no route that changes an attachment, so
+    /// a replacement is the old one deleted and the new bytes uploaded, in that
+    /// order: the other order would leave two attachments of the same name on
+    /// the feature and no way to tell which the next delta means. Both the
+    /// replacement and the delete have to find the loaded copy first, and the
+    /// only handle either has on it is its name, because ptolemy minted the id
+    /// and no extraction ever saw it. Two attachments of one name on one
+    /// feature is a match the loader will not pick between, so that operation
+    /// is refused and named.
+    fn apply_attachments(
+        &self,
+        sidecar: &Sidecar,
+        directory: &Path,
+        loaded: &mut Loaded,
+    ) -> Result<(), LoadError> {
+        for op in &sidecar.attachments {
+            match op {
+                AttachmentOp::Add(attachment) => {
+                    let branch = self.attachment_branch(loaded, op)?;
+                    let id = self.upload_attachment(attachment, &branch, directory)?;
+                    loaded.attachments.insert(attachment.name.clone(), id);
+                    loaded.attachment_ops.added += 1;
+                }
+                AttachmentOp::Update(attachment) => {
+                    let branch = self.attachment_branch(loaded, op)?;
+                    match self.held_attachment(&branch, &attachment.feature_id, &attachment.name)? {
+                        Held::One(id) => self.delete(&format!("{API}/attachments/{id}"))?,
+                        // the bytes still go up: the source says this
+                        // attachment is on the feature, and it is
+                        Held::None => loaded.attachment_ops.unmatched.push(format!(
+                            "no attachment named {} on the feature {}, so the new bytes went up as a first copy rather than replacing one",
+                            attachment.name, attachment.feature_id
+                        )),
+                        Held::Many(count) => {
+                            loaded.attachment_ops.unmatched.push(refuse(
+                                "replaced",
+                                &attachment.name,
+                                &attachment.feature_id,
+                                count,
+                            ));
+                            continue;
+                        }
+                    }
+                    let id = self.upload_attachment(attachment, &branch, directory)?;
+                    loaded.attachments.insert(attachment.name.clone(), id);
+                    loaded.attachment_ops.replaced += 1;
+                }
+                AttachmentOp::Delete(delete) => {
+                    let branch = self.attachment_branch(loaded, op)?;
+                    match self.held_attachment(&branch, &delete.feature_id, &delete.name)? {
+                        Held::One(id) => {
+                            self.delete(&format!("{API}/attachments/{id}"))?;
+                            loaded.attachment_ops.deleted += 1;
+                        }
+                        Held::None => loaded.attachment_ops.unmatched.push(format!(
+                            "no attachment named {} on the feature {}, so there was nothing to delete",
+                            delete.name, delete.feature_id
+                        )),
+                        Held::Many(count) => loaded.attachment_ops.unmatched.push(refuse(
+                            "deleted",
+                            &delete.name,
+                            &delete.feature_id,
+                            count,
+                        )),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The branch the operation's dataset was loaded onto.
+    fn attachment_branch(&self, loaded: &Loaded, op: &AttachmentOp) -> Result<String, LoadError> {
+        loaded.branches.get(op.dataset()).cloned().ok_or_else(|| {
+            LoadError::UnknownAttachmentDataset {
+                name: op.name().to_string(),
+                dataset: op.dataset().to_string(),
+            }
+        })
+    }
+
+    /// Which attachment of `feature` is the one called `name`, out of what
+    /// ptolemy lists on it.
+    fn held_attachment(&self, branch: &str, feature: &str, name: &str) -> Result<Held, LoadError> {
+        let route = format!("{API}/branches/{branch}/features/{feature}/attachments");
+        let listed = self.get(&route)?;
+        let matching: Vec<String> = listed
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|held| held.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .filter_map(|held| {
+                held.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        Ok(match matching.len() {
+            0 => Held::None,
+            1 => Held::One(matching[0].clone()),
+            count => Held::Many(count),
+        })
     }
 
     fn create_dataset(&self, plan: &DatasetPlan) -> Result<String, LoadError> {
@@ -403,15 +530,9 @@ impl Loader {
     fn upload_attachment(
         &self,
         attachment: &NewAttachment,
-        loaded: &Loaded,
+        branch: &str,
         directory: &Path,
     ) -> Result<String, LoadError> {
-        let branch = loaded.branches.get(&attachment.dataset).ok_or_else(|| {
-            LoadError::UnknownAttachmentDataset {
-                name: attachment.name.clone(),
-                dataset: attachment.dataset.clone(),
-            }
-        })?;
         let path = directory.join(&attachment.file);
         let bytes = std::fs::read(&path).map_err(|source| LoadError::Read {
             path: path.display().to_string(),
@@ -511,6 +632,24 @@ impl Loader {
         id_of(&route, &body)
     }
 
+    /// A DELETE, which only an attachment operation makes: ptolemy has no route
+    /// that changes an attachment, so replacing one is deleting it and
+    /// uploading the new bytes.
+    fn delete(&self, route: &str) -> Result<(), LoadError> {
+        let url = format!("{}{route}", self.base);
+        let response = self.client.delete(url).bearer_auth(&self.token).send()?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(LoadError::Refused {
+            method: "DELETE",
+            route: route.to_string(),
+            status: status.as_u16(),
+            body: response.text()?,
+        })
+    }
+
     fn post<T: Serialize>(&self, route: &str, body: &T) -> Result<serde_json::Value, LoadError> {
         let text = self.send(Method::Post, route, body)?;
         serde_json::from_str(&text).map_err(|_| LoadError::NoId {
@@ -570,6 +709,21 @@ impl Loader {
             body: text,
         })
     }
+}
+
+/// Which loaded attachment an operation is about, out of the ones ptolemy lists
+/// on the feature under that name.
+enum Held {
+    None,
+    One(String),
+    Many(usize),
+}
+
+/// Why an operation the loader would have had to guess at was not applied.
+fn refuse(verb: &str, name: &str, feature: &str, count: usize) -> String {
+    format!(
+        "{count} attachments on the feature {feature} are called {name}, so which of them the source {verb} cannot be told and none was touched"
+    )
 }
 
 #[derive(Clone, Copy)]

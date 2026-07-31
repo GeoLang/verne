@@ -24,7 +24,7 @@ mod portal;
 mod service;
 mod verdict;
 
-pub use changes::{OBJECT_IDS_DIR, SERVER_GENS_FILE};
+pub use changes::{ATTACHMENT_IDS_DIR, OBJECT_IDS_DIR, SERVER_GENS_FILE};
 pub use client::{Fetch, HttpFetch};
 pub use extract::Extraction;
 pub use geometry::{EsriGeometry, Position};

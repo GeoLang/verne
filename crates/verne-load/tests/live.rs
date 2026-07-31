@@ -19,8 +19,8 @@ use std::path::Path;
 
 use verne_core::SourceDescription;
 use verne_core::sidecar::{
-    DatasetPlan, ExtractionLog, NewAttachment, NewDataset, NewDomain, NewFeature, NewField,
-    NewRelationship, NewSchema, NewSubtype, Sidecar,
+    AttachmentOp, DatasetPlan, ExtractionLog, NewAttachment, NewDataset, NewDomain, NewFeature,
+    NewField, NewRelationship, NewSchema, NewSubtype, Sidecar,
 };
 use verne_load::Loader;
 
@@ -230,7 +230,7 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
         }],
-        attachments: vec![NewAttachment {
+        attachments: vec![AttachmentOp::Add(NewAttachment {
             dataset: wells,
             feature_id: well_feature.to_string(),
             name: "photo.png".into(),
@@ -238,7 +238,8 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
             file: "attachments/photo.png".into(),
             metadata: serde_json::json!({ "source_table": "wells__ATTACH" }),
             created_by: "verne-load test".into(),
-        }],
+            global_id: None,
+        })],
         log: ExtractionLog::new("verne-load test"),
     }
 }

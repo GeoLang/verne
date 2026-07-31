@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use verne_core::{
-    DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, Item, ItemKind, NewDataset, NewDomain, NewField,
-    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source,
+    AttachmentOp, DatasetPlan, ExtractionLog, GEOPACKAGE_FILE, Item, ItemKind, NewDataset,
+    NewDomain, NewField, NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source,
 };
 
 use crate::features;
@@ -91,7 +91,12 @@ impl GdbSource {
             .map(|(table, dataset)| (table.as_str(), dataset.as_str()))
             .collect();
         let written = features::write(&self.dataset, &scan, directory, &named, operator)?;
-        let attachments = written.attachments;
+        // every blob a geodatabase carries is an add: this path has no delta
+        let attachments: Vec<AttachmentOp> = written
+            .attachments
+            .into_iter()
+            .map(AttachmentOp::Add)
+            .collect();
         for file in &written.files {
             let Some(plan) = datasets
                 .iter_mut()

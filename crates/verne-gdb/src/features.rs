@@ -750,27 +750,10 @@ fn binary_field(feature: &Feature<'_>, name: &str) -> Option<Vec<u8>> {
 
 // ─── Names ──────────────────────────────────────────────────────────
 
-/// A file name that stands for a table or an attachment without carrying
-/// anything a path could act on. Anything outside the safe set becomes an
-/// underscore, so two names can collide, which is why every attachment file is
-/// also prefixed with its row number.
+/// A file name with nothing a path can act on, shared with every adapter that
+/// writes an extraction.
 fn file_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim_matches('.').to_string();
-    if cleaned.is_empty() {
-        "unnamed".to_string()
-    } else {
-        cleaned
-    }
+    verne_core::safe_file_name(name)
 }
 
 /// `__ATTACH` tables no media relationship points at. The report already has a

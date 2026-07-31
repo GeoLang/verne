@@ -3,32 +3,40 @@
 [![CI](https://github.com/GeoLang/verne/actions/workflows/ci.yml/badge.svg)](https://github.com/GeoLang/verne/actions)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
-Read-only inventory of a third-party geospatial source. Verne opens a file, lists
-what is in it, and says of each thing whether GeoLang could hold it faithfully,
-would have to approximate it, or has no home for it at all.
+Read-only inventory of a third-party geospatial source. Verne opens a file or a
+hosted service, lists what is in it, and says of each thing whether GeoLang
+could hold it faithfully, would have to approximate it, or has no home for it
+at all.
 
-It can then act on that report: `verne extract` writes a geodatabase out as a
-GeoPackage and a sidecar, and `verne load` creates what the sidecar describes in
-a running ptolemy. The source is never written to, in either.
+It can then act on that report: `verne extract` writes the source out as a
+sidecar ptolemy can load, with a GeoPackage beside it when the source is a
+geodatabase, and `verne load` creates what the sidecar describes in a running
+ptolemy. The source is never written to, in either.
 
 ## Scope
 
-v0.3 reads KML and KMZ, and Esri file geodatabases, and extracts a geodatabase
-into a GeoPackage and a ptolemy sidecar: the datasets and their semantics, the
-features themselves, and the attachments on the features they belong to.
+v0.4 reads KML and KMZ, Esri file geodatabases, and hosted ArcGIS feature
+services over their REST API, and extracts a geodatabase or a feature service
+into what ptolemy loads: the datasets and their semantics, the features
+themselves, and the attachments on the features they belong to. A geodatabase
+extraction also writes a GeoPackage; a feature service extraction does not,
+because writing one is GDAL's work and the REST side builds without GDAL.
 
-Reading and extracting reach no network and take no credentials. Verne does not
-follow a NetworkLink or fetch an overlay image, so anything behind a URL is
-reported as outside the inventory rather than inspected, and it never opens a
-raster. An inventory does not open an attachment blob either; an extraction
-does, because carrying one means writing the bytes out. `verne load` is the one
-command that reaches a network, and the only one that takes a credential.
+Reading a file reaches no network and takes no credentials. Verne does not
+follow a NetworkLink or fetch an overlay image, so anything behind a URL in a
+file is reported as outside the inventory rather than inspected, and it never
+opens a raster. An inventory does not open an attachment blob either; an
+extraction does, because carrying one means writing the bytes out. A feature
+service is read over HTTP by nature, with GETs and nothing else, and its token
+comes from `VERNE_ARCGIS_TOKEN`, never an argument; a public service needs
+none. `verne load` is still the only command that writes anywhere, and it
+writes to ptolemy.
 
-The KML side is pure Rust and needs no GDAL. The geodatabase side is behind the
-`gdb` feature and needs GDAL 3.8 or later, read through GDAL's own OpenFileGDB
-driver: Esri's FileGDB SDK is never loaded, and the open call names the driver it
-allows. Without the feature the geodatabase adapter is not built at all and the
-rest of verne is unaffected.
+The KML and feature service sides are pure Rust and need no GDAL. The
+geodatabase side is behind the `gdb` feature and needs GDAL 3.8 or later, read
+through GDAL's own OpenFileGDB driver: Esri's FileGDB SDK is never loaded, and
+the open call names the driver it allows. Without the feature the geodatabase
+adapter is not built at all and the rest of verne is unaffected.
 
 ## Usage
 
@@ -45,6 +53,12 @@ verne inspect wells.gdb
 
 # write the features and the semantics out
 verne extract wells.gdb --out ./wells-extract --operator you@example.com
+
+# a hosted feature service, by its FeatureServer root; a private one reads
+# the token from VERNE_ARCGIS_TOKEN
+verne inspect https://host/arcgis/rest/services/Wells/FeatureServer
+verne extract https://host/arcgis/rest/services/Wells/FeatureServer \
+    --out ./wells-extract --operator you@example.com
 
 # create them in a running ptolemy
 export VERNE_PTOLEMY_TOKEN=<a bearer token that may write>
@@ -110,6 +124,52 @@ is GDAL's work and not verne's. What verne adds is the subtypes, out of the
 catalogue XML; carrying all of it into somewhere that can hold it; and saying
 what did not survive.
 
+## Feature services
+
+`verne inspect` and `verne extract` take a FeatureServer root URL and read it
+through the documented REST API: the service resource, each layer and table,
+`/query` for the features, and the attachment routes for the blobs. The scope
+is the operator's own services with their own credentials: verne takes a
+ready token, records who ran the extraction, and touches nothing it is not
+pointed at.
+
+What is inventoried: layers and tables with their fields, aliases and domain
+bindings, coded and range domains, subtypes with their defaults and per-subtype
+domain assignments, relationships as both of their ends tell them, attachments,
+renderers by name, time awareness, metadata records, and whether the service
+fronts versioned data (verne reads only the version the service answers with).
+
+Three things differ from a geodatabase on disk, and the report names each:
+
+- **The service does the reprojecting.** Every query asks for EPSG:4326 in
+  `outSR` and verne does no coordinate arithmetic, which is what keeps this
+  side GDAL-free. Esri does not document which datum transformation answers
+  that, and the coordinates as stored are not fetched, so no native original
+  rides on the inserts. The source stays hosted, which is what makes the loss
+  bearable: the original coordinates are where they always were.
+- **No GeoPackage.** The feature files and the sidecar are the whole
+  extraction.
+- **A layer's relationship description carries no forward or backward label
+  and no rules**, so ptolemy's labels are created empty and the report says it
+  cannot see rules at all.
+
+Features come down `/query` a page at a time, `maxRecordCount` per page and
+ordered by the object id field, until the service stops saying
+`exceededTransferLimit`, which Esri's docs say can outlive the last full page.
+A layer that caps its answers and cannot page is fetched once, and the log
+says the rest of the layer was left behind. A Date attribute arrives as epoch
+milliseconds and is written as RFC 3339 text, since the schema declares the
+column a string.
+
+Attachments are listed through `queryAttachments` where the layer supports it
+and one feature at a time where it does not, then each blob is downloaded and
+lands on the feature it belongs to through the object ids the feature pass
+recorded. A blob that belongs to no feature the extraction wrote is skipped
+and counted, never guessed onto another one.
+
+A failed request is an error naming the route, including the ones ArcGIS
+answers with HTTP 200 and an error object in the body.
+
 ## Extraction
 
 `verne extract` writes four things into the directory it is given:
@@ -129,6 +189,10 @@ sidecar.json  — the datasets, their column schemas, coded and range domains,
                 subtypes, relationship classes and attachments to create in
                 ptolemy, plus the log
 ```
+
+From a feature service the GeoPackage is absent and everything else is the
+same, so `verne load` reads both extractions without knowing which it was
+handed.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the
@@ -330,12 +394,14 @@ registry and no dynamic loading: whoever builds the binary picks the adapters.
 ## Crates
 
 ```
-verne-core — the inventory model, verdicts, reports, and the sidecar model
-verne-kml  — the KML and KMZ adapter
-verne-gdb  — the Esri file geodatabase adapter and its extraction, behind the
-             `gdal` feature
-verne-load — the ptolemy loader: HTTP, no GDAL
-verne-cli  — the command-line interface
+verne-core   — the inventory model, verdicts, reports, and the sidecar model
+verne-kml    — the KML and KMZ adapter
+verne-gdb    — the Esri file geodatabase adapter and its extraction, behind
+               the `gdal` feature
+verne-arcgis — the ArcGIS Feature Service adapter and its extraction: REST,
+               no GDAL
+verne-load   — the ptolemy loader: HTTP, no GDAL
+verne-cli    — the command-line interface
 ```
 
 ## License

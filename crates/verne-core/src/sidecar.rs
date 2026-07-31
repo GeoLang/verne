@@ -317,6 +317,29 @@ impl Sidecar {
     }
 }
 
+/// A file name that stands for a table or an attachment without carrying
+/// anything a path could act on. Anything outside the safe set becomes an
+/// underscore, so two names can collide, which is why every attachment file
+/// is also prefixed with its row number.
+pub fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').to_string();
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// What an extraction did with one thing.
 ///
 /// For a thing the inventory judged, which variant it gets is decided by the

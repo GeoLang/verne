@@ -21,18 +21,20 @@ struct Cli {
 enum Command {
     /// Report what a source holds and how much of it GeoLang could keep
     Inspect {
-        /// Path to a .kml or .kmz file, or to a .gdb directory
-        path: PathBuf,
+        /// Path to a .kml or .kmz file or a .gdb directory, or the URL of an
+        /// ArcGIS FeatureServer root
+        source: String,
         /// Also write the report as JSON to this path
         #[arg(long, value_name = "PATH")]
         json: Option<PathBuf>,
     },
-    /// Write a source out as a GeoPackage and a sidecar ptolemy can load
+    /// Write a source out as a sidecar ptolemy can load: a geodatabase also
+    /// gets a GeoPackage, a feature service is fetched over REST
     Extract {
-        /// Path to a .gdb directory
-        path: PathBuf,
-        /// Directory to write the GeoPackage, the features, the attachment
-        /// blobs, the sidecar and the log into
+        /// Path to a .gdb directory, or the URL of an ArcGIS FeatureServer root
+        source: String,
+        /// Directory to write the features, the attachment blobs, the sidecar
+        /// and the log into (and the GeoPackage, from a geodatabase)
         #[arg(long, value_name = "PATH")]
         out: PathBuf,
         /// Who is running this, recorded in the extraction log
@@ -63,11 +65,16 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Inspect { path, json } => {
-            let report = if is_geodatabase(&path) {
-                geodatabase(&path)?
+        Command::Inspect { source, json } => {
+            let report = if is_url(&source) {
+                Report::build(&open_service(&source)?)?
             } else {
-                Report::build(&KmlSource::open(&path)?)?
+                let path = PathBuf::from(&source);
+                if is_geodatabase(&path) {
+                    geodatabase(&path)?
+                } else {
+                    Report::build(&KmlSource::open(&path)?)?
+                }
             };
             println!("{}", report.to_markdown());
             if let Some(json_path) = json {
@@ -77,17 +84,45 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Extract {
-            path,
+            source,
             out,
             operator,
-        } => extract(&path, &out, &operator),
+        } => {
+            if is_url(&source) {
+                extract_service(&source, &out, &operator)
+            } else {
+                extract(&PathBuf::from(&source), &out, &operator)
+            }
+        }
         Command::Load { path, ptolemy } => load(&path, &ptolemy),
     }
 }
 
-/// The token is read from the environment and never taken as an argument: an
+/// The tokens are read from the environment and never taken as arguments: an
 /// argument is in the process list of every other user on the machine.
 const TOKEN_VAR: &str = "VERNE_PTOLEMY_TOKEN";
+
+fn is_url(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+/// A feature service, with the token from [`verne_arcgis::TOKEN_VAR`] when one
+/// is set; a public service needs none.
+fn open_service(url: &str) -> Result<verne_arcgis::ArcgisSource, Box<dyn std::error::Error>> {
+    let token = std::env::var(verne_arcgis::TOKEN_VAR).ok();
+    Ok(verne_arcgis::ArcgisSource::open(url, token)?)
+}
+
+fn extract_service(
+    url: &str,
+    out: &Path,
+    operator: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let extraction = open_service(url)?.extract(out, operator)?;
+    println!("{}", extraction.sidecar.log.to_markdown());
+    eprintln!("wrote {}", extraction.sidecar_path.display());
+    Ok(())
+}
 
 fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
     let token = std::env::var(TOKEN_VAR).map_err(|_| {

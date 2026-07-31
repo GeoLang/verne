@@ -18,6 +18,7 @@ gdb = ["dep:verne-gdb", "verne-gdb/gdal"]
 
 [dependencies]
 verne-core = { path = "../verne-core" }
+verne-arcgis = { path = "../verne-arcgis" }
 verne-kml = { path = "../verne-kml" }
 verne-load = { path = "../verne-load" }
 verne-gdb = { path = "../verne-gdb", optional = true }

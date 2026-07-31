@@ -1,0 +1,1167 @@
+//! Extracting a feature service into a form ptolemy accepts.
+//!
+//! The same contract as the gdb extraction, minus the GeoPackage: writing one
+//! is GDAL's work and this crate has none, so the feature files and the
+//! sidecar are the whole of what lands on disk. Nothing here decides whether
+//! a thing can be carried: that was decided in `verdict.rs`, and the log
+//! restates the verdict rather than forming a second opinion.
+//!
+//! The features come down `/query` a page at a time, asked for in EPSG:4326,
+//! so the service transforms and verne only encodes. A page is asked for
+//! again until the service stops saying `exceededTransferLimit`, which its
+//! docs say can outlive the last full page.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use verne_core::{
+    ATTACHMENTS_DIR, DatasetPlan, ExtractionLog, FEATURES_DIR, Item, ItemKind, MAX_FEATURE_BYTES,
+    NewAttachment, NewDataset, NewDomain, NewFeature, NewField, NewRelationship, NewSchema,
+    NewSubtype, SIDECAR_FILE, Sidecar, Source, safe_file_name,
+};
+
+use crate::client::{Fetch, json};
+use crate::geometry::{EMPTY_GEOMETRY, EsriGeometry, Position};
+use crate::service::{DomainKind, Layer, text};
+use crate::verdict::{self, Pairing};
+use crate::{ArcgisError, ArcgisSource};
+
+/// The srid every dataset declares: what its geometry is by the time ptolemy
+/// has it, because every query asked the service for it.
+const PTOLEMY_SRID: i32 = 4326;
+
+/// The page size when a layer names no `maxRecordCount` of its own.
+const DEFAULT_PAGE: u64 = 1000;
+
+/// How many object ids go in one `queryAttachments` request. Bounded by URL
+/// length rather than by any documented limit.
+const ATTACHMENT_BATCH: usize = 100;
+
+/// Where an extraction landed. No GeoPackage on this path: the sidecar's
+/// `geopackage` is absent and the loader already reads that as none.
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub directory: PathBuf,
+    pub sidecar_path: PathBuf,
+    pub sidecar: Sidecar,
+}
+
+impl ArcgisSource {
+    /// Read the service and write it out into `directory`.
+    ///
+    /// `&self` throughout: every request is a read, and everything written
+    /// goes into the extraction directory. The `operator` is recorded in the
+    /// log, which is what makes an extraction accountable rather than
+    /// anonymous.
+    pub fn extract(&self, directory: &Path, operator: &str) -> Result<Extraction, ArcgisError> {
+        let service = &self.service;
+        let items = verdict::items(service);
+        std::fs::create_dir_all(directory).map_err(|source| ArcgisError::Write {
+            path: directory.display().to_string(),
+            source,
+        })?;
+
+        let mut placed: Vec<(Item, Placed)> = Vec::new();
+        let mut conversions: Vec<Conversion> = Vec::new();
+
+        // one plan per layer, in layer order, so the two walk together by index
+        let mut datasets = dataset_plans(service, operator, &mut placed, &mut conversions);
+        let relationships = relationship_classes(service, &datasets, &mut placed);
+
+        let mut attachments = Vec::new();
+        for (plan_index, layer) in service.layers.iter().enumerate() {
+            // files are named after the dataset, not the layer: dataset names
+            // are unique where duplicate layer names were suffixed, and a file
+            // per layer name would have the second layer overwrite the first
+            let dataset_name = datasets[plan_index].dataset.name.clone();
+            let (file, minted) = write_layer(
+                self.fetch.as_ref(),
+                &service.url,
+                layer,
+                &dataset_name,
+                directory,
+            )?;
+            datasets[plan_index].features = file.path.clone();
+            conversions.push(Conversion {
+                location: layer.name.clone(),
+                kind: ItemKind::FeatureCollection,
+                detail: format!("{} feature{}", file.features, plural(file.features)),
+                destination: file.path.clone(),
+                losses: file.losses,
+            });
+            if layer.has_attachments {
+                let carried = self.attachments(
+                    layer,
+                    &dataset_name,
+                    &minted,
+                    directory,
+                    operator,
+                    &mut attachments,
+                )?;
+                place_attachments(layer, carried, &mut placed, &mut conversions);
+            }
+        }
+
+        let mut log = ExtractionLog::new(operator);
+        // walked in report order, so the log reads down the same list the
+        // markdown report does
+        for item in &items {
+            // consumed as matched: two layers with identical names and
+            // metadata make equal items, and each must find its own placement
+            match placed.iter().position(|(held, _)| held == item) {
+                Some(index) => match placed.remove(index).1 {
+                    Placed::At(destination) => log.carried(item, destination),
+                    Placed::Left(reason) => log.skipped(item, &reason),
+                },
+                None => log.skipped(item, left_behind(item.kind)),
+            }
+        }
+        for conversion in conversions {
+            match conversion.destination {
+                Some(destination) => log.converted(
+                    conversion.location,
+                    conversion.kind,
+                    conversion.detail,
+                    destination,
+                    conversion.losses,
+                ),
+                None => log.not_converted(
+                    conversion.location,
+                    conversion.kind,
+                    conversion.detail,
+                    conversion.losses.join("; "),
+                ),
+            }
+        }
+
+        let sidecar = Sidecar {
+            source: self.describe(),
+            geopackage: None,
+            datasets,
+            relationships,
+            attachments,
+            log,
+        };
+        let sidecar_path = directory.join(SIDECAR_FILE);
+        std::fs::write(&sidecar_path, sidecar.to_json() + "\n").map_err(|source| {
+            ArcgisError::Write {
+                path: sidecar_path.display().to_string(),
+                source,
+            }
+        })?;
+
+        Ok(Extraction {
+            directory: directory.to_path_buf(),
+            sidecar_path,
+            sidecar,
+        })
+    }
+}
+
+/// What became of one row of the report.
+enum Placed {
+    At(String),
+    Left(String),
+}
+
+/// A loss the extraction itself took, which no verdict covers.
+struct Conversion {
+    location: String,
+    kind: ItemKind,
+    detail: String,
+    destination: Option<String>,
+    losses: Vec<String>,
+}
+
+/// Why a thing the inventory judged was not written out, for a row that could
+/// have been carried and was not.
+fn left_behind(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::EmbeddedResource => {
+            "an attachment reaches ptolemy on the feature it belongs to, and this one names no feature this extraction created, so there is nothing to hang it off"
+        }
+        ItemKind::Styling => {
+            "the renderer stays on the service: this extraction writes datasets, domains, subtypes, relationship classes, features and attachments, and jung is not among its outputs"
+        }
+        ItemKind::Metadata => {
+            "ptolemy takes a metadata record through a route of its own, which this extraction does not use"
+        }
+        _ => {
+            "this extraction writes datasets, domains, subtypes, relationship classes, features and attachments, and nothing else"
+        }
+    }
+}
+
+// ─── Datasets, domains and subtypes ─────────────────────────────────
+
+fn dataset_plans(
+    service: &crate::Service,
+    operator: &str,
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) -> Vec<DatasetPlan> {
+    let mut plans: Vec<DatasetPlan> = Vec::new();
+    for layer in &service.layers {
+        // two layers may share a name across the layer and table lists, and
+        // ptolemy datasets are told apart by name
+        let mut name = layer.name.clone();
+        if plans.iter().any(|plan| plan.dataset.name == name) {
+            name = format!("{} {}", layer.name, layer.id);
+            conversions.push(Conversion {
+                location: layer.name.clone(),
+                kind: ItemKind::FeatureCollection,
+                detail: format!("dataset created as {name}"),
+                destination: Some(format!("dataset {name}")),
+                losses: vec![format!(
+                    "another layer of this service is already called {}, and ptolemy datasets are told apart by name, so the layer id was appended",
+                    layer.name
+                )],
+            });
+        }
+        let (geometry_type, dropped) = ptolemy_geometry(layer);
+        if !dropped.is_empty() {
+            conversions.push(Conversion {
+                location: layer.name.clone(),
+                kind: ItemKind::FeatureCollection,
+                detail: format!("geometry type recorded as {geometry_type}"),
+                destination: Some(format!("dataset {name}")),
+                losses: dropped,
+            });
+        }
+        placed.push((
+            verdict::layer_item(layer),
+            Placed::At(format!("dataset {name}")),
+        ));
+        let domains = domains_of(layer, conversions);
+        let subtypes = subtypes_of(layer, conversions);
+        if let Some(item) = verdict::subtype_item(layer) {
+            let destination = if subtypes.is_empty() {
+                Placed::Left(
+                    "every subtype on the layer carries a code ptolemy cannot hold, so there was nothing left to create".into(),
+                )
+            } else {
+                Placed::At(format!("subtypes of {name}"))
+            };
+            placed.push((item, destination));
+        }
+        for (domain, users) in verdict::layer_domains(layer) {
+            placed.push((
+                verdict::domain_item(layer, &domain, &users),
+                Placed::At(format!("domains of {name}")),
+            ));
+        }
+        plans.push(DatasetPlan {
+            source_table: layer.name.clone(),
+            layer: None,
+            features: None,
+            dataset: NewDataset {
+                name,
+                srid: PTOLEMY_SRID,
+                geometry_type: geometry_type.to_string(),
+                created_by: operator.to_string(),
+            },
+            schema: columns_of(layer, conversions),
+            domains,
+            subtypes,
+        });
+    }
+    plans
+}
+
+/// ptolemy's name for a layer's geometry, and what calling it that drops.
+///
+/// A polyline layer is declared multilinestring and a polygon layer
+/// multipolygon, which is also how every feature is encoded, so a one-path
+/// feature and a three-path one agree with the dataset that holds them.
+fn ptolemy_geometry(layer: &Layer) -> (&'static str, Vec<String>) {
+    let mut losses = Vec::new();
+    if layer.has_z {
+        losses.push(
+            "the layer carries a Z ordinate and ptolemy's geometry_type names 2D shapes only, so the dataset does not declare it".to_string(),
+        );
+    }
+    if layer.has_m {
+        losses.push(
+            "the layer carries an M ordinate and ptolemy's geometry_type names 2D shapes only, so the dataset does not declare it".to_string(),
+        );
+    }
+    let name = match layer.geometry_type.as_deref() {
+        None => "geometry",
+        Some("esriGeometryPoint") => "point",
+        Some("esriGeometryMultipoint") => "multipoint",
+        Some("esriGeometryPolyline") => "multilinestring",
+        Some("esriGeometryPolygon") => "multipolygon",
+        Some(other) => {
+            losses.push(format!(
+                "{other} is a shape ptolemy has no name for, so the dataset is declared as holding any geometry"
+            ));
+            "geometry"
+        }
+    };
+    (name, losses)
+}
+
+/// The layer's columns as ptolemy's dataset schema holds them. This is where
+/// a field alias lands, and storing it is the whole of what happens to it.
+fn columns_of(layer: &Layer, conversions: &mut Vec<Conversion>) -> NewSchema {
+    let mut fields = Vec::new();
+    let mut retyped = Vec::new();
+    for field in &layer.fields {
+        if field.kind == "esriFieldTypeGeometry" {
+            continue;
+        }
+        let (field_type, approximated) = verdict::schema_field_type(&field.kind);
+        if let Some(loss) = approximated {
+            retyped.push(loss);
+        }
+        fields.push(NewField {
+            name: field.name.clone(),
+            field_type: field_type.to_string(),
+            required: !field.nullable,
+            alias: field.alias.clone(),
+        });
+    }
+    if !retyped.is_empty() {
+        conversions.push(Conversion {
+            location: layer.name.clone(),
+            kind: ItemKind::AttributeSchema,
+            detail: format!(
+                "{} column{} declared as the nearest type ptolemy has",
+                retyped.len(),
+                plural(retyped.len())
+            ),
+            destination: Some(format!("schema of {}", layer.name)),
+            losses: retyped,
+        });
+    }
+    NewSchema { fields }
+}
+
+/// Every distinct domain the layer uses, as the sidecar creates them.
+fn domains_of(layer: &Layer, conversions: &mut Vec<Conversion>) -> Vec<NewDomain> {
+    let mut out: Vec<NewDomain> = Vec::new();
+    for (domain, _) in verdict::layer_domains(layer) {
+        if out.iter().any(|held| held.name == domain.name) {
+            continue;
+        }
+        // the domain rides on a field, and the field's own type is what
+        // ptolemy's domain declares
+        let field_kind = layer
+            .fields
+            .iter()
+            .find(|field| {
+                field
+                    .domain
+                    .as_ref()
+                    .is_some_and(|held| held.name == domain.name)
+            })
+            .map(|field| field.kind.as_str())
+            .or_else(|| {
+                layer
+                    .subtypes
+                    .iter()
+                    .flat_map(|subtype| subtype.domains.iter())
+                    .find(|(_, held)| held.name == domain.name)
+                    .and_then(|(field, _)| {
+                        layer
+                            .fields
+                            .iter()
+                            .find(|held| held.name == *field)
+                            .map(|held| held.kind.as_str())
+                    })
+            })
+            .unwrap_or("esriFieldTypeString");
+        let (field_type, retyped) = verdict::domain_field_type(field_kind);
+        if let Some(loss) = retyped {
+            conversions.push(Conversion {
+                location: domain.name.clone(),
+                kind: ItemKind::AttributeSchema,
+                detail: format!("domain field type recorded as {field_type}"),
+                destination: Some(format!("domains of {}", layer.name)),
+                losses: vec![loss],
+            });
+        }
+        out.push(match &domain.kind {
+            DomainKind::Coded(values) => NewDomain::coded(
+                domain.name.clone(),
+                field_type,
+                values
+                    .iter()
+                    .map(|(code, label)| (code.clone(), label.clone())),
+            ),
+            DomainKind::Range { min, max } => {
+                NewDomain::range(domain.name.clone(), field_type, *min, *max)
+            }
+        });
+    }
+    out
+}
+
+fn subtypes_of(layer: &Layer, conversions: &mut Vec<Conversion>) -> Vec<NewSubtype> {
+    let Some(field) = &layer.subtype_field else {
+        return Vec::new();
+    };
+    let mut subtypes = Vec::new();
+    for subtype in &layer.subtypes {
+        // ptolemy keys a subtype on an integer, so a code that is not one has
+        // nothing to be written as
+        let code = subtype
+            .code
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok());
+        let Some(code) = code else {
+            conversions.push(Conversion {
+                location: layer.name.clone(),
+                kind: ItemKind::AttributeSchema,
+                detail: format!(
+                    "subtype \"{}\" with code {}",
+                    subtype.name,
+                    text(&subtype.code)
+                ),
+                destination: Some(format!("subtypes of {}", layer.name)),
+                losses: vec![format!(
+                    "ptolemy's subtype code is an integer and this one is {}, so the subtype was not written",
+                    text(&subtype.code)
+                )],
+            });
+            continue;
+        };
+        subtypes.push(NewSubtype {
+            subtype_field: field.clone(),
+            name: subtype.name.clone(),
+            code,
+            default_values: subtype.default_values.clone(),
+            domain_assignments: subtype
+                .domains
+                .iter()
+                .map(|(field, domain)| (field.clone(), domain.name.clone()))
+                .collect(),
+        });
+    }
+    subtypes
+}
+
+// ─── Relationship classes ───────────────────────────────────────────
+
+fn relationship_classes(
+    service: &crate::Service,
+    plans: &[DatasetPlan],
+    placed: &mut Vec<(Item, Placed)>,
+) -> Vec<NewRelationship> {
+    // the class names ptolemy datasets, which are the plans' names, not the
+    // layers': the two differ where a duplicate layer name was suffixed
+    let names: BTreeMap<i64, &str> = service
+        .layers
+        .iter()
+        .zip(plans)
+        .map(|(layer, plan)| (layer.id, plan.dataset.name.as_str()))
+        .collect();
+    let mut classes = Vec::new();
+    for pairing in verdict::pairings(service) {
+        let item = verdict::relationship_item(&pairing);
+        match new_relationship(&pairing, &names) {
+            Ok(class) => {
+                placed.push((
+                    item,
+                    Placed::At(format!("relationship class {}", class.name)),
+                ));
+                classes.push(class);
+            }
+            Err(reason) => placed.push((item, Placed::Left(reason))),
+        }
+    }
+    classes
+}
+
+fn new_relationship(
+    pairing: &Pairing<'_>,
+    names: &BTreeMap<i64, &str>,
+) -> Result<NewRelationship, String> {
+    let origin = pairing.origin;
+    let Some((destination_layer, destination)) = &pairing.destination else {
+        return Err(format!(
+            "{} relates to table id {}, which is not in this service, and a relationship class in ptolemy names two dataset ids",
+            origin.name, origin.related_table_id
+        ));
+    };
+    let cardinality = match origin.cardinality.as_str() {
+        "esriRelCardinalityOneToOne" => "one_to_one",
+        "esriRelCardinalityOneToMany" => "one_to_many",
+        "esriRelCardinalityManyToMany" => "many_to_many",
+        other => {
+            return Err(format!(
+                "the service states the cardinality as \"{other}\", which verne does not know, and guessing one would misstate the class"
+            ));
+        }
+    };
+    // the key ptolemy wants is the one on the destination side that holds the
+    // origin's key, which is what the destination end's keyField names
+    let key = destination.key_field.clone().ok_or_else(|| {
+        format!(
+            "{} names no key field on its destination side, and ptolemy's class is keyed on one",
+            origin.name
+        )
+    })?;
+    Ok(NewRelationship {
+        name: origin.name.clone(),
+        origin_dataset: names
+            .get(&pairing.origin_layer.id)
+            .unwrap_or(&pairing.origin_layer.name.as_str())
+            .to_string(),
+        destination_dataset: names
+            .get(&destination_layer.id)
+            .unwrap_or(&destination_layer.name.as_str())
+            .to_string(),
+        origin_foreign_key: key,
+        cardinality: cardinality.to_string(),
+        // the REST layer description carries no labels, and the report says so
+        forward_label: String::new(),
+        backward_label: String::new(),
+    })
+}
+
+// ─── Features ───────────────────────────────────────────────────────
+
+/// What writing one layer's features came to.
+struct FeatureFile {
+    path: Option<String>,
+    features: usize,
+    losses: Vec<String>,
+}
+
+/// What one layer's rows came to.
+#[derive(Default)]
+struct Tally {
+    read: usize,
+    written: usize,
+    shapeless: usize,
+    unwritable: usize,
+    oversized: usize,
+    largest: usize,
+    /// Vertices whose declared Z or M was missing and written as zero.
+    nulled_ordinates: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPage {
+    #[serde(default)]
+    features: Vec<RawFeature>,
+    #[serde(default)]
+    exceeded_transfer_limit: bool,
+    #[serde(default)]
+    has_z: bool,
+    #[serde(default)]
+    has_m: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFeature {
+    #[serde(default)]
+    attributes: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    geometry: Option<serde_json::Value>,
+}
+
+/// One layer's features as insert operations, and the object id of every
+/// feature that was written, keyed for the attachments that hang off them.
+fn write_layer(
+    fetch: &dyn Fetch,
+    url: &str,
+    layer: &Layer,
+    dataset: &str,
+    directory: &Path,
+) -> Result<(FeatureFile, BTreeMap<String, String>), ArcgisError> {
+    let relative = format!("{FEATURES_DIR}/{}.ndjson", safe_file_name(dataset));
+    let path = directory.join(&relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ArcgisError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let file = std::fs::File::create(&path).map_err(|source| ArcgisError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(file);
+
+    // the columns whose values are read, with the ptolemy type each was
+    // declared as, so a value cannot arrive as a type the schema says it is not
+    let readable: Vec<(&str, &str, &'static str)> = layer
+        .fields
+        .iter()
+        .filter(|field| verdict::carries_values(field))
+        .filter(|field| field.kind != "esriFieldTypeGeometry")
+        .map(|field| {
+            (
+                field.name.as_str(),
+                field.kind.as_str(),
+                verdict::schema_field_type(&field.kind).0,
+            )
+        })
+        .collect();
+
+    let mut minted = BTreeMap::new();
+    let mut tally = Tally::default();
+    let mut losses = Vec::new();
+    let page_size = layer.max_record_count.unwrap_or(DEFAULT_PAGE);
+    let route = format!("{url}/{}/query", layer.id);
+    let mut offset: u64 = 0;
+    let mut empty_pages = 0u32;
+    loop {
+        let mut params: Vec<(&str, String)> =
+            vec![("where", "1=1".to_string()), ("outFields", "*".to_string())];
+        if layer.geometry_type.is_some() {
+            params.push(("returnGeometry", "true".to_string()));
+            params.push(("outSR", PTOLEMY_SRID.to_string()));
+            if layer.has_z {
+                params.push(("returnZ", "true".to_string()));
+            }
+            if layer.has_m {
+                params.push(("returnM", "true".to_string()));
+            }
+        } else {
+            params.push(("returnGeometry", "false".to_string()));
+        }
+        if layer.supports_pagination {
+            params.push(("resultOffset", offset.to_string()));
+            params.push(("resultRecordCount", page_size.to_string()));
+            if let Some(oid) = &layer.object_id_field {
+                params.push(("orderByFields", oid.clone()));
+            }
+        }
+        let value = json(fetch, &route, &params)?;
+        let page: RawPage =
+            serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+                route: route.clone(),
+                message: error.to_string(),
+            })?;
+
+        if page.features.is_empty() {
+            if page.exceeded_transfer_limit && layer.supports_pagination {
+                // the docs allow an empty page with the flag still up; move
+                // past it, but not forever
+                empty_pages += 1;
+                offset += page_size;
+                if empty_pages >= 3 {
+                    losses.push(
+                        "the service kept answering empty pages with exceededTransferLimit still set, so the extraction stopped asking; features past that point were not fetched".to_string(),
+                    );
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        empty_pages = 0;
+        offset += page.features.len() as u64;
+
+        for feature in &page.features {
+            tally.read += 1;
+            let id = uuid::Uuid::now_v7().to_string();
+            let geometry = match (&layer.geometry_type, &feature.geometry) {
+                (None, _) => EMPTY_GEOMETRY.to_string(),
+                (Some(_), None) => {
+                    tally.shapeless += 1;
+                    EMPTY_GEOMETRY.to_string()
+                }
+                (Some(kind), Some(value)) => {
+                    match esri_geometry(
+                        kind,
+                        value,
+                        layer.has_z || page.has_z,
+                        layer.has_m || page.has_m,
+                        &mut tally,
+                    ) {
+                        Some(shape) => shape.wkb_hex(),
+                        None => {
+                            tally.unwritable += 1;
+                            EMPTY_GEOMETRY.to_string()
+                        }
+                    }
+                }
+            };
+            let mut properties = serde_json::Map::new();
+            for (name, esri, declared) in &readable {
+                if let Some(value) = json_value(&feature.attributes, name, esri, declared) {
+                    properties.insert((*name).to_string(), value);
+                }
+            }
+            let line = serde_json::to_string(&NewFeature {
+                feature_id: id.clone(),
+                geometry_wkb_hex: geometry,
+                properties,
+                // the service transformed on the way out and the original was
+                // never fetched, so there is no distinct original to send
+                native_geometry_wkb_hex: None,
+                native_srid: None,
+                native_crs_wkt: None,
+            })
+            .expect("a feature holds only serialisable values");
+            // a feature ptolemy would refuse is not written: it would fail the
+            // batch it landed in and take the rest of the layer with it
+            if line.len() > MAX_FEATURE_BYTES {
+                tally.oversized += 1;
+                tally.largest = tally.largest.max(line.len());
+                continue;
+            }
+            if layer.has_attachments
+                && let Some(oid) = layer
+                    .object_id_field
+                    .as_ref()
+                    .and_then(|name| feature.attributes.get(name))
+            {
+                minted.insert(text(oid), id);
+            }
+            writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+            tally.written += 1;
+        }
+
+        if !page.exceeded_transfer_limit {
+            break;
+        }
+        if !layer.supports_pagination {
+            losses.push(format!(
+                "the service answers at most {} record{} at a time and does not support pagination, so only the first page was fetched and the rest of the layer is not in the extraction",
+                page.features.len(),
+                plural(page.features.len())
+            ));
+            break;
+        }
+    }
+    out.flush().map_err(|source| ArcgisError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+
+    losses.extend(feature_losses(layer, &tally));
+    Ok((
+        FeatureFile {
+            path: Some(relative),
+            features: tally.written,
+            losses,
+        },
+        minted,
+    ))
+}
+
+/// What reading the rows found, which is the part no verdict can know.
+fn feature_losses(layer: &Layer, tally: &Tally) -> Vec<String> {
+    let mut losses = Vec::new();
+    if layer.geometry_type.is_some() && layer.wkid != Some(4326) {
+        losses.push(match layer.wkid {
+            Some(code) => format!(
+                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the service transformed it out of wkid {code} itself; verne does no coordinate arithmetic, cannot say which datum transformation the service chose, and did not fetch the coordinates as stored, so no native original rides on the inserts"
+            ),
+            None => format!(
+                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the layer states no readable reference of its own, so what the service transformed out of is not written down"
+            ),
+        });
+    }
+    if layer.supports_pagination && layer.object_id_field.is_none() {
+        losses.push(
+            "the layer names no object id field, so the pages were fetched without a stable order and an edit made during the extraction can repeat or drop a row".to_string(),
+        );
+    }
+    if tally.shapeless > 0 {
+        losses.push(format!(
+            "no geometry on {}, and ptolemy's insert has no way to say so that is not also how a deletion reads, so each was written as an empty geometry collection",
+            of_rows(tally.shapeless, tally.read)
+        ));
+    }
+    if tally.unwritable > 0 {
+        losses.push(format!(
+            "the geometry of {} was not in a shape verne could encode, so each was written with an empty geometry collection in its place",
+            of_rows(tally.unwritable, tally.read)
+        ));
+    }
+    if tally.nulled_ordinates > 0 {
+        losses.push(format!(
+            "{} declared Z or M ordinate{} arrived null and {} written as zero, because WKB has no way to leave one out of a vertex",
+            tally.nulled_ordinates,
+            plural(tally.nulled_ordinates),
+            if tally.nulled_ordinates == 1 { "was" } else { "were" }
+        ));
+    }
+    if tally.oversized > 0 {
+        losses.push(format!(
+            "an insert bigger than the {MAX_FEATURE_BYTES} bytes ptolemy takes in a request on {}, {}, so they are not in the feature file and no load will create them; unlike a file extraction there is no GeoPackage keeping them, only the service itself",
+            of_rows(tally.oversized, tally.read),
+            if tally.oversized == 1 {
+                format!("which is {} bytes", tally.largest)
+            } else {
+                format!("the largest {} bytes", tally.largest)
+            }
+        ));
+    }
+    losses
+}
+
+/// "3 of the 40 rows", as a noun phrase with no verb after it.
+fn of_rows(some: usize, all: usize) -> String {
+    match (some, all) {
+        (_, 1) => "the one row".to_string(),
+        (some, all) if some == all => format!("all {all} rows"),
+        (some, all) => format!("{some} of the {all} rows"),
+    }
+}
+
+/// One attribute as JSON, in the type the schema declared the column as.
+///
+/// A value that will not fit the declared type is left out rather than sent
+/// as something else: ptolemy validates a commit against the schema. The one
+/// rewrite is a Date, which arrives as epoch milliseconds and is written as
+/// the RFC 3339 text the schema's string column expects.
+fn json_value(
+    attributes: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    esri: &str,
+    declared: &str,
+) -> Option<serde_json::Value> {
+    let value = attributes.get(name)?;
+    if value.is_null() {
+        return None;
+    }
+    let value = match (esri, value) {
+        ("esriFieldTypeDate", serde_json::Value::Number(number)) => {
+            let millis = number.as_i64()?;
+            let instant =
+                time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
+                    .ok()?;
+            serde_json::Value::String(
+                instant
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok()?,
+            )
+        }
+        _ => value.clone(),
+    };
+    let fits = match declared {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "float" => value.is_number(),
+        _ => false,
+    };
+    fits.then_some(value)
+}
+
+/// A feature's geometry out of the response JSON. `None` is a shape verne
+/// could not encode, which the caller counts rather than drops silently.
+fn esri_geometry(
+    kind: &str,
+    value: &serde_json::Value,
+    has_z: bool,
+    has_m: bool,
+    tally: &mut Tally,
+) -> Option<EsriGeometry> {
+    // a geometry can carry its own flags; the layer's stand when it does not
+    let has_z = value
+        .get("hasZ")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(has_z);
+    let has_m = value
+        .get("hasM")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(has_m);
+    match kind {
+        "esriGeometryPoint" => {
+            let x = value.get("x").and_then(serde_json::Value::as_f64)?;
+            let y = value.get("y").and_then(serde_json::Value::as_f64)?;
+            Some(EsriGeometry::Point(Position {
+                x,
+                y,
+                z: value.get("z").and_then(serde_json::Value::as_f64),
+                m: value.get("m").and_then(serde_json::Value::as_f64),
+            }))
+        }
+        "esriGeometryMultipoint" => {
+            let points = value.get("points")?.as_array()?;
+            let positions = points
+                .iter()
+                .map(|held| position(held, has_z, has_m, tally))
+                .collect::<Option<Vec<Position>>>()?;
+            Some(EsriGeometry::Multipoint(positions))
+        }
+        "esriGeometryPolyline" => Some(EsriGeometry::Polyline(paths(
+            value.get("paths")?.as_array()?,
+            has_z,
+            has_m,
+            tally,
+        )?)),
+        "esriGeometryPolygon" => Some(EsriGeometry::Polygon(paths(
+            value.get("rings")?.as_array()?,
+            has_z,
+            has_m,
+            tally,
+        )?)),
+        _ => None,
+    }
+}
+
+fn paths(
+    raw: &[serde_json::Value],
+    has_z: bool,
+    has_m: bool,
+    tally: &mut Tally,
+) -> Option<Vec<Vec<Position>>> {
+    raw.iter()
+        .map(|path| {
+            path.as_array()?
+                .iter()
+                .map(|held| position(held, has_z, has_m, tally))
+                .collect::<Option<Vec<Position>>>()
+        })
+        .collect()
+}
+
+/// One vertex out of its coordinate array. A declared Z or M that is missing
+/// or null becomes zero and is counted: WKB has no way to leave an ordinate
+/// out of one vertex of a geometry that has it.
+fn position(
+    value: &serde_json::Value,
+    has_z: bool,
+    has_m: bool,
+    tally: &mut Tally,
+) -> Option<Position> {
+    let coordinates = value.as_array()?;
+    let number = |index: usize| coordinates.get(index).and_then(serde_json::Value::as_f64);
+    let ordinate = |index: usize, wanted: bool, tally: &mut Tally| {
+        if !wanted {
+            return None;
+        }
+        match number(index) {
+            Some(value) => Some(value),
+            None => {
+                tally.nulled_ordinates += 1;
+                Some(0.0)
+            }
+        }
+    };
+    let x = number(0)?;
+    let y = number(1)?;
+    let z = ordinate(2, has_z, tally);
+    let m = ordinate(if has_z { 3 } else { 2 }, has_m, tally);
+    Some(Position { x, y, z, m })
+}
+
+// ─── Attachments ────────────────────────────────────────────────────
+
+/// What one attachment info the service lists says about itself.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAttachmentInfo {
+    id: i64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    keywords: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAttachmentGroup {
+    parent_object_id: serde_json::Value,
+    #[serde(default)]
+    attachment_infos: Vec<RawAttachmentInfo>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawGroups {
+    #[serde(default)]
+    attachment_groups: Vec<RawAttachmentGroup>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInfos {
+    #[serde(default)]
+    attachment_infos: Vec<RawAttachmentInfo>,
+}
+
+/// What became of one layer's attachments.
+struct AttachmentsCarried {
+    carried: usize,
+    orphans: Vec<String>,
+}
+
+impl ArcgisSource {
+    /// One layer's attachments: listed, downloaded, written as files and named
+    /// in the sidecar. A blob that cannot be attributed to a feature the
+    /// extraction wrote is skipped and said to be skipped.
+    fn attachments(
+        &self,
+        layer: &Layer,
+        dataset: &str,
+        minted: &BTreeMap<String, String>,
+        directory: &Path,
+        operator: &str,
+        out: &mut Vec<NewAttachment>,
+    ) -> Result<AttachmentsCarried, ArcgisError> {
+        let mut carried = AttachmentsCarried {
+            carried: 0,
+            orphans: Vec::new(),
+        };
+        let relative_dir = format!("{ATTACHMENTS_DIR}/{}", safe_file_name(dataset));
+        let blob_dir = directory.join(&relative_dir);
+        std::fs::create_dir_all(&blob_dir).map_err(|source| ArcgisError::Write {
+            path: blob_dir.display().to_string(),
+            source,
+        })?;
+
+        let listed = self.list_attachments(layer, minted)?;
+        for (row, (oid, info)) in listed.iter().enumerate() {
+            let Some(feature_id) = minted.get(oid) else {
+                carried.orphans.push(format!(
+                    "attachment {} belongs to object id {oid}, which is not a feature this extraction wrote, so there is nothing to attach it to",
+                    info.id
+                ));
+                continue;
+            };
+            let route = format!(
+                "{}/{}/{oid}/attachments/{}",
+                self.service.url, layer.id, info.id
+            );
+            let bytes = match self.fetch.get(&route, &[]) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    carried.orphans.push(format!(
+                        "the service would not hand over attachment {} ({error}), so it was left where it is",
+                        info.id
+                    ));
+                    continue;
+                }
+            };
+            let name = info
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}-{row}", layer.name));
+            let blob = format!("{relative_dir}/{row}-{}", safe_file_name(&name));
+            std::fs::write(directory.join(&blob), &bytes).map_err(|source| ArcgisError::Write {
+                path: blob.clone(),
+                source,
+            })?;
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("source_layer".into(), layer.name.clone().into());
+            metadata.insert("attachment_id".into(), info.id.into());
+            metadata.insert("object_id".into(), oid.clone().into());
+            if let Some(size) = info.size {
+                metadata.insert("size".into(), size.into());
+            }
+            if let Some(keywords) = &info.keywords {
+                metadata.insert("keywords".into(), keywords.clone().into());
+            }
+            out.push(NewAttachment {
+                dataset: dataset.to_string(),
+                feature_id: feature_id.clone(),
+                name,
+                content_type: info.content_type.clone(),
+                file: blob,
+                metadata: serde_json::Value::Object(metadata),
+                created_by: operator.to_string(),
+            });
+            carried.carried += 1;
+        }
+        Ok(carried)
+    }
+
+    /// Every attachment of the features that were written, as `(object id,
+    /// info)`. Through `queryAttachments` in batches where the layer supports
+    /// it, and one listing per feature where it does not.
+    fn list_attachments(
+        &self,
+        layer: &Layer,
+        minted: &BTreeMap<String, String>,
+    ) -> Result<Vec<(String, RawAttachmentInfo)>, ArcgisError> {
+        let mut listed = Vec::new();
+        let oids: Vec<&String> = minted.keys().collect();
+        if layer.supports_query_attachments {
+            let route = format!("{}/{}/queryAttachments", self.service.url, layer.id);
+            for batch in oids.chunks(ATTACHMENT_BATCH) {
+                let ids = batch
+                    .iter()
+                    .map(|oid| oid.as_str())
+                    .collect::<Vec<&str>>()
+                    .join(",");
+                let value = json(self.fetch.as_ref(), &route, &[("objectIds", ids)])?;
+                let groups: RawGroups =
+                    serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+                        route: route.clone(),
+                        message: error.to_string(),
+                    })?;
+                for group in groups.attachment_groups {
+                    let oid = text(&group.parent_object_id);
+                    for info in group.attachment_infos {
+                        listed.push((oid.clone(), info));
+                    }
+                }
+            }
+            return Ok(listed);
+        }
+        for oid in oids {
+            let route = format!("{}/{}/{oid}/attachments", self.service.url, layer.id);
+            let value = json(self.fetch.as_ref(), &route, &[])?;
+            let infos: RawInfos =
+                serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+                    route: route.clone(),
+                    message: error.to_string(),
+                })?;
+            for info in infos.attachment_infos {
+                listed.push((oid.clone(), info));
+            }
+        }
+        Ok(listed)
+    }
+}
+
+/// The log's account of one layer's attachments, decided by what was carried.
+fn place_attachments(
+    layer: &Layer,
+    carried: AttachmentsCarried,
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) {
+    let item = verdict::attachment_item(layer);
+    if carried.carried > 0 {
+        let destination = format!("attachments of {}", layer.name);
+        placed.push((item, Placed::At(destination.clone())));
+        if !carried.orphans.is_empty() {
+            conversions.push(Conversion {
+                location: layer.name.clone(),
+                kind: ItemKind::EmbeddedResource,
+                detail: format!(
+                    "{} attachment{} carried",
+                    carried.carried,
+                    plural(carried.carried)
+                ),
+                destination: Some(destination),
+                losses: carried.orphans,
+            });
+        }
+    } else {
+        placed.push((
+            item,
+            Placed::Left(if carried.orphans.is_empty() {
+                format!(
+                    "{} holds no attachments on the features that were written",
+                    layer.name
+                )
+            } else {
+                carried.orphans.join("; ")
+            }),
+        ));
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}

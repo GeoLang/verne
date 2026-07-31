@@ -13,7 +13,7 @@ pub use report::{Counts, Report};
 pub use sidecar::{
     ATTACHMENTS_DIR, Action, DatasetPlan, ExtractionLog, FEATURES_DIR, GEOPACKAGE_FILE, LogCounts,
     LogEntry, MAX_FEATURE_BYTES, NewAttachment, NewDataset, NewDomain, NewFeature, NewField,
-    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar,
+    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, safe_file_name,
 };
 
 /// A thing verne can read.

@@ -1,0 +1,28 @@
+[package]
+name = "verne-arcgis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ArcGIS Feature Service inventory and extraction adapter for verne"
+
+[dependencies]
+verne-core = { path = "../verne-core" }
+# same client as verne-load: rustls rather than the system OpenSSL
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    # query-string building is its own feature in 0.13
+    "query",
+    "rustls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# a Date attribute arrives as epoch milliseconds and is written as RFC 3339
+time = { version = "0.3", features = ["formatting"] }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3"

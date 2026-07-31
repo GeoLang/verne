@@ -9,6 +9,8 @@
 
 use serde::Deserialize;
 
+use crate::changes::LayerGen;
+
 /// A feature or map service, its layers and tables already fetched.
 #[derive(Debug)]
 pub struct Service {
@@ -38,6 +40,10 @@ pub struct Service {
     /// keep this null, and then only a sync replica could obtain generations,
     /// which registers state on the server and is not verne's to do.
     pub change_generations: bool,
+    /// The generations `changeTrackingInfo.layerServerGens` publishes, which
+    /// is the cursor a later delta sends back. Empty where the service
+    /// publishes none, and then a delta has nothing to ask about.
+    pub layer_server_gens: Vec<LayerGen>,
     pub layers: Vec<Layer>,
 }
 
@@ -380,6 +386,17 @@ pub fn parse_service(json: &serde_json::Value) -> Result<(ServiceHead, Vec<i64>)
         .chain(raw.tables.iter())
         .map(|listed| listed.id)
         .collect();
+    let tracking = raw
+        .change_tracking_info
+        .filter(|info| !info.is_null())
+        // a generation whose shape verne does not know is no cursor, so an
+        // unreadable list reads as none rather than failing the open
+        .map(|info| {
+            info.get("layerServerGens")
+                .cloned()
+                .and_then(|gens| serde_json::from_value::<Vec<LayerGen>>(gens).ok())
+                .unwrap_or_default()
+        });
     Ok((
         ServiceHead {
             description: raw
@@ -391,7 +408,8 @@ pub fn parse_service(json: &serde_json::Value) -> Result<(ServiceHead, Vec<i64>)
                 .capabilities
                 .split(',')
                 .any(|held| held.trim() == "ChangeTracking"),
-            change_generations: raw.change_tracking_info.is_some_and(|info| !info.is_null()),
+            change_generations: tracking.is_some(),
+            layer_server_gens: tracking.unwrap_or_default(),
         },
         ids,
     ))
@@ -403,6 +421,7 @@ pub struct ServiceHead {
     pub versioned: bool,
     pub change_tracking: bool,
     pub change_generations: bool,
+    pub layer_server_gens: Vec<LayerGen>,
 }
 
 pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {

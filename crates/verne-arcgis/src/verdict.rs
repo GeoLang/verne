@@ -10,7 +10,7 @@ use crate::service::{Domain, DomainKind, Field, Layer, RelationshipEnd, Service}
 
 /// Where anything that belongs to the service rather than to one layer is
 /// reported.
-const ROOT: &str = "service root";
+pub const ROOT: &str = "service root";
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
@@ -76,17 +76,17 @@ pub fn items(service: &Service) -> Vec<Item> {
     items
 }
 
-/// Change tracking is what would let a client ask `extractChanges` what
-/// changed between two generations. verne extracts the current state in full
-/// and does not call it, and the row says which half of that is choice and
-/// which is the server's.
+/// Change tracking is what lets a client ask `extractChanges` what changed
+/// between two generations. The capability itself is not a thing ptolemy holds,
+/// so the row stays a refusal; what it says is whether a later delta can ask
+/// the service what changed or has to work it out by reading everything again.
 fn change_tracking_item(service: &Service) -> Item {
     Item::new(
         ROOT,
         ItemKind::Temporal,
         "change tracking",
         Verdict::unsupported(if service.change_generations {
-            "the service tracks changes and publishes its generation window; verne extracts the current state in full rather than asking extractChanges what changed, so edits between two extractions are found by extracting again"
+            "the service tracks changes and publishes its generation window; a full extraction records the generations it read at beside its sidecar, and a later --since asks extractChanges for the object ids edited since and fetches only those rows. a layer the service publishes no generation for puts that run back on reading the whole service and diffing it locally, which the delta's own report says"
         } else {
             "the service tracks changes but publishes no changeTrackingInfo, so the generation window extractChanges needs could only come from registering a sync replica, which writes state on the server and is not verne's to do; the current state comes across in full"
         }),

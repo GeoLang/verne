@@ -16,6 +16,7 @@
 
 use verne_core::{Item, Source, SourceDescription};
 
+mod changes;
 mod client;
 mod extract;
 mod geometry;
@@ -23,6 +24,7 @@ mod portal;
 mod service;
 mod verdict;
 
+pub use changes::SERVER_GENS_FILE;
 pub use client::{Fetch, HttpFetch};
 pub use extract::Extraction;
 pub use geometry::{EsriGeometry, Position};
@@ -115,9 +117,17 @@ pub enum ArcgisError {
     #[error("{path} is not an extraction verne wrote: {message}")]
     BadPrevious { path: String, message: String },
     #[error(
-        "the extraction at {path} is itself a delta; --since diffs against the full extraction the datasets were first loaded from"
+        "the extraction at {path} is itself a delta, and its feature files hold only what changed: the feature ids the rest of the datasets were loaded under are not in them, so neither an extractChanges delta nor a local one could pair an update. --since takes the full extraction the datasets were first loaded from"
     )]
     DeltaPrevious { path: String },
+    #[error(
+        "{route} answered {status} for the extractChanges job, so what changed is not known and nothing was written"
+    )]
+    ChangesFailed { route: String, status: String },
+    #[error(
+        "the extractChanges job at {route} was still running after {minutes} minutes, so verne stopped waiting; nothing was written"
+    )]
+    ChangesTimedOut { route: String, minutes: u64 },
 }
 
 /// A feature service, its metadata fetched at open. The queries an extraction
@@ -216,6 +226,7 @@ impl ArcgisSource {
                 versioned: head.versioned,
                 change_tracking: head.change_tracking,
                 change_generations: head.change_generations,
+                layer_server_gens: head.layer_server_gens,
                 layers,
             },
             fetch,

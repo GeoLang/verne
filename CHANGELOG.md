@@ -41,10 +41,9 @@ All notable changes to this project will be documented in this file.
 - `--gdb-version` reads a named geodatabase version of a versioned enterprise
   service: the name rides on every query, count, feature page, native pass
   and attachment listing, and a wrong name fails the open loudly. The
-  versioning and change-tracking report rows say what is deliberately not
-  done: no version enumeration or differences (needs the Version Management
-  resource's editing privilege and read locks) and no extractChanges (the
-  generation window is only obtainable here by registering a sync replica).
+  versioning report row says what is deliberately not done: no version
+  enumeration or differences, which need the Version Management resource's
+  editing privilege and read locks.
 - MapServer roots read through the same contract: group layers become
   hierarchy rows and their members flat datasets, raster layers are named for
   terrano and not fetched, per-layer `isDataVersioned` reaches the versioning
@@ -59,3 +58,29 @@ All notable changes to this project will be documented in this file.
   in the log. serde_json's `float_roundtrip` is on throughout: its best-effort
   parsing does not round-trip its own shortest output, which made
   server-computed floats hash as changed on every delta.
+- A delta asks the service what changed where the service can say. A full
+  extraction of a service that tracks changes and publishes
+  `changeTrackingInfo.layerServerGens` records those generations in
+  `server-gens.json` beside the sidecar; `--since` sends them to
+  `extractChanges`, polls the job it starts, reads the change file its result
+  URL redirects to, and fetches only the object ids it names through the same
+  page machinery a full extraction uses, so date rewriting, the reference the
+  geometry arrives in and the untransformed originals stay on one code path.
+  The change file is read for its ids alone, never for its geometries. The
+  delta records the generations the window ended at. No new flag: `--since`
+  picks the path and the report says which ran.
+  - The local diff still runs where the server cannot answer, all or nothing
+    per run: no generations recorded, change tracking gone, a queryable layer
+    with no generation or no object id field, or a refused request. The report
+    row gives the reason, and a change file's attachment counts are reported
+    with the row saying attachments are not diffed.
+  - The token does not follow the result URL's redirect: it points at a signed
+    file on storage, and reqwest only drops `Authorization` across a host
+    boundary while the token rides in `X-Esri-Authorization`, so the redirect
+    is followed by hand and the signed URL fetched bare.
+  - `returnIdsOnly` is not used. On a live service it answers with empty edits
+    for windows the async job returns thousands of rows for.
+  - A delta is still never a basis for another delta. The generation would
+    chain, but the pairing would not: a delta's feature files hold only the
+    rows it touched, so an object id last written by an earlier extraction
+    would find no feature id and land as a second copy of itself.

@@ -10,6 +10,9 @@
 //! so the service transforms and verne only encodes. A page is asked for
 //! again until the service stops saying `exceededTransferLimit`, which its
 //! docs say can outlive the last full page.
+//!
+//! A delta reads the same route: what a change file changes is which rows are
+//! asked for, not how they are read.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,6 +24,9 @@ use verne_core::{
     safe_file_name,
 };
 
+use crate::changes::{
+    self, AttachmentEdits, ChangeFile, LayerChanges, LayerGen, RecordedGen, RecordedGens,
+};
 use crate::client::{Fetch, json, json_post};
 use crate::geometry::{EMPTY_GEOMETRY, EsriGeometry, Position};
 use crate::service::{DomainKind, Layer, text};
@@ -59,15 +65,23 @@ impl ArcgisSource {
     }
 
     /// Read the service again and write only what changed since `previous`,
-    /// an earlier full extraction of it, as insert, update and delete
-    /// operations `verne load` commits onto the datasets that extraction's
-    /// load created.
+    /// an earlier extraction of it, as insert, update and delete operations
+    /// `verne load` commits onto the datasets the first load created.
     ///
-    /// The diff is local: the full current state is fetched and paired with
-    /// the previous feature files by object id, with a hash of geometry and
-    /// properties deciding changed from unchanged. The service's own
-    /// `extractChanges` is not used, because its generation window is only
-    /// obtainable by registering a sync replica, which writes server state.
+    /// What changed is asked of the service where it can be: a previous
+    /// extraction that recorded the generations it read at, against a service
+    /// still tracking changes, means `extractChanges` names the object ids
+    /// edited since and only those rows are fetched. Otherwise the diff is
+    /// verne's own, and the whole current state is fetched and paired with the
+    /// previous feature files by object id, with a hash of geometry and
+    /// properties deciding changed from unchanged. The report says which of
+    /// the two ran and why.
+    ///
+    /// A delta of a delta is refused whichever path would run. The generation
+    /// a change file ends at does chain, but the pairing does not: an object id
+    /// the service reports edited has to be looked up to find the feature id
+    /// ptolemy holds it under, and a delta's feature files hold only the rows
+    /// that delta touched.
     pub fn extract_since(
         &self,
         directory: &Path,
@@ -83,21 +97,86 @@ impl ArcgisSource {
             path: sidecar_path.display().to_string(),
             message: error.to_string(),
         })?;
-        // a delta's feature files hold only what changed, so diffing against
-        // one would read every unchanged feature as vanished
+        // refused before the service is asked anything, so a run that cannot
+        // be paired does not start a job on the server either
         if sidecar.incremental {
             return Err(ArcgisError::DeltaPrevious {
                 path: previous.display().to_string(),
             });
         }
+        let path = self.delta_path(changes::read(previous)?.as_ref())?;
         self.extract_inner(
             directory,
             operator,
             Some(Previous {
                 directory: previous.to_path_buf(),
                 sidecar,
+                path,
             }),
         )
+    }
+
+    /// Whether this delta can ride `extractChanges`, and the change file when
+    /// it can.
+    ///
+    /// All or nothing: one run has one meaning, so a single layer without a
+    /// recorded generation or without an object id field puts the whole
+    /// service on the local diff rather than leaving a report whose counts
+    /// were arrived at two different ways.
+    fn delta_path(&self, recorded: Option<&RecordedGens>) -> Result<DeltaPath, ArcgisError> {
+        let service = &self.service;
+        let local = |reason: String| Ok(DeltaPath::LocalDiff(reason));
+        let Some(recorded) = recorded else {
+            return local(
+                "the previous extraction recorded no server generations, so there is no cursor to send back and the whole service was read again and diffed locally".into(),
+            );
+        };
+        if !service.change_tracking {
+            return local(
+                "the service no longer states ChangeTracking among its capabilities, so extractChanges has no window to answer for and the whole service was read again and diffed locally".into(),
+            );
+        }
+        let mut gens: Vec<LayerGen> = Vec::new();
+        for layer in service.layers.iter().filter(|layer| layer.queryable()) {
+            let Some(server_gen) = recorded.of_layer(layer.id) else {
+                return local(format!(
+                    "the previous extraction recorded no generation for layer {} ({}), and a change file covers the layers it was asked about or none, so the whole service was read again and diffed locally",
+                    layer.id, layer.name
+                ));
+            };
+            if layer.object_id_field.is_none() {
+                return local(format!(
+                    "{} names no object id field, so the object ids a change file holds could not be paired with anything, and the whole service was read again and diffed locally",
+                    layer.name
+                ));
+            }
+            gens.push(LayerGen {
+                id: layer.id,
+                server_gen,
+            });
+        }
+        if gens.is_empty() {
+            return local(
+                "the service lists no layer that answers a query, so there is nothing to ask extractChanges about".into(),
+            );
+        }
+        let status = match changes::submit(self.fetch.as_ref(), &service.url, &gens) {
+            Ok(status) => status,
+            // the service would not start the job at all, and the local diff
+            // answers the same question the slow way
+            Err(error) => {
+                return local(format!(
+                    "the service refused extractChanges ({error}), so the whole service was read again and diffed locally"
+                ));
+            }
+        };
+        // past the submit the job is the service's own, and a job that fails
+        // or never finishes is an error rather than a quiet re-read of
+        // everything: only the operator can decide to pay for that
+        Ok(DeltaPath::Changes(changes::collect(
+            self.fetch.as_ref(),
+            &status,
+        )?))
     }
 
     fn extract_inner(
@@ -165,13 +244,36 @@ impl ArcgisSource {
                             losses: vec![reason],
                         });
                         if layer.has_attachments {
-                            placed.push((verdict::attachment_item(layer), left_of_delta()));
+                            placed.push((
+                                verdict::attachment_item(layer),
+                                left_of_delta(AttachmentEdits::default()),
+                            ));
                         }
                         continue;
                     }
                 },
             };
-            let incremental = basis.is_some();
+            // what the service said changed on this layer, where it was asked
+            let changed = match (&previous, &layer.object_id_field) {
+                (Some(held), Some(oid_field)) => match &held.path {
+                    DeltaPath::Changes(file) => Some(file.layer(layer.id, oid_field)),
+                    DeltaPath::LocalDiff(_) => None,
+                },
+                _ => None,
+            };
+            let attachment_edits = changed
+                .as_ref()
+                .map(|changes| changes.attachments)
+                .unwrap_or_default();
+            let pass = match (basis, changed) {
+                (None, _) => Pass::Full,
+                (Some(basis), None) => Pass::Diff(basis),
+                (Some(basis), Some(changes)) => Pass::Changed {
+                    changes,
+                    previous: basis,
+                },
+            };
+            let incremental = !matches!(pass, Pass::Full);
             let (file, minted) = write_layer(
                 self.fetch.as_ref(),
                 &service.url,
@@ -179,7 +281,7 @@ impl ArcgisSource {
                 &dataset_name,
                 service.gdb_version.as_deref(),
                 directory,
-                basis,
+                pass,
             )?;
             datasets[plan_index].features = file.path.clone();
             conversions.push(Conversion {
@@ -200,7 +302,10 @@ impl ArcgisSource {
                     // not diffed: what the full extraction attached stands,
                     // and pairing attachment changes would need a second
                     // listing pass this path does not make
-                    placed.push((verdict::attachment_item(layer), left_of_delta()));
+                    placed.push((
+                        verdict::attachment_item(layer),
+                        left_of_delta(attachment_edits),
+                    ));
                 } else {
                     let carried = self.attachments(
                         layer,
@@ -215,6 +320,24 @@ impl ArcgisSource {
             }
         }
         if let Some(held) = &previous {
+            // which of the two delta paths ran, and why it was that one
+            conversions.push(match &held.path {
+                DeltaPath::Changes(_) => Conversion {
+                    location: verdict::ROOT.into(),
+                    kind: ItemKind::Temporal,
+                    detail: "delta read from extractChanges".into(),
+                    destination: Some("the delta's feature files".into()),
+                    losses: Vec::new(),
+                },
+                DeltaPath::LocalDiff(reason) => Conversion {
+                    location: verdict::ROOT.into(),
+                    kind: ItemKind::Temporal,
+                    detail: "delta found by reading the service again and diffing it against the previous extraction"
+                        .into(),
+                    destination: Some("the delta's feature files".into()),
+                    losses: vec![reason.clone()],
+                },
+            });
             // a dataset of the previous extraction the service no longer
             // lists: its features stand in ptolemy, and deleting a whole
             // dataset is a decision for an operator, not a diff
@@ -268,6 +391,41 @@ impl ArcgisSource {
             }
         }
 
+        // the cursor this extraction can be continued from: what the service
+        // published at a full read, or what the change file's window ended at
+        let gens: BTreeMap<i64, u64> = match &previous {
+            None if service.change_tracking => service
+                .layer_server_gens
+                .iter()
+                .map(|held| (held.id, held.server_gen))
+                .collect(),
+            Some(held) => match &held.path {
+                DeltaPath::Changes(file) => file.gens(),
+                DeltaPath::LocalDiff(_) => BTreeMap::new(),
+            },
+            None => BTreeMap::new(),
+        };
+        let recorded: Vec<RecordedGen> = planned
+            .iter()
+            .zip(&datasets)
+            .filter_map(|(layer, plan)| {
+                Some(RecordedGen {
+                    dataset: plan.dataset.name.clone(),
+                    layer: layer.id,
+                    server_gen: *gens.get(&layer.id)?,
+                })
+            })
+            .collect();
+        if !recorded.is_empty() {
+            changes::write(
+                directory,
+                &RecordedGens {
+                    service: service.url.clone(),
+                    layers: recorded,
+                },
+            )?;
+        }
+
         let sidecar = Sidecar {
             source: self.describe(),
             incremental: previous.is_some(),
@@ -308,17 +466,39 @@ struct Conversion {
     losses: Vec<String>,
 }
 
-/// The full extraction a delta diffs against.
+/// The earlier extraction a delta is measured from, and how.
 struct Previous {
     directory: PathBuf,
     sidecar: Sidecar,
+    path: DeltaPath,
 }
 
-/// Where a delta leaves a layer's attachments.
-fn left_of_delta() -> Placed {
-    Placed::Left(
-        "a delta carries feature operations only; the attachments the full extraction carried stand, and changes to them are not diffed".into(),
-    )
+/// How a delta finds what changed, decided once for the whole run before any
+/// layer is read.
+enum DeltaPath {
+    /// The service named what changed, and this is what it said.
+    Changes(ChangeFile),
+    /// The whole service is read again and paired with the previous
+    /// extraction's feature files, for the reason held here.
+    LocalDiff(String),
+}
+
+/// Where a delta leaves a layer's attachments, and what the service said it
+/// missed by leaving them.
+fn left_of_delta(edits: AttachmentEdits) -> Placed {
+    let mut reason =
+        "a delta carries feature operations only; the attachments the full extraction carried stand, and changes to them are not diffed"
+            .to_string();
+    if edits.any() {
+        reason.push_str(&format!(
+            "; the service counted {} added, {} updated and {} deleted attachment{} in this window, which a full extraction would pick up",
+            edits.added,
+            edits.updated,
+            edits.deleted,
+            plural(edits.added + edits.updated + edits.deleted)
+        ));
+    }
+    Placed::Left(reason)
 }
 
 /// Why a thing the inventory judged was not written out, for a row that could
@@ -677,6 +857,19 @@ fn new_relationship(
 
 // ─── Features ───────────────────────────────────────────────────────
 
+/// How one layer's rows are read and what they are compared against.
+enum Pass {
+    /// Every row of the layer, and every row is an insert.
+    Full,
+    /// Every row again, paired with the previous extraction by object id.
+    Diff(PrevFeatures),
+    /// Only the object ids the service said changed, paired the same way.
+    Changed {
+        changes: LayerChanges,
+        previous: PrevFeatures,
+    },
+}
+
 /// What writing one layer's features came to.
 struct FeatureFile {
     path: Option<String>,
@@ -867,10 +1060,15 @@ struct RawFeature {
 /// One layer's features as commit operations, and the object id of every
 /// feature that was written, keyed for the attachments that hang off them.
 ///
-/// With no `previous`, every row is an insert. With one, the row's object id
-/// decides: unknown ids are inserts, known ids are updates when the hash
-/// says they changed and a count when it says they did not, and whatever is
-/// left of `previous` at the end vanished from the service and is a delete.
+/// On a full pass every row is an insert. On either delta pass the row's
+/// object id decides: unknown ids are inserts, known ids are updates when the
+/// hash says they changed and a count when it says they did not.
+///
+/// What counts as a delete is the one thing the two delta passes part over. A
+/// local diff sees the whole current state, so whatever is left of the
+/// previous extraction at the end vanished from the service. A change pass
+/// sees only what it asked for, so a delete is one the service named, and one
+/// it named that the previous extraction never held is counted and dropped.
 fn write_layer(
     fetch: &dyn Fetch,
     url: &str,
@@ -878,7 +1076,7 @@ fn write_layer(
     dataset: &str,
     gdb_version: Option<&str>,
     directory: &Path,
-    previous: Option<PrevFeatures>,
+    pass: Pass,
 ) -> Result<(FeatureFile, BTreeMap<String, String>), ArcgisError> {
     let relative = format!("{FEATURES_DIR}/{}.ndjson", safe_file_name(dataset));
     let path = directory.join(&relative);
@@ -914,8 +1112,12 @@ fn write_layer(
     let mut minted = BTreeMap::new();
     let mut tally = Tally::default();
     let mut losses = Vec::new();
+    let (mut previous, changed) = match pass {
+        Pass::Full => (None, None),
+        Pass::Diff(previous) => (Some(previous), None),
+        Pass::Changed { changes, previous } => (Some(previous), Some(changes)),
+    };
     let diffed = previous.is_some();
-    let mut previous = previous;
     if let Some(prev) = &mut previous {
         losses.append(&mut prev.losses);
     }
@@ -933,58 +1135,32 @@ fn write_layer(
         }
         (None, _) => None,
     };
-    let mut offset: u64 = 0;
-    let mut empty_pages = 0u32;
+    // the change pass asks for the ids the service named, in batches the size
+    // of a page it would have answered anyway
+    let batch_size = usize::try_from(page_size).unwrap_or(usize::MAX).max(1);
+    let mut batches = changed
+        .as_ref()
+        .map(|changes| {
+            changes
+                .touched
+                .chunks(batch_size)
+                .map(<[String]>::to_vec)
+                .collect::<Vec<Vec<String>>>()
+        })
+        .unwrap_or_default()
+        .into_iter();
+    let mut paging = Paging::default();
     loop {
-        let mut params: Vec<(&str, String)> =
-            vec![("where", "1=1".to_string()), ("outFields", "*".to_string())];
-        if let Some(version) = gdb_version {
-            params.push(("gdbVersion", version.to_string()));
-        }
-        if layer.geometry_type.is_some() {
-            params.push(("returnGeometry", "true".to_string()));
-            params.push(("outSR", PTOLEMY_SRID.to_string()));
-            if layer.has_z {
-                params.push(("returnZ", "true".to_string()));
-            }
-            if layer.has_m {
-                params.push(("returnM", "true".to_string()));
-            }
-        } else {
-            params.push(("returnGeometry", "false".to_string()));
-        }
-        if layer.supports_pagination {
-            params.push(("resultOffset", offset.to_string()));
-            params.push(("resultRecordCount", page_size.to_string()));
-            if let Some(oid) = &layer.object_id_field {
-                params.push(("orderByFields", oid.clone()));
-            }
-        }
-        let value = json(fetch, &route, &params)?;
-        let page: RawPage =
-            serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
-                route: route.clone(),
-                message: error.to_string(),
-            })?;
-
-        if page.features.is_empty() {
-            if page.exceeded_transfer_limit && layer.supports_pagination {
-                // the docs allow an empty page with the flag still up; move
-                // past it, but not forever
-                empty_pages += 1;
-                offset += page_size;
-                if empty_pages >= 3 {
-                    losses.push(
-                        "the service kept answering empty pages with exceededTransferLimit still set, so the extraction stopped asking; features past that point were not fetched".to_string(),
-                    );
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        empty_pages = 0;
-        offset += page.features.len() as u64;
+        let page = match &changed {
+            None => match paging.next(fetch, &route, layer, gdb_version, &mut losses)? {
+                Some(page) => page,
+                None => break,
+            },
+            Some(_) => match batches.next() {
+                Some(batch) => changed_page(fetch, &route, layer, gdb_version, &batch)?,
+                None => break,
+            },
+        };
 
         // the same rows again, untransformed, asked for by the object ids this
         // page just delivered so an edit mid-extraction cannot skew the pairing
@@ -1116,23 +1292,22 @@ fn write_layer(
                 }
             }
         }
-
-        if !page.exceeded_transfer_limit {
-            break;
-        }
-        if !layer.supports_pagination {
-            losses.push(format!(
-                "the service answers at most {} record{} at a time and does not support pagination, so only the first page was fetched and the rest of the layer is not in the extraction",
-                page.features.len(),
-                plural(page.features.len())
-            ));
-            break;
-        }
     }
-    // whatever the current state never answered for vanished from the
-    // service since the previous extraction
-    if let Some(prev) = previous {
-        for (_, (feature_id, _)) in prev.map {
+    if let Some(mut prev) = previous {
+        // on a local diff, whatever the current state never answered for
+        // vanished from the service; on a change pass only the ids the service
+        // named as deleted are gone, and the rest of the previous extraction
+        // was never asked about
+        let deletes: Vec<String> = match &changed {
+            None => prev.map.keys().cloned().collect(),
+            Some(changes) => changes.deleted.clone(),
+        };
+        let mut unknown = 0usize;
+        for oid in deletes {
+            let Some((feature_id, _)) = prev.map.remove(&oid) else {
+                unknown += 1;
+                continue;
+            };
             let line = serde_json::to_string(&FeatureOp::Delete(DeleteFeature { feature_id }))
                 .expect("a delete holds only serialisable values");
             writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
@@ -1141,6 +1316,14 @@ fn write_layer(
             })?;
             tally.written += 1;
             tally.deleted += 1;
+        }
+        if unknown > 0 {
+            losses.push(format!(
+                "the service says {unknown} object id{} {} deleted, and the previous extraction holds no feature for {}, so nothing was written to delete",
+                plural(unknown),
+                if unknown == 1 { "was" } else { "were" },
+                if unknown == 1 { "it" } else { "them" }
+            ));
         }
     }
     out.flush().map_err(|source| ArcgisError::Write {
@@ -1163,6 +1346,120 @@ fn write_layer(
         },
         minted,
     ))
+}
+
+/// The parameters every feature query shares: the columns, the geometry as
+/// ptolemy wants it, and the named version when the operator gave one.
+fn shape_params(layer: &Layer, gdb_version: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut params: Vec<(&str, String)> = vec![("outFields", "*".to_string())];
+    if let Some(version) = gdb_version {
+        params.push(("gdbVersion", version.to_string()));
+    }
+    if layer.geometry_type.is_some() {
+        params.push(("returnGeometry", "true".to_string()));
+        params.push(("outSR", PTOLEMY_SRID.to_string()));
+        if layer.has_z {
+            params.push(("returnZ", "true".to_string()));
+        }
+        if layer.has_m {
+            params.push(("returnM", "true".to_string()));
+        }
+    } else {
+        params.push(("returnGeometry", "false".to_string()));
+    }
+    params
+}
+
+/// Where the full pass has got to: the offset the next page starts at, how
+/// many empty pages with the transfer limit still up have gone by, and whether
+/// the service has said it has no more.
+#[derive(Default)]
+struct Paging {
+    offset: u64,
+    empty: u32,
+    done: bool,
+}
+
+impl Paging {
+    /// The next page of the layer, or `None` when the layer is exhausted. An
+    /// empty page with `exceededTransferLimit` still set is stepped over,
+    /// which the docs allow, but not forever.
+    fn next(
+        &mut self,
+        fetch: &dyn Fetch,
+        route: &str,
+        layer: &Layer,
+        gdb_version: Option<&str>,
+        losses: &mut Vec<String>,
+    ) -> Result<Option<RawPage>, ArcgisError> {
+        if self.done {
+            return Ok(None);
+        }
+        let page_size = layer.max_record_count.unwrap_or(DEFAULT_PAGE);
+        loop {
+            let mut params = shape_params(layer, gdb_version);
+            params.push(("where", "1=1".to_string()));
+            if layer.supports_pagination {
+                params.push(("resultOffset", self.offset.to_string()));
+                params.push(("resultRecordCount", page_size.to_string()));
+                if let Some(oid) = &layer.object_id_field {
+                    params.push(("orderByFields", oid.clone()));
+                }
+            }
+            let value = json(fetch, route, &params)?;
+            let page: RawPage =
+                serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+                    route: route.to_string(),
+                    message: error.to_string(),
+                })?;
+            if page.features.is_empty() {
+                if page.exceeded_transfer_limit && layer.supports_pagination {
+                    self.empty += 1;
+                    self.offset += page_size;
+                    if self.empty >= 3 {
+                        losses.push(
+                            "the service kept answering empty pages with exceededTransferLimit still set, so the extraction stopped asking; features past that point were not fetched".to_string(),
+                        );
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                return Ok(None);
+            }
+            self.empty = 0;
+            self.offset += page.features.len() as u64;
+            if !page.exceeded_transfer_limit {
+                self.done = true;
+            } else if !layer.supports_pagination {
+                losses.push(format!(
+                    "the service answers at most {} record{} at a time and does not support pagination, so only the first page was fetched and the rest of the layer is not in the extraction",
+                    page.features.len(),
+                    plural(page.features.len())
+                ));
+                self.done = true;
+            }
+            return Ok(Some(page));
+        }
+    }
+}
+
+/// One batch of the object ids a change file named, read the same way a page
+/// is. A POST because a thousand object ids do not fit in a URL, and no
+/// `where`: the id list is the whole of what is asked for.
+fn changed_page(
+    fetch: &dyn Fetch,
+    route: &str,
+    layer: &Layer,
+    gdb_version: Option<&str>,
+    oids: &[String],
+) -> Result<RawPage, ArcgisError> {
+    let mut params = shape_params(layer, gdb_version);
+    params.push(("objectIds", oids.join(",")));
+    let value = json_post(fetch, route, &params)?;
+    serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+        route: route.to_string(),
+        message: error.to_string(),
+    })
 }
 
 /// One page's rows again, untransformed: a POST of the page's object ids with

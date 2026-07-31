@@ -19,6 +19,7 @@ use verne_arcgis::{ArcgisError, Fetch};
 pub const ROOT: &str = "https://example.invalid/arcgis/rest/services/Fixture/FeatureServer";
 
 /// One request the adapter made, as the fake saw it.
+#[derive(Debug)]
 pub struct Call {
     /// The URL past the fake's root, so `/0/query` rather than the whole thing.
     pub route: String,
@@ -119,6 +120,13 @@ impl Fetch for Fake {
     fn post_form(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError> {
         self.answer("POST", url, params)
     }
+
+    /// The redirect a live service answers a result URL with is the client's
+    /// business, and it is tested against a socket; here the route answers the
+    /// file itself.
+    fn get_file(&self, url: &str) -> Result<Vec<u8>, ArcgisError> {
+        self.answer("GET", url, &[])
+    }
 }
 
 /// The service root: one layer and one table.
@@ -129,6 +137,25 @@ pub fn service_root() -> serde_json::Value {
         "layers": [{ "id": 0, "name": "Wells" }],
         "tables": [{ "id": 1, "name": "Logs" }]
     })
+}
+
+/// The same root from a service that tracks changes and publishes the
+/// generation window `extractChanges` takes back, one generation per layer.
+pub fn tracking_root(server_gen: u64) -> serde_json::Value {
+    let mut root = service_root();
+    let object = root.as_object_mut().expect("the root is an object");
+    object.insert("capabilities".into(), "Query,ChangeTracking".into());
+    object.insert(
+        "changeTrackingInfo".into(),
+        json!({
+            "lastSyncDate": 1743630690000i64,
+            "layerServerGens": [
+                { "id": 0, "serverGen": server_gen },
+                { "id": 1, "serverGen": server_gen }
+            ]
+        }),
+    );
+    root
 }
 
 /// The point layer: aliases, a coded and a range domain, a Date column, one

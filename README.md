@@ -200,10 +200,11 @@ features and the attachments all describe that version's state, and a wrong
 name fails the open rather than reading as an empty service. The tree itself
 is not carried, and the report says so: enumerating versions and diffing them
 is the Version Management resource, which demands an editing privilege and
-read-session locks verne will not take, and a change-tracking service is
-asked nothing either, because the generation window `extractChanges` needs is
-only obtainable here by registering a sync replica, which writes state on the
-server. Each refusal is a report row with the reason.
+read-session locks verne will not take. A service that tracks changes but
+publishes no `changeTrackingInfo` is asked nothing either, because the
+generation window `extractChanges` needs would then only come from registering
+a sync replica, which writes state on the server. Each refusal is a report row
+with the reason.
 
 A failed request is an error naming the route, including the ones ArcGIS
 answers with HTTP 200 and an error object in the body.
@@ -212,16 +213,34 @@ A service already extracted and loaded once can be re-read as a delta:
 `--since <dir>` points at the earlier full extraction, and only what changed
 lands on disk, as the insert, update and delete operations of ptolemy's
 commit route. `verne load` commits them onto the datasets the first load
-created and creates nothing. The diff is verne's own: the full current state
-is fetched again and paired with the previous feature files by object id,
-with a hash of geometry and properties deciding changed from unchanged, so an
-update keeps the feature id the first extraction minted and its history in
-ptolemy stays one feature. The service's `extractChanges` is not used, for
-the sync-replica reason above. What a delta does not carry is named in the
-log: attachments and relationship classes are not diffed, a layer without an
-object id field cannot be paired at all, and a layer that vanished from the
-service keeps its features in ptolemy rather than having a diff delete a
-whole dataset.
+created and creates nothing.
+
+Where the service can say what changed, it is asked. A full extraction of a
+service that publishes `changeTrackingInfo.layerServerGens` records those
+generations in `server-gens.json` beside the sidecar, and a later `--since`
+sends them back to `extractChanges`: the job it starts answers with the object
+ids edited since, and only those rows are fetched. The delta records the
+generations the window ended at, so the next one carries on from there. There
+is no flag for this, and no change to the sidecar `verne load` reads.
+
+Otherwise the diff is verne's own: the full current state is fetched again and
+paired with the previous feature files by object id. Either way a hash of
+geometry and properties decides changed from unchanged, an update keeps the
+feature id the first extraction minted so its history in ptolemy stays one
+feature, and the report says which of the two ran and why. It is the local
+diff whenever the previous extraction recorded no generations, the service
+stopped tracking changes, a queryable layer has no generation or no object id
+field, or the service refuses the request: one run is all one way, never half
+of each.
+
+What a delta does not carry is named in the log: attachments and relationship
+classes are not diffed, though a change file's attachment counts are reported
+so an operator knows a full re-extract would pick them up; a layer without an
+object id field cannot be paired at all; and a layer that vanished from the
+service keeps its features in ptolemy rather than having a diff delete a whole
+dataset. A delta is never a basis for another delta: its feature files hold
+only what changed, so the feature ids the rest of the datasets were loaded
+under are not in them, and that is true whichever path would run.
 
 `demo/migration-loop.sh` runs the whole story against a live service and a
 scratch ptolemy: full extract, load, delta, delta load, then verifies
@@ -251,7 +270,9 @@ sidecar.json  — the datasets, their column schemas, coded and range domains,
 
 From a feature service the GeoPackage is absent and everything else is the
 same, so `verne load` reads both extractions without knowing which it was
-handed.
+handed. A feature service that publishes a generation window leaves a fifth
+file, `server-gens.json`, which is the cursor the next `--since` sends back to
+`extractChanges`. Nothing but a later delta reads it.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the

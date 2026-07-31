@@ -5,7 +5,9 @@
 //! was. The token, when there is one, goes in the `X-Esri-Authorization`
 //! header, which works for web-tier and token-authenticated deployments
 //! alike, and never in the URL, where it would land in logs and process
-//! lists.
+//! lists. The one route it is dropped on rather than sent is a job's result
+//! file, whose pointer redirects to a signed URL on a host that is not the
+//! service.
 //!
 //! [`Fetch`] is a trait so the adapter can be exercised against canned
 //! responses: everything above it is deterministic, and the tests feed it
@@ -29,6 +31,11 @@ const MARGIN: Duration = Duration::from_secs(60);
 /// keeps a nonsense `expires_in` from overflowing the deadline.
 const LONGEST_LIFETIME: Duration = Duration::from_secs(20_160 * 60);
 
+/// How many redirects a job's result file may take before verne stops
+/// following. A live service takes one: the pointer answers with the signed
+/// URL of a file on storage.
+const REDIRECTS: usize = 4;
+
 /// One request against the service.
 pub trait Fetch {
     /// GET, with `params` in the query string.
@@ -38,11 +45,22 @@ pub trait Fetch {
     /// parameters either way, and the body is where an object id list goes
     /// when it would blow past what a URL can carry.
     fn post_form(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError>;
+
+    /// GET a file the service points at rather than serves: the result of an
+    /// `extractChanges` job, whose URL answers with a redirect to a signed one
+    /// on storage that is not the service. The token must not follow it there,
+    /// and the signed URL needs none.
+    fn get_file(&self, url: &str) -> Result<Vec<u8>, ArcgisError>;
 }
 
 /// The real client.
 pub struct HttpFetch {
     client: reqwest::blocking::Client,
+    /// A second client that follows nothing, for the result file whose pointer
+    /// redirects to another host. reqwest drops `Authorization` across a host
+    /// boundary and leaves a header it does not know alone, which is where the
+    /// token rides, so the redirect is followed by hand instead.
+    unfollowing: reqwest::blocking::Client,
     credentials: Credentials,
     /// The minted token, behind a lock because [`Fetch`] hands out `&self` and
     /// the mint is a write.
@@ -57,14 +75,17 @@ struct Minted {
 
 impl HttpFetch {
     pub fn new(credentials: Credentials) -> Result<Self, ArcgisError> {
-        let client = reqwest::blocking::Client::builder()
-            .build()
-            .map_err(|error| ArcgisError::Http {
+        let built = |builder: reqwest::blocking::ClientBuilder| {
+            builder.build().map_err(|error| ArcgisError::Http {
                 route: "building the HTTP client".into(),
                 message: error.to_string(),
-            })?;
+            })
+        };
         Ok(HttpFetch {
-            client,
+            client: built(reqwest::blocking::Client::builder())?,
+            unfollowing: built(
+                reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            )?,
             credentials,
             minted: Mutex::new(None),
         })
@@ -216,6 +237,73 @@ impl Fetch for HttpFetch {
     fn post_form(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError> {
         self.send(url, self.client.post(url).form(params))
     }
+
+    fn get_file(&self, url: &str) -> Result<Vec<u8>, ArcgisError> {
+        let first = reqwest::Url::parse(url).map_err(|error| ArcgisError::Http {
+            route: url.to_string(),
+            message: error.to_string(),
+        })?;
+        let mut next = first.clone();
+        for _ in 0..REDIRECTS {
+            let mut request = self.unfollowing.get(next.clone());
+            // the token goes to the service and to nowhere else: past the
+            // redirect the host is storage, and the URL is signed already
+            if same_host(&next, &first)
+                && let Some(token) = self.bearer()?
+            {
+                request = request.header("X-Esri-Authorization", format!("Bearer {token}"));
+            }
+            let response = request.send().map_err(|error| ArcgisError::Http {
+                route: next.to_string(),
+                message: error.to_string(),
+            })?;
+            let status = response.status();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| ArcgisError::BadShape {
+                        route: next.to_string(),
+                        message: format!(
+                            "answered {status} with no Location, so the file it points at cannot be reached"
+                        ),
+                    })?;
+                next = next.join(location).map_err(|error| ArcgisError::BadShape {
+                    route: next.to_string(),
+                    message: format!("redirected to {location}, which is not a URL: {error}"),
+                })?;
+                continue;
+            }
+            let bytes = response
+                .bytes()
+                .map_err(|error| ArcgisError::Http {
+                    route: next.to_string(),
+                    message: error.to_string(),
+                })?
+                .to_vec();
+            if !status.is_success() {
+                return Err(ArcgisError::Refused {
+                    route: next.to_string(),
+                    status: status.as_u16(),
+                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+            }
+            return Ok(bytes);
+        }
+        Err(ArcgisError::Http {
+            route: url.to_string(),
+            message: format!("redirected more than {REDIRECTS} times"),
+        })
+    }
+}
+
+/// Whether two URLs are the same origin, by the same rule reqwest drops a
+/// sensitive header on: host, port and scheme all have to match.
+fn same_host(next: &reqwest::Url, first: &reqwest::Url) -> bool {
+    next.host_str() == first.host_str()
+        && next.port_or_known_default() == first.port_or_known_default()
+        && next.scheme() == first.scheme()
 }
 
 /// A JSON resource, with `f=json` asked for and the body's own error object
@@ -246,7 +334,9 @@ fn with_format<'a>(params: &[(&'a str, String)]) -> Vec<(&'a str, String)> {
     all
 }
 
-fn parse(url: &str, bytes: &[u8]) -> Result<serde_json::Value, ArcgisError> {
+/// A JSON body, with the service's error convention applied to it whatever
+/// route it came off.
+pub fn parse(url: &str, bytes: &[u8]) -> Result<serde_json::Value, ArcgisError> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| ArcgisError::BadJson {
             route: url.to_string(),

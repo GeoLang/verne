@@ -27,6 +27,10 @@ enum Command {
         /// Also write the report as JSON to this path
         #[arg(long, value_name = "PATH")]
         json: Option<PathBuf>,
+        /// Named geodatabase version to read instead of the default, such as
+        /// SDE.DEFAULT; only a versioned enterprise service has any
+        #[arg(long, value_name = "NAME")]
+        gdb_version: Option<String>,
     },
     /// Write a source out as a sidecar ptolemy can load: a geodatabase also
     /// gets a GeoPackage, a feature service is fetched over REST
@@ -41,6 +45,9 @@ enum Command {
         /// Who is running this, recorded in the extraction log
         #[arg(long, value_name = "NAME")]
         operator: String,
+        /// Named geodatabase version to read instead of the default
+        #[arg(long, value_name = "NAME")]
+        gdb_version: Option<String>,
     },
     /// List the feature services a portal holds, one URL per line
     Services {
@@ -74,9 +81,13 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Inspect { source, json } => {
+        Command::Inspect {
+            source,
+            json,
+            gdb_version,
+        } => {
             let report = if is_url(&source) {
-                Report::build(&open_service(&source)?)?
+                Report::build(&open_service(&source, gdb_version)?)?
             } else {
                 let path = PathBuf::from(&source);
                 if is_geodatabase(&path) {
@@ -96,9 +107,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source,
             out,
             operator,
+            gdb_version,
         } => {
             if is_url(&source) {
-                extract_service(&source, &out, &operator)
+                extract_service(&source, &out, &operator, gdb_version)
             } else {
                 extract(&PathBuf::from(&source), &out, &operator)
             }
@@ -119,10 +131,14 @@ fn is_url(source: &str) -> bool {
 /// The portal a token is minted at when none is named.
 const DEFAULT_PORTAL: &str = "https://www.arcgis.com";
 
-fn open_service(url: &str) -> Result<verne_arcgis::ArcgisSource, Box<dyn std::error::Error>> {
+fn open_service(
+    url: &str,
+    gdb_version: Option<String>,
+) -> Result<verne_arcgis::ArcgisSource, Box<dyn std::error::Error>> {
     Ok(verne_arcgis::ArcgisSource::open(
         url,
         arcgis_credentials()?,
+        gdb_version,
     )?)
 }
 
@@ -171,8 +187,9 @@ fn extract_service(
     url: &str,
     out: &Path,
     operator: &str,
+    gdb_version: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let extraction = open_service(url)?.extract(out, operator)?;
+    let extraction = open_service(url, gdb_version)?.extract(out, operator)?;
     println!("{}", extraction.sidecar.log.to_markdown());
     eprintln!("wrote {}", extraction.sidecar_path.display());
     Ok(())

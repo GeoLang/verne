@@ -20,10 +20,24 @@ pub struct Service {
     /// The one layer the operator's URL scoped verne to, when it named one.
     /// `layers` then holds it and nothing else.
     pub scope: Option<i64>,
+    /// The geodatabase version every query is asked against, when the
+    /// operator named one. Absent means the default version, which is the
+    /// only one a service will name unprompted: there is no REST resource
+    /// here that lists versions, so knowing the name is the operator's part.
+    pub gdb_version: Option<String>,
     pub description: Option<String>,
     /// `hasVersionedData`: only an enterprise geodatabase behind the service
     /// can make this true.
     pub versioned: bool,
+    /// Whether the service's capabilities include ChangeTracking, which is
+    /// what would let a client ask `extractChanges` what changed between two
+    /// generations.
+    pub change_tracking: bool,
+    /// Whether the service publishes `changeTrackingInfo`, the generation
+    /// window `extractChanges` needs. A service can track changes and still
+    /// keep this null, and then only a sync replica could obtain generations,
+    /// which registers state on the server and is not verne's to do.
+    pub change_generations: bool,
     pub layers: Vec<Layer>,
 }
 
@@ -170,6 +184,10 @@ struct RawService {
     description: Option<String>,
     #[serde(default)]
     has_versioned_data: bool,
+    #[serde(default)]
+    capabilities: String,
+    #[serde(default)]
+    change_tracking_info: Option<serde_json::Value>,
     #[serde(default)]
     layers: Vec<RawListed>,
     #[serde(default)]
@@ -369,6 +387,11 @@ pub fn parse_service(json: &serde_json::Value) -> Result<(ServiceHead, Vec<i64>)
                 .or(raw.description)
                 .filter(|text| !text.trim().is_empty()),
             versioned: raw.has_versioned_data,
+            change_tracking: raw
+                .capabilities
+                .split(',')
+                .any(|held| held.trim() == "ChangeTracking"),
+            change_generations: raw.change_tracking_info.is_some_and(|info| !info.is_null()),
         },
         ids,
     ))
@@ -378,6 +401,8 @@ pub fn parse_service(json: &serde_json::Value) -> Result<(ServiceHead, Vec<i64>)
 pub struct ServiceHead {
     pub description: Option<String>,
     pub versioned: bool,
+    pub change_tracking: bool,
+    pub change_generations: bool,
 }
 
 pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {

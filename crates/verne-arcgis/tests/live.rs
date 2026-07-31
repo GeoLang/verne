@@ -32,7 +32,7 @@ fn a_live_feature_service_inventories_and_extracts() {
         Some(token) => Credentials::Token(token),
         None => Credentials::Anonymous,
     };
-    let source = ArcgisSource::open(&url, credentials).expect("the service opens");
+    let source = ArcgisSource::open(&url, credentials, None).expect("the service opens");
     eprintln!("{:?}", source.describe());
 
     let items = source.inventory().expect("the service inventories");

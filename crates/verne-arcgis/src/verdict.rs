@@ -70,7 +70,27 @@ pub fn items(service: &Service) -> Vec<Item> {
     }
     items.extend(relationship_items(service));
     items.push(versioning_item(service));
+    if service.change_tracking {
+        items.push(change_tracking_item(service));
+    }
     items
+}
+
+/// Change tracking is what would let a client ask `extractChanges` what
+/// changed between two generations. verne extracts the current state in full
+/// and does not call it, and the row says which half of that is choice and
+/// which is the server's.
+fn change_tracking_item(service: &Service) -> Item {
+    Item::new(
+        ROOT,
+        ItemKind::Temporal,
+        "change tracking",
+        Verdict::unsupported(if service.change_generations {
+            "the service tracks changes and publishes its generation window; verne extracts the current state in full rather than asking extractChanges what changed, so edits between two extractions are found by extracting again"
+        } else {
+            "the service tracks changes but publishes no changeTrackingInfo, so the generation window extractChanges needs could only come from registering a sync replica, which writes state on the server and is not verne's to do; the current state comes across in full"
+        }),
+    )
 }
 
 /// A group layer is the map's tree, and ptolemy has no container above a
@@ -664,9 +684,12 @@ fn versioning_item(service: &Service) -> Item {
         .map(|layer| layer.name.as_str())
         .collect();
     let verdict = if service.versioned || !versioned.is_empty() {
-        Verdict::unsupported(
-            "the service fronts versioned data and verne queries only the default version it answers with; the version tree, its edits and its conflicts are not read, so nothing here reaches geogit's branches",
-        )
+        Verdict::unsupported(match &service.gdb_version {
+            Some(version) => format!(
+                "the service fronts versioned data and every query here asked for version {version}, so that one version's state comes across per extraction; the tree itself, its edits and its conflicts are not read, so nothing here reaches geogit's branches"
+            ),
+            None => "the service fronts versioned data and verne queries only the default version it answers with; a named version can be read with --gdb-version, one per extraction, but the version tree, its edits and its conflicts are not read, so nothing here reaches geogit's branches".to_string(),
+        })
     } else {
         Verdict::not_applicable(
             "the service reports no versioned data, so there is no version tree to carry",

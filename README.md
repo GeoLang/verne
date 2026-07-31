@@ -194,6 +194,17 @@ lands on the feature it belongs to through the object ids the feature pass
 recorded. A blob that belongs to no feature the extraction wrote is skipped
 and counted, never guessed onto another one.
 
+An enterprise service fronting versioned data can be read one named version
+at a time: `--gdb-version` puts the name on every query, so the counts, the
+features and the attachments all describe that version's state, and a wrong
+name fails the open rather than reading as an empty service. The tree itself
+is not carried, and the report says so: enumerating versions and diffing them
+is the Version Management resource, which demands an editing privilege and
+read-session locks verne will not take, and a change-tracking service is
+asked nothing either, because the generation window `extractChanges` needs is
+only obtainable here by registering a sync replica, which writes state on the
+server. Each refusal is a report row with the reason.
+
 A failed request is an error naming the route, including the ones ArcGIS
 answers with HTTP 200 and an error object in the body.
 

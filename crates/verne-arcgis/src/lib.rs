@@ -118,19 +118,38 @@ pub struct ArcgisSource {
 impl ArcgisSource {
     /// Fetch the service and every layer it lists. The credentials are sent on
     /// every request; a public service needs none.
-    pub fn open(url: &str, credentials: Credentials) -> Result<Self, ArcgisError> {
+    ///
+    /// `gdb_version` is a named geodatabase version to read instead of the
+    /// default, such as `SDE.DEFAULT` or an editor's own. It rides on every
+    /// query, so the counts, the features and the attachments all describe
+    /// that version's state. No REST resource here lists versions, so the
+    /// name is the operator's to know; a wrong one fails the open loudly.
+    pub fn open(
+        url: &str,
+        credentials: Credentials,
+        gdb_version: Option<String>,
+    ) -> Result<Self, ArcgisError> {
         let fetch = HttpFetch::new(credentials)?;
-        Self::open_with(Box::new(fetch), url)
+        Self::open_with_version(Box::new(fetch), url, gdb_version)
     }
 
-    /// The same open against any [`Fetch`], which is what lets the tests feed
+    /// [`Self::open_with_version`] against the default version.
+    pub fn open_with(fetch: Box<dyn Fetch>, url: &str) -> Result<Self, ArcgisError> {
+        Self::open_with_version(fetch, url, None)
+    }
+
+    /// The open against any [`Fetch`], which is what lets the tests feed
     /// canned responses instead of standing up a server.
     ///
     /// A URL ending in a layer id, which is how a portal names its items,
     /// scopes the source to that one layer: only it is fetched, inventoried
     /// and extracted, and a relationship whose other side is out of scope is
     /// reported rather than followed.
-    pub fn open_with(fetch: Box<dyn Fetch>, url: &str) -> Result<Self, ArcgisError> {
+    pub fn open_with_version(
+        fetch: Box<dyn Fetch>,
+        url: &str,
+        gdb_version: Option<String>,
+    ) -> Result<Self, ArcgisError> {
         let (url, format, scope) = normalize(url)?;
         let root = client::json(fetch.as_ref(), &url, &[])?;
         let (head, ids) =
@@ -162,7 +181,13 @@ impl ArcgisSource {
             // a group or raster layer holds no rows to count, and a real
             // MapServer refuses the question
             if layer.queryable() {
-                layer.count = count(fetch.as_ref(), &url, layer.id);
+                layer.count = match count(fetch.as_ref(), &url, layer.id, gdb_version.as_deref()) {
+                    Ok(counted) => counted,
+                    // a named version that fails is the operator's typo
+                    // and must fail the open, not read as an empty layer
+                    Err(error) if gdb_version.is_some() => return Err(error),
+                    Err(_) => None,
+                };
             }
             layers.push(layer);
         }
@@ -174,8 +199,11 @@ impl ArcgisSource {
                 url,
                 format,
                 scope,
+                gdb_version,
                 description: head.description,
                 versioned: head.versioned,
+                change_tracking: head.change_tracking,
+                change_generations: head.change_generations,
                 layers,
             },
             fetch,
@@ -187,20 +215,24 @@ impl ArcgisSource {
     }
 }
 
-/// How many features a layer holds, asked for cheaply. A layer that will not
-/// answer is a layer with no count, not a failed open: the inventory still
-/// stands and the extraction will name the refusal itself.
-fn count(fetch: &dyn Fetch, url: &str, id: i64) -> Option<u64> {
-    let value = client::json(
-        fetch,
-        &format!("{url}/{id}/query"),
-        &[
-            ("where", "1=1".to_string()),
-            ("returnCountOnly", "true".to_string()),
-        ],
-    )
-    .ok()?;
-    value.get("count").and_then(serde_json::Value::as_u64)
+/// How many features a layer holds, asked for cheaply. The caller decides
+/// what a refusal means: without a named version it is a layer with no
+/// count, with one it is the operator's typo.
+fn count(
+    fetch: &dyn Fetch,
+    url: &str,
+    id: i64,
+    gdb_version: Option<&str>,
+) -> Result<Option<u64>, ArcgisError> {
+    let mut params = vec![
+        ("where", "1=1".to_string()),
+        ("returnCountOnly", "true".to_string()),
+    ];
+    if let Some(version) = gdb_version {
+        params.push(("gdbVersion", version.to_string()));
+    }
+    let value = client::json(fetch, &format!("{url}/{id}/query"), &params)?;
+    Ok(value.get("count").and_then(serde_json::Value::as_u64))
 }
 
 /// The FeatureServer or MapServer root, what to call it, and the one layer
@@ -272,6 +304,9 @@ impl Source for ArcgisSource {
                 ", {rasters} raster layer{}",
                 if rasters == 1 { "" } else { "s" }
             ));
+        }
+        if let Some(version) = &self.service.gdb_version {
+            detail.push_str(&format!(", read at version {version}"));
         }
         if let Some(description) = &self.service.description {
             detail.push_str(&format!(". {description}"));

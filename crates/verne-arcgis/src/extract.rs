@@ -87,6 +87,7 @@ impl ArcgisSource {
                 &service.url,
                 layer,
                 &dataset_name,
+                service.gdb_version.as_deref(),
                 directory,
             )?;
             datasets[plan_index].features = file.path.clone();
@@ -610,6 +611,7 @@ fn write_layer(
     url: &str,
     layer: &Layer,
     dataset: &str,
+    gdb_version: Option<&str>,
     directory: &Path,
 ) -> Result<(FeatureFile, BTreeMap<String, String>), ArcgisError> {
     let relative = format!("{FEATURES_DIR}/{}.ndjson", safe_file_name(dataset));
@@ -665,6 +667,9 @@ fn write_layer(
     loop {
         let mut params: Vec<(&str, String)> =
             vec![("where", "1=1".to_string()), ("outFields", "*".to_string())];
+        if let Some(version) = gdb_version {
+            params.push(("gdbVersion", version.to_string()));
+        }
         if layer.geometry_type.is_some() {
             params.push(("returnGeometry", "true".to_string()));
             params.push(("outSR", PTOLEMY_SRID.to_string()));
@@ -713,7 +718,7 @@ fn write_layer(
         // the same rows again, untransformed, asked for by the object ids this
         // page just delivered so an edit mid-extraction cannot skew the pairing
         let natives = match &original {
-            Some(_) => native_page(fetch, &route, layer, &page, &mut tally)?,
+            Some(_) => native_page(fetch, &route, layer, gdb_version, &page, &mut tally)?,
             None => BTreeMap::new(),
         };
 
@@ -835,6 +840,7 @@ fn native_page(
     fetch: &dyn Fetch,
     route: &str,
     layer: &Layer,
+    gdb_version: Option<&str>,
     page: &RawPage,
     tally: &mut Tally,
 ) -> Result<BTreeMap<String, String>, ArcgisError> {
@@ -855,6 +861,9 @@ fn native_page(
         ("outFields", oid_field.to_string()),
         ("returnGeometry", "true".to_string()),
     ];
+    if let Some(version) = gdb_version {
+        params.push(("gdbVersion", version.to_string()));
+    }
     if layer.has_z {
         params.push(("returnZ", "true".to_string()));
     }
@@ -1243,7 +1252,11 @@ impl ArcgisSource {
                     .map(|oid| oid.as_str())
                     .collect::<Vec<&str>>()
                     .join(",");
-                let value = json(self.fetch.as_ref(), &route, &[("objectIds", ids)])?;
+                let mut params = vec![("objectIds", ids)];
+                if let Some(version) = &self.service.gdb_version {
+                    params.push(("gdbVersion", version.clone()));
+                }
+                let value = json(self.fetch.as_ref(), &route, &params)?;
                 let groups: RawGroups =
                     serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
                         route: route.clone(),
@@ -1260,7 +1273,11 @@ impl ArcgisSource {
         }
         for oid in oids {
             let route = format!("{}/{}/{oid}/attachments", self.service.url, layer.id);
-            let value = json(self.fetch.as_ref(), &route, &[])?;
+            let mut params: Vec<(&str, String)> = Vec::new();
+            if let Some(version) = &self.service.gdb_version {
+                params.push(("gdbVersion", version.clone()));
+            }
+            let value = json(self.fetch.as_ref(), &route, &params)?;
             let infos: RawInfos =
                 serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
                     route: route.clone(),

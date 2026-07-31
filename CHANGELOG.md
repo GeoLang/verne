@@ -38,6 +38,13 @@ All notable changes to this project will be documented in this file.
 - A FeatureServer URL ending in a layer id scopes inspect and extract to that
   one layer, which is the shape a portal's item URLs come in, so the listing
   pipes straight into `verne inspect`.
+- `--gdb-version` reads a named geodatabase version of a versioned enterprise
+  service: the name rides on every query, count, feature page, native pass
+  and attachment listing, and a wrong name fails the open loudly. The
+  versioning and change-tracking report rows say what is deliberately not
+  done: no version enumeration or differences (needs the Version Management
+  resource's editing privilege and read locks) and no extractChanges (the
+  generation window is only obtainable here by registering a sync replica).
 - MapServer roots read through the same contract: group layers become
   hierarchy rows and their members flat datasets, raster layers are named for
   terrano and not fetched, per-layer `isDataVersioned` reaches the versioning

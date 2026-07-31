@@ -146,6 +146,7 @@ impl GdbSource {
 
         let sidecar = Sidecar {
             source: self.describe(),
+            incremental: false,
             geopackage: Some(GEOPACKAGE_FILE.to_string()),
             datasets,
             relationships,
@@ -366,6 +367,7 @@ fn dataset_plans(
             source_table: table.name.clone(),
             layer: None,
             features: None,
+            object_id_field: None,
             dataset: NewDataset {
                 name: table.name.clone(),
                 srid: PTOLEMY_SRID,
@@ -758,6 +760,7 @@ mod tests {
                 source_table: (*name).to_string(),
                 layer: None,
                 features: None,
+                object_id_field: None,
                 dataset: NewDataset {
                     name: (*name).to_string(),
                     srid: PTOLEMY_SRID,

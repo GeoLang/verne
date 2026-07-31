@@ -106,6 +106,18 @@ pub enum ArcgisError {
         #[source]
         source: std::io::Error,
     },
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{path} is not an extraction verne wrote: {message}")]
+    BadPrevious { path: String, message: String },
+    #[error(
+        "the extraction at {path} is itself a delta; --since diffs against the full extraction the datasets were first loaded from"
+    )]
+    DeltaPrevious { path: String },
 }
 
 /// A feature service, its metadata fetched at open. The queries an extraction

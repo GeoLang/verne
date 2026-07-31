@@ -50,3 +50,12 @@ All notable changes to this project will be documented in this file.
   terrano and not fetched, per-layer `isDataVersioned` reaches the versioning
   row, and an object id declared only as a field still orders the pages and
   keys the native pass.
+- `verne extract --since <dir>` diffs a feature service against an earlier
+  full extraction and writes only the insert, update and delete operations of
+  ptolemy's commit route, paired by object id with a hash deciding changed
+  from unchanged; `verne load` commits the delta onto the datasets the first
+  load created and creates nothing. Attachments and relationship classes are
+  not diffed, and a layer without an object id field gets no delta, both said
+  in the log. serde_json's `float_roundtrip` is on throughout: its best-effort
+  parsing does not round-trip its own shortest output, which made
+  server-computed floats hash as changed on every delta.

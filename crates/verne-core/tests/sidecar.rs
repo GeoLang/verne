@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 
 use verne_core::sidecar::{Action, ExtractionLog, LogEntry};
 use verne_core::{
-    DatasetPlan, Item, ItemKind, Losses, NewAttachment, NewDataset, NewDomain, NewFeature,
-    NewField, NewRelationship, NewSchema, NewSubtype, Sidecar, SourceDescription, Target, Verdict,
+    DatasetPlan, DeleteFeature, FeatureOp, Item, ItemKind, Losses, NewAttachment, NewDataset,
+    NewDomain, NewFeature, NewField, NewRelationship, NewSchema, NewSubtype, Sidecar,
+    SourceDescription, Target, UpdateFeature, Verdict,
 };
 
 fn faithful(location: &str) -> Item {
@@ -184,11 +185,13 @@ fn a_sidecar() -> Sidecar {
 
     Sidecar {
         source: SourceDescription::new("Esri file geodatabase", "/data/wells.gdb"),
+        incremental: false,
         geopackage: Some("features.gpkg".into()),
         datasets: vec![DatasetPlan {
             source_table: "wells".into(),
             layer: Some("wells".into()),
             features: Some("features/wells.ndjson".into()),
+            object_id_field: None,
             dataset: NewDataset {
                 name: "wells".into(),
                 srid: 4326,
@@ -419,4 +422,72 @@ fn a_transformed_feature_carries_its_original_and_code() {
     assert_eq!(json["native_srid"], 26919);
     let read: NewFeature = serde_json::from_value(json).expect("a line reads back");
     assert_eq!(read, feature);
+}
+
+/// An update line is a whole `update` operation of ptolemy's commit route,
+/// keyed on the id the previous extraction minted.
+#[test]
+fn an_update_serialises_as_ptolemys_update_operation() {
+    let update = UpdateFeature {
+        feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+        geometry_wkb_hex: Some("0101000000000000000000f03f0000000000000040".into()),
+        properties: serde_json::json!({ "depth": 121 }).as_object().cloned(),
+        native_geometry_wkb_hex: None,
+        native_srid: None,
+        native_crs_wkt: None,
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&update).expect("serialises")).expect("json");
+
+    assert_eq!(json["type"], "update");
+    assert_eq!(json["feature_id"], "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
+    assert_eq!(json["properties"]["depth"], 121);
+    // ptolemy defaults an absent original to "no original"; the keys must not
+    // be on the wire as nulls
+    let object = json.as_object().expect("an object");
+    assert!(!object.contains_key("native_geometry_wkb_hex"));
+    assert!(!object.contains_key("native_srid"));
+}
+
+#[test]
+fn a_delete_serialises_as_ptolemys_delete_operation() {
+    let delete = DeleteFeature {
+        feature_id: "019fb3fc-e521-7d70-80d3-3ee920a0e0d7".into(),
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&delete).expect("serialises")).expect("json");
+    assert_eq!(json["type"], "delete");
+    assert_eq!(json["feature_id"], "019fb3fc-e521-7d70-80d3-3ee920a0e0d7");
+}
+
+/// A feature file line reads back as the operation its tag says, so a delete
+/// carrying only a feature id cannot be misread as a bare update.
+#[test]
+fn a_feature_op_line_reads_back_by_its_tag() {
+    let ops = [
+        FeatureOp::Insert(NewFeature {
+            feature_id: "a".into(),
+            geometry_wkb_hex: "010700000000000000".into(),
+            properties: serde_json::Map::new(),
+            native_geometry_wkb_hex: None,
+            native_srid: None,
+            native_crs_wkt: None,
+        }),
+        FeatureOp::Update(UpdateFeature {
+            feature_id: "b".into(),
+            geometry_wkb_hex: None,
+            properties: None,
+            native_geometry_wkb_hex: None,
+            native_srid: None,
+            native_crs_wkt: None,
+        }),
+        FeatureOp::Delete(DeleteFeature {
+            feature_id: "c".into(),
+        }),
+    ];
+    for op in &ops {
+        let line = serde_json::to_string(op).expect("serialises");
+        let read: FeatureOp = serde_json::from_str(&line).expect("a line reads back");
+        assert_eq!(&read, op, "{line}");
+    }
 }

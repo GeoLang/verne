@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use verne_core::{
-    ATTACHMENTS_DIR, DatasetPlan, ExtractionLog, FEATURES_DIR, Item, ItemKind, MAX_FEATURE_BYTES,
-    NewAttachment, NewDataset, NewDomain, NewFeature, NewField, NewRelationship, NewSchema,
-    NewSubtype, SIDECAR_FILE, Sidecar, Source, safe_file_name,
+    ATTACHMENTS_DIR, DatasetPlan, DeleteFeature, ExtractionLog, FEATURES_DIR, FeatureOp, Item,
+    ItemKind, MAX_FEATURE_BYTES, NewAttachment, NewDataset, NewDomain, NewFeature, NewField,
+    NewRelationship, NewSchema, NewSubtype, SIDECAR_FILE, Sidecar, Source, UpdateFeature,
+    safe_file_name,
 };
 
 use crate::client::{Fetch, json, json_post};
@@ -54,6 +55,57 @@ impl ArcgisSource {
     /// log, which is what makes an extraction accountable rather than
     /// anonymous.
     pub fn extract(&self, directory: &Path, operator: &str) -> Result<Extraction, ArcgisError> {
+        self.extract_inner(directory, operator, None)
+    }
+
+    /// Read the service again and write only what changed since `previous`,
+    /// an earlier full extraction of it, as insert, update and delete
+    /// operations `verne load` commits onto the datasets that extraction's
+    /// load created.
+    ///
+    /// The diff is local: the full current state is fetched and paired with
+    /// the previous feature files by object id, with a hash of geometry and
+    /// properties deciding changed from unchanged. The service's own
+    /// `extractChanges` is not used, because its generation window is only
+    /// obtainable by registering a sync replica, which writes server state.
+    pub fn extract_since(
+        &self,
+        directory: &Path,
+        operator: &str,
+        previous: &Path,
+    ) -> Result<Extraction, ArcgisError> {
+        let sidecar_path = previous.join(SIDECAR_FILE);
+        let text = std::fs::read_to_string(&sidecar_path).map_err(|source| ArcgisError::Read {
+            path: sidecar_path.display().to_string(),
+            source,
+        })?;
+        let sidecar = Sidecar::from_json(&text).map_err(|error| ArcgisError::BadPrevious {
+            path: sidecar_path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        // a delta's feature files hold only what changed, so diffing against
+        // one would read every unchanged feature as vanished
+        if sidecar.incremental {
+            return Err(ArcgisError::DeltaPrevious {
+                path: previous.display().to_string(),
+            });
+        }
+        self.extract_inner(
+            directory,
+            operator,
+            Some(Previous {
+                directory: previous.to_path_buf(),
+                sidecar,
+            }),
+        )
+    }
+
+    fn extract_inner(
+        &self,
+        directory: &Path,
+        operator: &str,
+        previous: Option<Previous>,
+    ) -> Result<Extraction, ArcgisError> {
         let service = &self.service;
         let items = verdict::items(service);
         std::fs::create_dir_all(directory).map_err(|source| ArcgisError::Write {
@@ -74,7 +126,23 @@ impl ArcgisSource {
         // one plan per planned layer, in layer order, so the two walk
         // together by index
         let mut datasets = dataset_plans(&planned, operator, &mut placed, &mut conversions);
-        let relationships = relationship_classes(service, &planned, &datasets, &mut placed);
+        // a delta carries feature operations only: the relationship classes
+        // were created when the full extraction was loaded, and repeating
+        // them here would have the loader create second copies
+        let relationships = match &previous {
+            None => relationship_classes(service, &planned, &datasets, &mut placed),
+            Some(_) => {
+                for pairing in verdict::pairings(service) {
+                    placed.push((
+                        verdict::relationship_item(&pairing),
+                        Placed::Left(
+                            "the relationship classes were created when the full extraction was loaded, and a delta does not repeat them".into(),
+                        ),
+                    ));
+                }
+                Vec::new()
+            }
+        };
 
         let mut attachments = Vec::new();
         for (plan_index, layer) in planned.iter().copied().enumerate() {
@@ -82,6 +150,28 @@ impl ArcgisSource {
             // are unique where duplicate layer names were suffixed, and a file
             // per layer name would have the second layer overwrite the first
             let dataset_name = datasets[plan_index].dataset.name.clone();
+            let basis = match &previous {
+                None => None,
+                Some(held) => match delta_basis(held, &dataset_name, layer)? {
+                    Ok(basis) => Some(basis),
+                    Err(reason) => {
+                        // nothing can be diffed for this layer, so no feature
+                        // file is written and the plan carries none
+                        conversions.push(Conversion {
+                            location: layer.name.clone(),
+                            kind: ItemKind::FeatureCollection,
+                            detail: "no delta computed".into(),
+                            destination: None,
+                            losses: vec![reason],
+                        });
+                        if layer.has_attachments {
+                            placed.push((verdict::attachment_item(layer), left_of_delta()));
+                        }
+                        continue;
+                    }
+                },
+            };
+            let incremental = basis.is_some();
             let (file, minted) = write_layer(
                 self.fetch.as_ref(),
                 &service.url,
@@ -89,25 +179,60 @@ impl ArcgisSource {
                 &dataset_name,
                 service.gdb_version.as_deref(),
                 directory,
+                basis,
             )?;
             datasets[plan_index].features = file.path.clone();
             conversions.push(Conversion {
                 location: layer.name.clone(),
                 kind: ItemKind::FeatureCollection,
-                detail: format!("{} feature{}", file.features, plural(file.features)),
+                detail: match &file.delta {
+                    None => format!("{} feature{}", file.features, plural(file.features)),
+                    Some(delta) => format!(
+                        "{} inserted, {} updated, {} deleted; {} unchanged",
+                        delta.inserted, delta.updated, delta.deleted, delta.unchanged
+                    ),
+                },
                 destination: file.path.clone(),
                 losses: file.losses,
             });
             if layer.has_attachments {
-                let carried = self.attachments(
-                    layer,
-                    &dataset_name,
-                    &minted,
-                    directory,
-                    operator,
-                    &mut attachments,
-                )?;
-                place_attachments(layer, carried, &mut placed, &mut conversions);
+                if incremental {
+                    // not diffed: what the full extraction attached stands,
+                    // and pairing attachment changes would need a second
+                    // listing pass this path does not make
+                    placed.push((verdict::attachment_item(layer), left_of_delta()));
+                } else {
+                    let carried = self.attachments(
+                        layer,
+                        &dataset_name,
+                        &minted,
+                        directory,
+                        operator,
+                        &mut attachments,
+                    )?;
+                    place_attachments(layer, carried, &mut placed, &mut conversions);
+                }
+            }
+        }
+        if let Some(held) = &previous {
+            // a dataset of the previous extraction the service no longer
+            // lists: its features stand in ptolemy, and deleting a whole
+            // dataset is a decision for an operator, not a diff
+            for plan in &held.sidecar.datasets {
+                if !datasets
+                    .iter()
+                    .any(|current| current.dataset.name == plan.dataset.name)
+                {
+                    conversions.push(Conversion {
+                        location: plan.source_table.clone(),
+                        kind: ItemKind::FeatureCollection,
+                        detail: "in the previous extraction, not in the service now".into(),
+                        destination: None,
+                        losses: vec![
+                            "the service no longer lists this layer, so no delta was computed; its features stand in ptolemy until someone deletes them deliberately".into(),
+                        ],
+                    });
+                }
             }
         }
 
@@ -145,6 +270,7 @@ impl ArcgisSource {
 
         let sidecar = Sidecar {
             source: self.describe(),
+            incremental: previous.is_some(),
             geopackage: None,
             datasets,
             relationships,
@@ -180,6 +306,19 @@ struct Conversion {
     detail: String,
     destination: Option<String>,
     losses: Vec<String>,
+}
+
+/// The full extraction a delta diffs against.
+struct Previous {
+    directory: PathBuf,
+    sidecar: Sidecar,
+}
+
+/// Where a delta leaves a layer's attachments.
+fn left_of_delta() -> Placed {
+    Placed::Left(
+        "a delta carries feature operations only; the attachments the full extraction carried stand, and changes to them are not diffed".into(),
+    )
 }
 
 /// Why a thing the inventory judged was not written out, for a row that could
@@ -269,6 +408,7 @@ fn dataset_plans(
             source_table: layer.name.clone(),
             layer: None,
             features: None,
+            object_id_field: layer.object_id_field.clone(),
             dataset: NewDataset {
                 name,
                 srid: PTOLEMY_SRID,
@@ -542,6 +682,119 @@ struct FeatureFile {
     path: Option<String>,
     features: usize,
     losses: Vec<String>,
+    /// The operation counts when the layer was diffed rather than dumped.
+    delta: Option<Delta>,
+}
+
+/// What one layer's delta came to. Unchanged features are counted rather
+/// than written: the count is the proof the diff saw them.
+struct Delta {
+    inserted: usize,
+    updated: usize,
+    deleted: usize,
+    unchanged: usize,
+}
+
+/// One layer of the previous extraction, keyed for diffing: object id to the
+/// feature id that extraction minted and a hash of what it wrote.
+struct PrevFeatures {
+    map: BTreeMap<String, (String, u64)>,
+    /// What reading the previous file already lost, carried into the layer's
+    /// loss lines.
+    losses: Vec<String>,
+}
+
+/// What decides changed from unchanged: the working geometry and the
+/// properties, as the feature file holds them. The original is left out
+/// because it is derived from the same geometry by the same service. Both
+/// sides are hashed by this run, so the hasher only has to be stable within
+/// a process; a collision reads a changed feature as unchanged, at
+/// one-in-2^64 per pair.
+fn feature_hash(
+    geometry_wkb_hex: &str,
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    geometry_wkb_hex.hash(&mut hasher);
+    serde_json::to_string(properties)
+        .expect("properties hold only serialisable values")
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The previous extraction's state of one layer, or the reason no delta can
+/// be computed for it, which becomes the log's account. The outer error is a
+/// previous feature file that cannot be read at all, which fails the
+/// extraction rather than shrugging.
+fn delta_basis(
+    previous: &Previous,
+    dataset_name: &str,
+    layer: &Layer,
+) -> Result<Result<PrevFeatures, String>, ArcgisError> {
+    let Some(plan) = previous.sidecar.dataset(dataset_name) else {
+        return Ok(Err(format!(
+            "{dataset_name} is not in the previous extraction, so there is nothing to diff against; a full extract and load creates it"
+        )));
+    };
+    let Some(oid_field) = plan.object_id_field.as_deref() else {
+        return Ok(Err(
+            "the previous extraction recorded no object id field, so its features cannot be paired with the service's and no delta was computed".into(),
+        ));
+    };
+    if layer.object_id_field.is_none() {
+        return Ok(Err(
+            "the layer names no object id field now, so the current features cannot be paired with the previous extraction's".into(),
+        ));
+    }
+    let mut basis = PrevFeatures {
+        map: BTreeMap::new(),
+        losses: Vec::new(),
+    };
+    let Some(relative) = &plan.features else {
+        // the previous extraction wrote no features, so everything is new
+        return Ok(Ok(basis));
+    };
+    let path = previous.directory.join(relative);
+    let file = std::fs::File::open(&path).map_err(|source| ArcgisError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    use std::io::BufRead;
+    let mut unkeyed = 0usize;
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|source| ArcgisError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let feature: NewFeature =
+            serde_json::from_str(&line).map_err(|error| ArcgisError::BadPrevious {
+                path: path.display().to_string(),
+                message: format!("line {}: {error}", index + 1),
+            })?;
+        let Some(oid) = feature.properties.get(oid_field) else {
+            unkeyed += 1;
+            continue;
+        };
+        basis.map.insert(
+            text(oid),
+            (
+                feature.feature_id.clone(),
+                feature_hash(&feature.geometry_wkb_hex, &feature.properties),
+            ),
+        );
+    }
+    if unkeyed > 0 {
+        basis.losses.push(format!(
+            "{unkeyed} feature{} of the previous extraction carry no {oid_field} value, so the delta cannot see {}: each old copy stands, and the same row can come back as a fresh insert",
+            plural(unkeyed),
+            if unkeyed == 1 { "it" } else { "them" }
+        ));
+    }
+    Ok(Ok(basis))
 }
 
 /// What one layer's rows came to.
@@ -553,6 +806,13 @@ struct Tally {
     unwritable: usize,
     oversized: usize,
     largest: usize,
+    /// The delta's split of the rows; all zero on a full extraction.
+    inserted: usize,
+    updated: usize,
+    deleted: usize,
+    unchanged: usize,
+    /// Rows a diff could not pair because the object id field held nothing.
+    unkeyed: usize,
     /// Vertices whose declared Z or M was missing and written as zero.
     nulled_ordinates: usize,
     /// Rows whose untransformed original did not come back from the second
@@ -604,8 +864,13 @@ struct RawFeature {
     geometry: Option<serde_json::Value>,
 }
 
-/// One layer's features as insert operations, and the object id of every
+/// One layer's features as commit operations, and the object id of every
 /// feature that was written, keyed for the attachments that hang off them.
+///
+/// With no `previous`, every row is an insert. With one, the row's object id
+/// decides: unknown ids are inserts, known ids are updates when the hash
+/// says they changed and a count when it says they did not, and whatever is
+/// left of `previous` at the end vanished from the service and is a delete.
 fn write_layer(
     fetch: &dyn Fetch,
     url: &str,
@@ -613,6 +878,7 @@ fn write_layer(
     dataset: &str,
     gdb_version: Option<&str>,
     directory: &Path,
+    previous: Option<PrevFeatures>,
 ) -> Result<(FeatureFile, BTreeMap<String, String>), ArcgisError> {
     let relative = format!("{FEATURES_DIR}/{}.ndjson", safe_file_name(dataset));
     let path = directory.join(&relative);
@@ -648,6 +914,11 @@ fn write_layer(
     let mut minted = BTreeMap::new();
     let mut tally = Tally::default();
     let mut losses = Vec::new();
+    let diffed = previous.is_some();
+    let mut previous = previous;
+    if let Some(prev) = &mut previous {
+        losses.append(&mut prev.losses);
+    }
     let page_size = layer.max_record_count.unwrap_or(DEFAULT_PAGE);
     let route = format!("{url}/{}/query", layer.id);
     // the original is only fetchable when there is an object id to pair the
@@ -724,7 +995,6 @@ fn write_layer(
 
         for feature in &page.features {
             tally.read += 1;
-            let id = uuid::Uuid::now_v7().to_string();
             let geometry = match (&layer.geometry_type, &feature.geometry) {
                 (None, _) => EMPTY_GEOMETRY.to_string(),
                 (Some(_), None) => {
@@ -772,15 +1042,51 @@ fn write_layer(
                 }
                 _ => (None, None, None),
             };
-            let line = serde_json::to_string(&NewFeature {
-                feature_id: id.clone(),
-                geometry_wkb_hex: geometry,
-                properties,
-                native_geometry_wkb_hex: native_hex,
-                native_srid,
-                native_crs_wkt,
-            })
-            .expect("a feature holds only serialisable values");
+            let insert = |geometry: String, properties| {
+                FeatureOp::Insert(NewFeature {
+                    feature_id: uuid::Uuid::now_v7().to_string(),
+                    geometry_wkb_hex: geometry,
+                    properties,
+                    native_geometry_wkb_hex: native_hex.clone(),
+                    native_srid,
+                    native_crs_wkt: native_crs_wkt.clone(),
+                })
+            };
+            let op = match &mut previous {
+                None => insert(geometry, properties),
+                Some(prev) => {
+                    // pairing is by object id; a row without one cannot be
+                    // told apart from any other, so it is counted out
+                    let oid = layer
+                        .object_id_field
+                        .as_ref()
+                        .and_then(|name| feature.attributes.get(name))
+                        .map(text);
+                    let Some(oid) = oid else {
+                        tally.unkeyed += 1;
+                        continue;
+                    };
+                    // consumed as matched, so what is left at the end is
+                    // exactly what vanished from the service
+                    match prev.map.remove(&oid) {
+                        None => insert(geometry, properties),
+                        Some((_, held)) if held == feature_hash(&geometry, &properties) => {
+                            tally.unchanged += 1;
+                            continue;
+                        }
+                        Some((feature_id, _)) => FeatureOp::Update(UpdateFeature {
+                            feature_id,
+                            geometry_wkb_hex: Some(geometry),
+                            properties: Some(properties),
+                            native_geometry_wkb_hex: native_hex.clone(),
+                            native_srid,
+                            native_crs_wkt: native_crs_wkt.clone(),
+                        }),
+                    }
+                }
+            };
+            let line =
+                serde_json::to_string(&op).expect("a feature holds only serialisable values");
             // a feature ptolemy would refuse is not written: it would fail the
             // batch it landed in and take the rest of the layer with it
             if line.len() > MAX_FEATURE_BYTES {
@@ -789,18 +1095,26 @@ fn write_layer(
                 continue;
             }
             if layer.has_attachments
+                && let FeatureOp::Insert(held) = &op
                 && let Some(oid) = layer
                     .object_id_field
                     .as_ref()
                     .and_then(|name| feature.attributes.get(name))
             {
-                minted.insert(text(oid), id);
+                minted.insert(text(oid), held.feature_id.clone());
             }
             writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
                 path: path.display().to_string(),
                 source,
             })?;
             tally.written += 1;
+            if diffed {
+                match &op {
+                    FeatureOp::Insert(_) => tally.inserted += 1,
+                    FeatureOp::Update(_) => tally.updated += 1,
+                    FeatureOp::Delete(_) => {}
+                }
+            }
         }
 
         if !page.exceeded_transfer_limit {
@@ -815,6 +1129,20 @@ fn write_layer(
             break;
         }
     }
+    // whatever the current state never answered for vanished from the
+    // service since the previous extraction
+    if let Some(prev) = previous {
+        for (_, (feature_id, _)) in prev.map {
+            let line = serde_json::to_string(&FeatureOp::Delete(DeleteFeature { feature_id }))
+                .expect("a delete holds only serialisable values");
+            writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
+                path: path.display().to_string(),
+                source,
+            })?;
+            tally.written += 1;
+            tally.deleted += 1;
+        }
+    }
     out.flush().map_err(|source| ArcgisError::Write {
         path: path.display().to_string(),
         source,
@@ -826,6 +1154,12 @@ fn write_layer(
             path: Some(relative),
             features: tally.written,
             losses,
+            delta: diffed.then_some(Delta {
+                inserted: tally.inserted,
+                updated: tally.updated,
+                deleted: tally.deleted,
+                unchanged: tally.unchanged,
+            }),
         },
         minted,
     ))
@@ -927,6 +1261,12 @@ fn feature_losses(layer: &Layer, original: Option<&OriginalRef>, tally: &Tally) 
         losses.push(
             "the layer names no object id field, so the pages were fetched without a stable order and an edit made during the extraction can repeat or drop a row".to_string(),
         );
+    }
+    if tally.unkeyed > 0 {
+        losses.push(format!(
+            "{} carry no value in the object id field, so they could not be paired with the previous extraction and are not in the delta",
+            of_rows(tally.unkeyed, tally.read)
+        ));
     }
     if tally.shapeless > 0 {
         losses.push(format!(

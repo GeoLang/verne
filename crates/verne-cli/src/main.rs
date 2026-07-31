@@ -48,6 +48,12 @@ enum Command {
         /// Named geodatabase version to read instead of the default
         #[arg(long, value_name = "NAME")]
         gdb_version: Option<String>,
+        /// Directory of an earlier full extraction of the same service: only
+        /// what changed since it is written, as insert, update and delete
+        /// operations `verne load` commits onto the datasets that extraction
+        /// created (feature services only)
+        #[arg(long, value_name = "PATH")]
+        since: Option<PathBuf>,
     },
     /// List the feature services a portal holds, one URL per line
     Services {
@@ -108,9 +114,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             out,
             operator,
             gdb_version,
+            since,
         } => {
             if is_url(&source) {
-                extract_service(&source, &out, &operator, gdb_version)
+                extract_service(&source, &out, &operator, gdb_version, since.as_deref())
+            } else if since.is_some() {
+                Err(
+                    "--since diffs a feature service; a geodatabase is always extracted whole"
+                        .into(),
+                )
             } else {
                 extract(&PathBuf::from(&source), &out, &operator)
             }
@@ -188,8 +200,13 @@ fn extract_service(
     out: &Path,
     operator: &str,
     gdb_version: Option<String>,
+    since: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let extraction = open_service(url, gdb_version)?.extract(out, operator)?;
+    let source = open_service(url, gdb_version)?;
+    let extraction = match since {
+        Some(previous) => source.extract_since(out, operator, previous)?,
+        None => source.extract(out, operator)?,
+    };
     println!("{}", extraction.sidecar.log.to_markdown());
     eprintln!("wrote {}", extraction.sidecar_path.display());
     Ok(())
@@ -224,7 +241,26 @@ fn load(path: &Path, ptolemy: &str) -> Result<(), Box<dyn std::error::Error>> {
     let directory = sidecar_path.parent().unwrap_or(Path::new("."));
     let sidecar = Sidecar::from_json(&std::fs::read_to_string(&sidecar_path)?)?;
     let loaded = Loader::new(ptolemy, &token)?.load(&sidecar, directory)?;
-    println!("loaded into {ptolemy}: {}", loaded.sentence());
+    if sidecar.incremental {
+        // nothing is created on this path: the ops go onto the datasets the
+        // full extraction's load made
+        println!(
+            "committed the delta into {ptolemy}: {} operations in {} commits across {} datasets",
+            loaded
+                .features
+                .values()
+                .map(|held| held.features)
+                .sum::<usize>(),
+            loaded
+                .features
+                .values()
+                .map(|held| held.commits)
+                .sum::<usize>(),
+            loaded.datasets.len()
+        );
+    } else {
+        println!("loaded into {ptolemy}: {}", loaded.sentence());
+    }
     for (name, id) in &loaded.datasets {
         println!("  dataset {name} {id}");
     }

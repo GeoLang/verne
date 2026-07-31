@@ -31,7 +31,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use verne_core::sidecar::{
-    DatasetPlan, MAX_FEATURE_BYTES, NewAttachment, NewFeature, NewRelationship, NewSchema,
+    DatasetPlan, FeatureOp, MAX_FEATURE_BYTES, NewAttachment, NewRelationship, NewSchema,
     NewSubtype, Sidecar,
 };
 
@@ -92,6 +92,14 @@ pub enum LoadError {
         "the attachment \"{name}\" belongs to the dataset {dataset}, which the sidecar does not create"
     )]
     UnknownAttachmentDataset { name: String, dataset: String },
+    #[error("ptolemy answered {route} with {body}, which verne could not read")]
+    BadAnswer { route: String, body: String },
+    #[error(
+        "ptolemy holds no dataset named {name}; an incremental load commits onto the datasets a full load created, and nothing here creates one"
+    )]
+    MissingDataset { name: String },
+    #[error("the dataset {name} has no \"main\" branch, so the delta has nowhere to be committed")]
+    MissingBranch { name: String },
 }
 
 /// What a load created, keyed by the names the sidecar used.
@@ -196,6 +204,9 @@ impl Loader {
     /// created, and the error names the route that refused it. Undoing it is a
     /// matter for whoever holds the admin rows the load minted.
     pub fn load(&self, sidecar: &Sidecar, directory: &Path) -> Result<Loaded, LoadError> {
+        if sidecar.incremental {
+            return self.load_incremental(sidecar, directory);
+        }
         let mut loaded = Loaded::default();
         for plan in &sidecar.datasets {
             let id = self.create_dataset(plan)?;
@@ -237,6 +248,38 @@ impl Loader {
         for attachment in &sidecar.attachments {
             let id = self.upload_attachment(attachment, &loaded, directory)?;
             loaded.attachments.insert(attachment.name.clone(), id);
+        }
+        Ok(loaded)
+    }
+
+    /// Commit a delta onto what a full load created. Nothing is created here:
+    /// the datasets, schemas, domains, subtypes, relationship classes and
+    /// attachments were made by the first load, and making them again would
+    /// either collide or fork a second copy of the data. Each dataset is
+    /// found by the name the sidecar gives it and the ops go onto its "main"
+    /// branch, which is the one [`Self::load`] created.
+    fn load_incremental(&self, sidecar: &Sidecar, directory: &Path) -> Result<Loaded, LoadError> {
+        let mut loaded = Loaded::default();
+        let held = self.get(&format!("{API}/datasets"))?;
+        for plan in &sidecar.datasets {
+            let dataset =
+                named_id(&held, &plan.dataset.name).ok_or_else(|| LoadError::MissingDataset {
+                    name: plan.dataset.name.clone(),
+                })?;
+            let branches = self.get(&format!("{API}/datasets/{dataset}/branches"))?;
+            let branch = named_id(&branches, BRANCH).ok_or_else(|| LoadError::MissingBranch {
+                name: plan.dataset.name.clone(),
+            })?;
+            loaded
+                .datasets
+                .insert(plan.dataset.name.clone(), dataset.clone());
+            loaded
+                .branches
+                .insert(plan.dataset.name.clone(), branch.clone());
+            let committed = self.commit_features(plan, &branch, directory)?;
+            if committed.features > 0 {
+                loaded.features.insert(plan.dataset.name.clone(), committed);
+            }
         }
         Ok(loaded)
     }
@@ -293,7 +336,7 @@ impl Loader {
         })?;
 
         let mut committed = Committed::default();
-        let mut batch: Vec<NewFeature> = Vec::new();
+        let mut batch: Vec<FeatureOp> = Vec::new();
         let mut bytes = 0usize;
         for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
             let line = line.map_err(|source| LoadError::Read {
@@ -303,7 +346,7 @@ impl Loader {
             if line.trim().is_empty() {
                 continue;
             }
-            let feature: NewFeature =
+            let feature: FeatureOp =
                 serde_json::from_str(&line).map_err(|error| LoadError::BadFeature {
                     path: relative.clone(),
                     line: index + 1,
@@ -336,13 +379,13 @@ impl Loader {
         &self,
         plan: &DatasetPlan,
         branch_id: &str,
-        features: &[NewFeature],
+        features: &[FeatureOp],
     ) -> Result<(), LoadError> {
         self.post(
             &format!("{API}/branches/{branch_id}/commit"),
             &CommitBody {
                 message: &format!(
-                    "verne: {} feature{} of {}",
+                    "verne: {} operation{} of {}",
                     features.len(),
                     if features.len() == 1 { "" } else { "s" },
                     plan.source_table
@@ -482,6 +525,27 @@ impl Loader {
         self.send(Method::Put, route, body).map(drop)
     }
 
+    /// A read, which only the incremental path makes: a full load creates
+    /// everything itself and never has to ask what is already there.
+    fn get(&self, route: &str) -> Result<serde_json::Value, LoadError> {
+        let url = format!("{}{route}", self.base);
+        let response = self.client.get(url).bearer_auth(&self.token).send()?;
+        let status = response.status();
+        let text = response.text()?;
+        if !status.is_success() {
+            return Err(LoadError::Refused {
+                method: "GET",
+                route: route.to_string(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        serde_json::from_str(&text).map_err(|_| LoadError::BadAnswer {
+            route: route.to_string(),
+            body: text,
+        })
+    }
+
     fn send<T: Serialize>(
         &self,
         method: Method,
@@ -521,6 +585,16 @@ impl Method {
             Method::Put => "PUT",
         }
     }
+}
+
+/// The id of the row called `name` in a listed array, `None` when the answer
+/// is not an array or nothing in it carries that name.
+fn named_id(listed: &serde_json::Value, name: &str) -> Option<String> {
+    listed.as_array()?.iter().find_map(|row| {
+        (row.get("name")?.as_str()? == name)
+            .then(|| row.get("id")?.as_str().map(str::to_string))
+            .flatten()
+    })
 }
 
 fn id_of(route: &str, body: &serde_json::Value) -> Result<String, LoadError> {
@@ -573,13 +647,14 @@ struct BranchBody<'a> {
 }
 
 /// `POST /api/v1/branches/{id}/commit`. The operations are the sidecar's
-/// feature lines put in an array: each one already carries the `insert` tag
-/// ptolemy's `DiffOpRequest` is read by, so nothing here rewrites them.
+/// feature lines put in an array: each one already carries the `insert`,
+/// `update` or `delete` tag ptolemy's `DiffOpRequest` is read by, so nothing
+/// here rewrites them.
 #[derive(Serialize)]
 struct CommitBody<'a> {
     message: &'a str,
     author: &'a str,
-    operations: &'a [NewFeature],
+    operations: &'a [FeatureOp],
 }
 
 /// `POST /api/v1/branches/{branch}/features/{feature}/attachments`: the

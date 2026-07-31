@@ -208,6 +208,21 @@ server. Each refusal is a report row with the reason.
 A failed request is an error naming the route, including the ones ArcGIS
 answers with HTTP 200 and an error object in the body.
 
+A service already extracted and loaded once can be re-read as a delta:
+`--since <dir>` points at the earlier full extraction, and only what changed
+lands on disk, as the insert, update and delete operations of ptolemy's
+commit route. `verne load` commits them onto the datasets the first load
+created and creates nothing. The diff is verne's own: the full current state
+is fetched again and paired with the previous feature files by object id,
+with a hash of geometry and properties deciding changed from unchanged, so an
+update keeps the feature id the first extraction minted and its history in
+ptolemy stays one feature. The service's `extractChanges` is not used, for
+the sync-replica reason above. What a delta does not carry is named in the
+log: attachments and relationship classes are not diffed, a layer without an
+object id field cannot be paired at all, and a layer that vanished from the
+service keeps its features in ptolemy rather than having a diff delete a
+whole dataset.
+
 ## Extraction
 
 `verne extract` writes four things into the directory it is given:

@@ -229,6 +229,79 @@ pub struct NewFeature {
     pub native_crs_wkt: Option<String>,
 }
 
+/// One feature to change: one `update` operation of the same commit route,
+/// mirroring ptolemy's `DiffOpRequest::Update` field for field. Everything but
+/// the id is optional there, but a delta extraction fills geometry, properties
+/// and the original together: it cannot know which of them changed, and
+/// ptolemy reads an omitted original as "the new version has no original",
+/// never as inherited, so leaving it off would strip it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "update")]
+pub struct UpdateFeature {
+    /// The id the previous extraction minted, which is what makes this an
+    /// update of that feature rather than a second copy of it.
+    pub feature_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_wkb_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_geometry_wkb_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_srid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_crs_wkt: Option<String>,
+}
+
+/// One feature to delete: one `delete` operation of the commit route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "delete")]
+pub struct DeleteFeature {
+    pub feature_id: String,
+}
+
+/// One line of a feature file. Untagged on the way out because each struct
+/// already carries the `type` tag ptolemy's commit reads, so a line
+/// serialises exactly as the operation it is and a full extraction's
+/// insert-only files parse unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum FeatureOp {
+    Insert(NewFeature),
+    Update(UpdateFeature),
+    Delete(DeleteFeature),
+}
+
+/// By hand because the untagged derive takes the first variant whose fields
+/// fit, and a delete line fits an update whose fields are all optional: the
+/// tag has to decide, as it does in ptolemy.
+impl<'de> Deserialize<'de> for FeatureOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let tag = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| D::Error::missing_field("type"))?;
+        match tag.as_str() {
+            "insert" => serde_json::from_value(value).map(FeatureOp::Insert),
+            "update" => serde_json::from_value(value).map(FeatureOp::Update),
+            "delete" => serde_json::from_value(value).map(FeatureOp::Delete),
+            other => {
+                return Err(D::Error::unknown_variant(
+                    other,
+                    &["insert", "update", "delete"],
+                ));
+            }
+        }
+        .map_err(D::Error::custom)
+    }
+}
+
 /// One attachment: `POST /api/v1/branches/{branch}/features/{feature}/attachments`
 /// with the bytes in a file instead of inline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,6 +340,11 @@ pub struct DatasetPlan {
     /// silent drop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<String>,
+    /// The source's object id column, when it names one. What a later
+    /// `--since` pairs its diff on: without it a delta cannot tell an edit
+    /// from a new feature. Absent on sidecars written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id_field: Option<String>,
     pub dataset: NewDataset,
     /// No serde default: a sidecar written before schemas existed would
     /// otherwise load with an empty one and drop every alias without saying so,
@@ -289,6 +367,11 @@ pub struct DatasetPlan {
 pub struct Sidecar {
     /// The source it came out of, as the report describes it.
     pub source: SourceDescription,
+    /// True on a delta extraction: the feature files hold update and delete
+    /// operations beside inserts, and the loader commits onto the datasets an
+    /// earlier load created instead of creating anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub incremental: bool,
     /// The GeoPackage the features went to, named relative to the sidecar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geopackage: Option<String>,

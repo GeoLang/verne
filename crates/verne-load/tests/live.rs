@@ -149,12 +149,14 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
 
     Sidecar {
         source: SourceDescription::new("Esri file geodatabase", "the live load test"),
+        incremental: false,
         geopackage: Some("features.gpkg".into()),
         datasets: vec![
             DatasetPlan {
                 source_table: "wells".into(),
                 layer: Some("wells".into()),
                 features: Some("features/wells.ndjson".into()),
+                object_id_field: None,
                 dataset: NewDataset {
                     name: wells.clone(),
                     srid: 4326,
@@ -206,6 +208,7 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
                 source_table: "inspections".into(),
                 layer: Some("inspections".into()),
                 features: Some("features/inspections.ndjson".into()),
+                object_id_field: None,
                 dataset: NewDataset {
                     name: inspections.clone(),
                     srid: 4326,

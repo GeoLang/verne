@@ -77,11 +77,13 @@ impl ArcgisSource {
     /// properties deciding changed from unchanged. The report says which of
     /// the two ran and why.
     ///
-    /// A delta of a delta is refused whichever path would run. The generation
-    /// a change file ends at does chain, but the pairing does not: an object id
-    /// the service reports edited has to be looked up to find the feature id
-    /// ptolemy holds it under, and a delta's feature files hold only the rows
-    /// that delta touched.
+    /// A delta of a delta rides the `extractChanges` path and only that one.
+    /// Both halves of the basis chain there: the generation is the server's own
+    /// cursor, and the object id index each delta writes down says which
+    /// feature id ptolemy holds every row under, which its feature files cannot
+    /// because they hold only the rows it touched. A delta with no index, or a
+    /// run that would fall back to the local diff, is refused: the local diff
+    /// would read every row the previous delta left alone as vanished.
     pub fn extract_since(
         &self,
         directory: &Path,
@@ -97,14 +99,25 @@ impl ArcgisSource {
             path: sidecar_path.display().to_string(),
             message: error.to_string(),
         })?;
-        // refused before the service is asked anything, so a run that cannot
-        // be paired does not start a job on the server either
-        if sidecar.incremental {
+        // asked before the service is, so a run that cannot be paired does not
+        // start a job on the server either
+        if sidecar.incremental
+            && let Some(reason) = unindexed(previous, &sidecar)
+        {
             return Err(ArcgisError::DeltaPrevious {
                 path: previous.display().to_string(),
+                reason,
             });
         }
         let path = self.delta_path(changes::read(previous)?.as_ref())?;
+        if let (true, DeltaPath::LocalDiff(reason)) = (sidecar.incremental, &path) {
+            return Err(ArcgisError::DeltaPrevious {
+                path: previous.display().to_string(),
+                reason: format!(
+                    "{reason}, and a local diff would read every row that delta left alone as vanished"
+                ),
+            });
+        }
         self.extract_inner(
             directory,
             operator,
@@ -471,6 +484,26 @@ struct Previous {
     directory: PathBuf,
     sidecar: Sidecar,
     path: DeltaPath,
+}
+
+/// Why a delta cannot be the basis of another one, or `None` when it can: it
+/// wrote an index of every dataset it lists, which is what says where each row
+/// of them landed in ptolemy.
+fn unindexed(directory: &Path, sidecar: &Sidecar) -> Option<String> {
+    let missing: Vec<&str> = sidecar
+        .datasets
+        .iter()
+        .filter(|plan| !changes::index_path(directory, &plan.dataset.name).exists())
+        .map(|plan| plan.dataset.name.as_str())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "it holds no {} index for {}, so the feature ids the rest of those datasets were loaded under are not written down anywhere",
+        changes::OBJECT_IDS_DIR,
+        missing.join(", ")
+    ))
 }
 
 /// How a delta finds what changed, decided once for the whole run before any
@@ -899,21 +932,30 @@ struct PrevFeatures {
 
 /// What decides changed from unchanged: the working geometry and the
 /// properties, as the feature file holds them. The original is left out
-/// because it is derived from the same geometry by the same service. Both
-/// sides are hashed by this run, so the hasher only has to be stable within
-/// a process; a collision reads a changed feature as unchanged, at
-/// one-in-2^64 per pair.
+/// because it is derived from the same geometry by the same service. A
+/// collision reads a changed feature as unchanged, at one-in-2^64 per pair.
+///
+/// FNV-1a by hand rather than the standard library's hasher, whose value is
+/// documented as not to be relied on across releases: a chained delta compares
+/// against a hash an earlier run wrote into its index, so the same feature has
+/// to hash the same in another process built by another compiler.
 fn feature_hash(
     geometry_wkb_hex: &str,
     properties: &serde_json::Map<String, serde_json::Value>,
 ) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::hash::DefaultHasher::new();
-    geometry_wkb_hex.hash(&mut hasher);
-    serde_json::to_string(properties)
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    eat(geometry_wkb_hex.as_bytes());
+    // the properties are a BTreeMap, so one order of keys serialises them
+    eat(serde_json::to_string(properties)
         .expect("properties hold only serialisable values")
-        .hash(&mut hasher);
-    hasher.finish()
+        .as_bytes());
+    hash
 }
 
 /// The previous extraction's state of one layer, or the reason no delta can
@@ -944,6 +986,15 @@ fn delta_basis(
         map: BTreeMap::new(),
         losses: Vec::new(),
     };
+    // a delta's feature files hold only the rows that delta touched, so what
+    // pairs a chain is the index it wrote down instead. extract_since refuses
+    // a delta that has none, so reaching here means there is one.
+    if previous.sidecar.incremental {
+        for row in changes::read_index(&previous.directory, dataset_name)? {
+            basis.map.insert(row.oid, (row.feature_id, row.hash));
+        }
+        return Ok(Ok(basis));
+    }
     let Some(relative) = &plan.features else {
         // the previous extraction wrote no features, so everything is new
         return Ok(Ok(basis));
@@ -1069,6 +1120,9 @@ struct RawFeature {
 /// previous extraction at the end vanished from the service. A change pass
 /// sees only what it asked for, so a delete is one the service named, and one
 /// it named that the previous extraction never held is counted and dropped.
+///
+/// A change pass also writes the dataset's object id index, which is the basis
+/// it was given with every operation it wrote applied to it.
 fn write_layer(
     fetch: &dyn Fetch,
     url: &str,
@@ -1150,6 +1204,13 @@ fn write_layer(
         .unwrap_or_default()
         .into_iter();
     let mut paging = Paging::default();
+    // the change pass leaves an index behind, which is the basis plus every op
+    // it writes: the feature file it writes cannot say where the rows it did
+    // not touch landed, and the next delta of the chain has to know
+    let mut index = match (&changed, &previous) {
+        (Some(_), Some(prev)) => Some(prev.map.clone()),
+        _ => None,
+    };
     loop {
         let page = match &changed {
             None => match paging.next(fetch, &route, layer, gdb_version, &mut losses)? {
@@ -1228,25 +1289,29 @@ fn write_layer(
                     native_crs_wkt: native_crs_wkt.clone(),
                 })
             };
+            // pairing is by object id; a row without one cannot be told apart
+            // from any other, so it is counted out
+            let oid = layer
+                .object_id_field
+                .as_ref()
+                .and_then(|name| feature.attributes.get(name))
+                .map(text);
+            // the hash decides changed from unchanged and is also what the
+            // index writes down, so it is taken once per row and only where a
+            // delta is what is being written
+            let hash = diffed.then(|| feature_hash(&geometry, &properties));
             let op = match &mut previous {
                 None => insert(geometry, properties),
                 Some(prev) => {
-                    // pairing is by object id; a row without one cannot be
-                    // told apart from any other, so it is counted out
-                    let oid = layer
-                        .object_id_field
-                        .as_ref()
-                        .and_then(|name| feature.attributes.get(name))
-                        .map(text);
-                    let Some(oid) = oid else {
+                    let Some(oid) = &oid else {
                         tally.unkeyed += 1;
                         continue;
                     };
                     // consumed as matched, so what is left at the end is
                     // exactly what vanished from the service
-                    match prev.map.remove(&oid) {
+                    match prev.map.remove(oid) {
                         None => insert(geometry, properties),
-                        Some((_, held)) if held == feature_hash(&geometry, &properties) => {
+                        Some((_, held)) if hash == Some(held) => {
                             tally.unchanged += 1;
                             continue;
                         }
@@ -1272,12 +1337,9 @@ fn write_layer(
             }
             if layer.has_attachments
                 && let FeatureOp::Insert(held) = &op
-                && let Some(oid) = layer
-                    .object_id_field
-                    .as_ref()
-                    .and_then(|name| feature.attributes.get(name))
+                && let Some(oid) = &oid
             {
-                minted.insert(text(oid), held.feature_id.clone());
+                minted.insert(oid.clone(), held.feature_id.clone());
             }
             writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
                 path: path.display().to_string(),
@@ -1290,6 +1352,14 @@ fn write_layer(
                     FeatureOp::Update(_) => tally.updated += 1,
                     FeatureOp::Delete(_) => {}
                 }
+            }
+            // the op was written, so this is what ptolemy holds the row as once
+            // the delta is loaded. a row skipped anywhere above never reaches
+            // here, and the index keeps saying what it said before
+            if let Some(index) = &mut index
+                && let (Some(oid), Some(hash)) = (&oid, hash)
+            {
+                index.insert(oid.clone(), (op_feature_id(&op).to_string(), hash));
             }
         }
     }
@@ -1316,6 +1386,9 @@ fn write_layer(
             })?;
             tally.written += 1;
             tally.deleted += 1;
+            if let Some(index) = &mut index {
+                index.remove(&oid);
+            }
         }
         if unknown > 0 {
             losses.push(format!(
@@ -1330,6 +1403,9 @@ fn write_layer(
         path: path.display().to_string(),
         source,
     })?;
+    if let Some(index) = &index {
+        changes::write_index(directory, dataset, index)?;
+    }
 
     losses.extend(feature_losses(layer, original.as_ref(), &tally));
     Ok((
@@ -1346,6 +1422,15 @@ fn write_layer(
         },
         minted,
     ))
+}
+
+/// The feature an operation is of, which is one field under three names.
+fn op_feature_id(op: &FeatureOp) -> &str {
+    match op {
+        FeatureOp::Insert(held) => &held.feature_id,
+        FeatureOp::Update(held) => &held.feature_id,
+        FeatureOp::Delete(held) => &held.feature_id,
+    }
 }
 
 /// The parameters every feature query shares: the columns, the geometry as

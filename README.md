@@ -223,6 +223,16 @@ ids edited since, and only those rows are fetched. The delta records the
 generations the window ended at, so the next one carries on from there. There
 is no flag for this, and no change to the sidecar `verne load` reads.
 
+A delta on that path is a basis for the next one, so a migration window is a
+chain of cheap deltas rather than one. Two things have to carry over, and both
+are written into the delta's own directory: the generations, and an object id
+index in `object-ids/`, one line per row saying which feature id ptolemy holds
+it under and a hash of what was last written for it. The index is what the
+feature files cannot be, because they hold only the rows that delta touched,
+and without it a row edited in two windows running would come back as a second
+copy of itself. Each delta writes the index it was given with its own
+operations applied.
+
 Otherwise the diff is verne's own: the full current state is fetched again and
 paired with the previous feature files by object id. Either way a hash of
 geometry and properties decides changed from unchanged, an update keeps the
@@ -238,9 +248,9 @@ classes are not diffed, though a change file's attachment counts are reported
 so an operator knows a full re-extract would pick them up; a layer without an
 object id field cannot be paired at all; and a layer that vanished from the
 service keeps its features in ptolemy rather than having a diff delete a whole
-dataset. A delta is never a basis for another delta: its feature files hold
-only what changed, so the feature ids the rest of the datasets were loaded
-under are not in them, and that is true whichever path would run.
+dataset. A delta is not a basis for a local diff, and not a basis at all
+without its index: both would read every row it left alone as vanished or as
+new, and it is refused by name rather than mispaired.
 
 `demo/migration-loop.sh` runs the whole story against a live service and a
 scratch ptolemy: full extract, load, delta, delta load, then verifies
@@ -272,7 +282,9 @@ From a feature service the GeoPackage is absent and everything else is the
 same, so `verne load` reads both extractions without knowing which it was
 handed. A feature service that publishes a generation window leaves a fifth
 file, `server-gens.json`, which is the cursor the next `--since` sends back to
-`extractChanges`. Nothing but a later delta reads it.
+`extractChanges`, and a delta that rode that path leaves `object-ids/` beside
+it, one file per dataset saying which feature id ptolemy holds each object id
+under. Nothing but a later delta reads either.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the

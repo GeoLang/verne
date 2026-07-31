@@ -80,7 +80,15 @@ All notable changes to this project will be documented in this file.
     is followed by hand and the signed URL fetched bare.
   - `returnIdsOnly` is not used. On a live service it answers with empty edits
     for windows the async job returns thousands of rows for.
-  - A delta is still never a basis for another delta. The generation would
-    chain, but the pairing would not: a delta's feature files hold only the
-    rows it touched, so an object id last written by an earlier extraction
-    would find no feature id and land as a second copy of itself.
+  - A delta on this path is a basis for the next one, so a migration window is
+    a chain of cheap deltas rather than one. Each writes an object id index
+    into `object-ids/`, a line per row naming the feature id ptolemy holds it
+    under and a hash of what was last written, which is the basis it was given
+    with its own operations applied. Its feature files cannot serve: they hold
+    only the rows it touched, so a row edited in two windows running would
+    find no feature id and land as a second copy of itself. A delta with no
+    index, and a delta whose next run would fall back to the local diff, are
+    refused by name rather than mispaired.
+  - The change hash is FNV-1a rather than the standard library's hasher, whose
+    value is documented as not to be relied on across releases: a chained
+    delta compares against a hash an earlier run wrote down.

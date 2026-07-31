@@ -21,7 +21,8 @@ use std::thread::JoinHandle;
 use common::{Fake, ROOT, logs_table, service_root, tracking_root, wells_layer};
 use serde_json::json;
 use verne_arcgis::{
-    ArcgisError, ArcgisSource, Credentials, Extraction, Fetch, HttpFetch, SERVER_GENS_FILE,
+    ArcgisError, ArcgisSource, Credentials, Extraction, Fetch, HttpFetch, OBJECT_IDS_DIR,
+    SERVER_GENS_FILE,
 };
 use verne_core::{Action, FeatureOp, NewFeature};
 
@@ -34,6 +35,8 @@ const DRILLED: i64 = 1743630690000;
 /// window ends at.
 const FIRST_GEN: u64 = 4277428;
 const NEXT_GEN: u64 = 4277901;
+/// And the one the window after that ends at, for a delta of a delta.
+const LATER_GEN: u64 = 4278115;
 
 /// Where the fixture's async job lives, as URLs under the fixture's root so
 /// every request stays on the fake.
@@ -704,17 +707,196 @@ fn a_deleted_id_the_previous_extraction_lacks_is_dropped() {
     assert!(said, "{:#?}", extraction.sidecar.log.entries);
 }
 
-/// A delta of a delta is refused even where the cursor would chain, and
-/// nothing is asked of the service before it is refused.
-///
-/// The generation does chain: it is the server's own cursor, and the first
-/// delta recorded the one its window ended at. The pairing does not. An object
-/// id the service reports edited has to find the feature id ptolemy holds that
-/// row under, and a delta's feature files hold only the rows that delta
-/// touched, so a row last written by the full extraction would be paired with
-/// nothing and land as a second copy of itself.
+// ─── Chained deltas ─────────────────────────────────────────────────
+
+/// The third state: 1 got deeper again, and 4, which the first delta inserted,
+/// is gone. Nothing else moved, and nothing else is asked for.
+fn later_row(oid: i64) -> serde_json::Value {
+    match oid {
+        1 => json!({
+            "attributes": { "objectid": 1, "status": 1, "depth": 14.0, "drilled": DRILLED },
+            "geometry": { "x": 3.5, "y": 50.1 }
+        }),
+        other => panic!(
+            "the extraction asked for object id {other}, which the third state does not change"
+        ),
+    }
+}
+
+fn wells_later(params: &[(&str, String)]) -> Vec<u8> {
+    if param(params, "returnCountOnly").is_some() {
+        return serde_json::to_vec(&json!({ "count": 2 })).expect("the count serialises");
+    }
+    let oids = param(params, "objectIds").expect("the third state is only asked by object id");
+    if param(params, "outFields") != Some("*") {
+        return native_page(oids);
+    }
+    let rows: Vec<serde_json::Value> = oids
+        .split(',')
+        .map(|oid| later_row(oid.parse().expect("an object id")))
+        .collect();
+    serde_json::to_vec(&json!({ "objectIdFieldName": "objectid", "features": rows }))
+        .expect("the page serialises")
+}
+
+/// The second window's change file: 1 edited again, and 4 deleted.
+fn later_change_file() -> serde_json::Value {
+    json!({
+        "edits": [
+            {
+                "id": 0,
+                "features": {
+                    "adds": [],
+                    "updates": [{
+                        "attributes": { "objectid": 1, "status": 1, "depth": 999.0, "drilled": DRILLED },
+                        "geometry": { "x": 3.5, "y": 50.1 }
+                    }],
+                    "deleteIds": [4]
+                }
+            },
+            { "id": 1, "features": { "adds": [], "updates": [], "deleteIds": [] } }
+        ],
+        "layerServerGens": [
+            { "id": 0, "serverGen": LATER_GEN },
+            { "id": 1, "serverGen": LATER_GEN }
+        ]
+    })
+}
+
+fn later_fake() -> Fake {
+    Fake::new()
+        .json("", tracking_root(LATER_GEN))
+        .json("/0", wells_layer())
+        .json("/1", logs_table())
+        .answering("/0/query", wells_later)
+        .answering("/1/query", logs_pages)
+        .json(
+            "/extractChanges",
+            json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
+        )
+        .json(
+            STATUS_URL,
+            json!({ "status": "Completed", "resultUrl": format!("{ROOT}{RESULT_URL}") }),
+        )
+        .json(RESULT_URL, later_change_file())
+}
+
+/// The feature id each object id was inserted under by a delta, off its
+/// operation file.
+fn inserted(directory: &Path) -> BTreeMap<i64, String> {
+    ops(directory, "features/Wells.ndjson")
+        .into_iter()
+        .filter_map(|op| match op {
+            FeatureOp::Insert(insert) => Some((
+                insert.properties["objectid"].as_i64().expect("an oid"),
+                insert.feature_id,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// full, then a delta, then a delta of that delta.
+fn chain(full: &Path, first: &Path, second: &Path) -> Extraction {
+    extract_full(full);
+    ArcgisSource::open_with(Box::new(changed_fake()), ROOT)
+        .expect("the fixture opens")
+        .extract_since(first, OPERATOR, full)
+        .expect("the first delta runs");
+    ArcgisSource::open_with(Box::new(later_fake()), ROOT)
+        .expect("the fixture opens")
+        .extract_since(second, OPERATOR, first)
+        .expect("the second delta runs")
+}
+
+/// A row edited in two windows running is one feature throughout. The second
+/// delta pairs it through the index the first wrote, which is the only place
+/// the feature id of a row the first delta did not touch is written down.
 #[test]
-fn a_delta_of_a_delta_is_refused_even_with_a_cursor() {
+fn a_row_edited_twice_stays_one_feature_down_the_chain() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    let extraction = chain(full.path(), first.path(), second.path());
+    let ids = minted(full.path());
+
+    let written = ops(second.path(), "features/Wells.ndjson");
+    let updates: Vec<_> = written
+        .iter()
+        .filter_map(|op| match op {
+            FeatureOp::Update(update) => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.len(), 1, "{written:#?}");
+    assert_eq!(
+        updates[0].feature_id, ids[&1],
+        "the row was paired with something other than the feature the full extraction minted"
+    );
+    assert_eq!(
+        updates[0]
+            .properties
+            .as_ref()
+            .expect("properties ride on an update")["depth"],
+        14.0
+    );
+    assert!(
+        !written.iter().any(|op| matches!(op, FeatureOp::Insert(_))),
+        "a row already in ptolemy came back as a second copy of itself: {written:#?}"
+    );
+    assert_eq!(
+        path_entry(&extraction).detail,
+        "delta read from extractChanges"
+    );
+    // the chain carries on: the cursor moved and the index was written again
+    assert_eq!(
+        recorded(second.path()),
+        vec![
+            ("Wells".to_string(), 0, LATER_GEN),
+            ("Logs".to_string(), 1, LATER_GEN)
+        ]
+    );
+}
+
+/// A delete of a row an earlier delta inserted resolves to the feature id that
+/// delta minted, which is again only in its index.
+#[test]
+fn a_delete_of_a_row_an_earlier_delta_inserted_resolves() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    chain(full.path(), first.path(), second.path());
+    let by_first = inserted(first.path());
+
+    let deletes: Vec<_> = ops(second.path(), "features/Wells.ndjson")
+        .into_iter()
+        .filter_map(|op| match op {
+            FeatureOp::Delete(delete) => Some(delete.feature_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![by_first[&4].clone()],
+        "the delete did not name the feature the first delta inserted"
+    );
+    // and the index the second delta wrote carries the chain on: the row it
+    // deleted is out of it, and a row neither delta ever touched is still in it
+    // under the feature id the full extraction minted, which is the whole
+    // reason the file exists
+    let held = std::fs::read_to_string(second.path().join(OBJECT_IDS_DIR).join("Wells.ndjson"))
+        .expect("the index");
+    let ids = minted(full.path());
+    assert!(!held.contains(&by_first[&4]), "{held}");
+    assert!(held.contains(&ids[&2]), "{held}");
+    assert!(held.contains(&ids[&1]), "{held}");
+}
+
+/// A delta written before the index existed has no index, and pairing against
+/// its feature files would read every row it left alone as new. It is refused
+/// by name, and nothing is asked of the service first.
+#[test]
+fn a_delta_without_an_index_is_refused() {
     let full = tempfile::tempdir().expect("tempdir");
     let first = tempfile::tempdir().expect("tempdir");
     let second = tempfile::tempdir().expect("tempdir");
@@ -723,24 +905,21 @@ fn a_delta_of_a_delta_is_refused_even_with_a_cursor() {
         .expect("the fixture opens")
         .extract_since(first.path(), OPERATOR, full.path())
         .expect("the first delta runs");
-    assert_eq!(
-        recorded(first.path()),
-        vec![
-            ("Wells".to_string(), 0, NEXT_GEN),
-            ("Logs".to_string(), 1, NEXT_GEN)
-        ],
-        "the first delta recorded no cursor to chain from"
-    );
+    std::fs::remove_dir_all(first.path().join(OBJECT_IDS_DIR)).expect("the index");
 
-    let fake = changed_fake();
+    let fake = later_fake();
     let calls = fake.calls();
     let refused = ArcgisSource::open_with(Box::new(fake), ROOT)
         .expect("the fixture opens")
         .extract_since(second.path(), OPERATOR, first.path())
-        .expect_err("a delta is not a basis");
+        .expect_err("a delta with no index is not a basis");
     assert!(
-        matches!(&refused, ArcgisError::DeltaPrevious { .. }),
+        matches!(&refused, ArcgisError::DeltaPrevious { reason, .. } if reason.contains(OBJECT_IDS_DIR)),
         "{refused}"
+    );
+    assert!(
+        refused.to_string().contains("Wells"),
+        "the refusal does not name the dataset: {refused}"
     );
     assert!(
         !calls
@@ -748,6 +927,36 @@ fn a_delta_of_a_delta_is_refused_even_with_a_cursor() {
             .iter()
             .any(|call| call.route == "/extractChanges"),
         "a run that cannot be paired started a job on the server anyway"
+    );
+}
+
+/// The local diff still refuses a delta as a basis: its feature files hold only
+/// what changed, so every row it left alone would read as vanished. Here the
+/// index is there and it is the service that has stopped tracking changes.
+#[test]
+fn a_delta_is_refused_where_the_local_diff_would_run() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let first = tempfile::tempdir().expect("tempdir");
+    let second = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    ArcgisSource::open_with(Box::new(changed_fake()), ROOT)
+        .expect("the fixture opens")
+        .extract_since(first.path(), OPERATOR, full.path())
+        .expect("the first delta runs");
+
+    let untracked = Fake::new()
+        .json("", service_root())
+        .json("/0", wells_layer())
+        .json("/1", logs_table())
+        .answering("/0/query", wells_later)
+        .answering("/1/query", logs_pages);
+    let refused = ArcgisSource::open_with(Box::new(untracked), ROOT)
+        .expect("the fixture opens")
+        .extract_since(second.path(), OPERATOR, first.path())
+        .expect_err("a local diff of a delta is not a delta");
+    assert!(
+        matches!(&refused, ArcgisError::DeltaPrevious { reason, .. } if reason.contains("read every row that delta left alone as vanished")),
+        "{refused}"
     );
 }
 

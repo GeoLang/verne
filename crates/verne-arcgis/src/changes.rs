@@ -19,12 +19,19 @@
 //! `returnIdsOnly=true` is not asked for: on a live service it answers with
 //! empty edits for windows the async job returns thousands of rows for, so the
 //! change file is the only source that can be trusted.
+//!
+//! A delta on this path also writes down what ptolemy now holds, one line per
+//! row per dataset. Its own feature files hold only the rows it touched, so
+//! nothing else in them could tell the next delta which feature id an object id
+//! belongs to, and without that a row edited two windows running would come
+//! back as a second copy of itself.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use verne_core::safe_file_name;
 
 use crate::ArcgisError;
 use crate::client::{Fetch, json, json_post, parse};
@@ -34,6 +41,9 @@ use crate::service::text;
 /// sidecar and not into it: the loader reads the sidecar, and a cursor into
 /// one service is nothing to it.
 pub const SERVER_GENS_FILE: &str = "server-gens.json";
+
+/// Where a delta writes down what ptolemy holds, one file per dataset.
+pub const OBJECT_IDS_DIR: &str = "object-ids";
 
 /// How often a running job is asked whether it is done. A hundred thousand
 /// edits took about a minute on a live service, so nothing is gained by
@@ -105,6 +115,83 @@ pub fn write(directory: &Path, gens: &RecordedGens) -> Result<(), ArcgisError> {
     let path = directory.join(SERVER_GENS_FILE);
     let held = serde_json::to_string_pretty(gens).expect("generations hold only text and numbers");
     std::fs::write(&path, held + "\n").map_err(|source| ArcgisError::Write {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// One row of a dataset as the index holds it: the object id the service knows
+/// it by, the feature id ptolemy holds it under, and a hash of what was last
+/// written for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Indexed {
+    pub oid: String,
+    pub feature_id: String,
+    pub hash: u64,
+}
+
+pub fn index_path(directory: &Path, dataset: &str) -> PathBuf {
+    directory
+        .join(OBJECT_IDS_DIR)
+        .join(format!("{}.ndjson", safe_file_name(dataset)))
+}
+
+/// One dataset's index, as the delta that wrote it left it.
+pub fn read_index(directory: &Path, dataset: &str) -> Result<Vec<Indexed>, ArcgisError> {
+    let path = index_path(directory, dataset);
+    let held = std::fs::read_to_string(&path).map_err(|source| ArcgisError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut rows = Vec::new();
+    for (number, line) in held.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(
+            serde_json::from_str(line).map_err(|error| ArcgisError::BadPrevious {
+                path: path.display().to_string(),
+                message: format!("line {}: {error}", number + 1),
+            })?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Write one dataset's index. A line per row rather than one JSON document,
+/// because a dataset holds as many rows as the service does and this file is
+/// read a line at a time.
+pub fn write_index(
+    directory: &Path,
+    dataset: &str,
+    rows: &BTreeMap<String, (String, u64)>,
+) -> Result<(), ArcgisError> {
+    let path = index_path(directory, dataset);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ArcgisError::Write {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    let file = std::fs::File::create(&path).map_err(|source| ArcgisError::Write {
+        path: path.display().to_string(),
+        source,
+    })?;
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(file);
+    for (oid, (feature_id, hash)) in rows {
+        let line = serde_json::to_string(&Indexed {
+            oid: oid.clone(),
+            feature_id: feature_id.clone(),
+            hash: *hash,
+        })
+        .expect("an index row holds only text and a number");
+        writeln!(out, "{line}").map_err(|source| ArcgisError::Write {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    out.flush().map_err(|source| ArcgisError::Write {
         path: path.display().to_string(),
         source,
     })

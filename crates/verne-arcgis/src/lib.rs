@@ -3,30 +3,76 @@
 //! The hosted half of the Esri story. The gdb adapter reads a `.gdb` on disk
 //! through GDAL; this crate reads a feature service over HTTP and needs no
 //! GDAL at all, so it is always built. Reading is read-only by construction:
-//! every request is a GET, and the one credential comes from the environment
-//! rather than an argument, so it is never in a process list.
+//! every request reads (the one POST is a query whose id list outgrows a
+//! URL), and the credentials come from the environment rather than an
+//! argument, so they are never in a process list.
 //!
 //! The service does the reprojecting. Every feature query asks for EPSG:4326
 //! in `outSR` and verne does no coordinate arithmetic, which is what lets the
-//! loader's whole path stay GDAL-free. The cost is named in the report: no
-//! native original rides on the inserts, and there is no GeoPackage on this
-//! path, because writing one is GDAL's work.
+//! loader's whole path stay GDAL-free; the untransformed original is fetched
+//! in a second per-page pass and rides on each insert where its reference can
+//! be declared at all. There is no GeoPackage on this path, because writing
+//! one is GDAL's work.
 
 use verne_core::{Item, Source, SourceDescription};
 
 mod client;
 mod extract;
 mod geometry;
+mod portal;
 mod service;
 mod verdict;
 
 pub use client::{Fetch, HttpFetch};
 pub use extract::Extraction;
 pub use geometry::{EsriGeometry, Position};
+pub use portal::{PortalService, feature_services};
 pub use service::{Layer, Service};
 
-/// The environment variable a token is read from, never an argument.
+/// The environment variables the tokens and secrets are read from, never
+/// arguments: an argument is in the process list of every other user on the
+/// machine.
 pub const TOKEN_VAR: &str = "VERNE_ARCGIS_TOKEN";
+pub const CLIENT_ID_VAR: &str = "VERNE_ARCGIS_CLIENT_ID";
+pub const CLIENT_SECRET_VAR: &str = "VERNE_ARCGIS_CLIENT_SECRET";
+pub const PORTAL_VAR: &str = "VERNE_ARCGIS_PORTAL";
+
+/// How verne proves who it is to the service.
+pub enum Credentials {
+    /// A public service, which needs nothing.
+    Anonymous,
+    /// A token the operator already holds, sent as it stands.
+    Token(String),
+    /// An app id and secret verne mints a token from itself, so a long run
+    /// does not die when the token it was handed expires. `token_url` is the
+    /// portal's `oauth2/token` route.
+    ClientCredentials {
+        token_url: String,
+        client_id: String,
+        client_secret: String,
+    },
+}
+
+/// Written by hand rather than derived: a derived `Debug` would put the secret
+/// in whatever log line or panic printed it.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credentials::Anonymous => formatter.write_str("Anonymous"),
+            Credentials::Token(_) => formatter.write_str("Token(redacted)"),
+            Credentials::ClientCredentials {
+                token_url,
+                client_id,
+                ..
+            } => formatter
+                .debug_struct("ClientCredentials")
+                .field("token_url", token_url)
+                .field("client_id", client_id)
+                .field("client_secret", &"redacted")
+                .finish(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArcgisError {
@@ -70,23 +116,40 @@ pub struct ArcgisSource {
 }
 
 impl ArcgisSource {
-    /// Fetch the service and every layer it lists. `token` is sent on every
-    /// request when given; a public service needs none.
-    pub fn open(url: &str, token: Option<String>) -> Result<Self, ArcgisError> {
-        let fetch = HttpFetch::new(token)?;
+    /// Fetch the service and every layer it lists. The credentials are sent on
+    /// every request; a public service needs none.
+    pub fn open(url: &str, credentials: Credentials) -> Result<Self, ArcgisError> {
+        let fetch = HttpFetch::new(credentials)?;
         Self::open_with(Box::new(fetch), url)
     }
 
     /// The same open against any [`Fetch`], which is what lets the tests feed
     /// canned responses instead of standing up a server.
+    ///
+    /// A URL ending in a layer id, which is how a portal names its items,
+    /// scopes the source to that one layer: only it is fetched, inventoried
+    /// and extracted, and a relationship whose other side is out of scope is
+    /// reported rather than followed.
     pub fn open_with(fetch: Box<dyn Fetch>, url: &str) -> Result<Self, ArcgisError> {
-        let url = normalize(url)?;
+        let (url, scope) = normalize(url)?;
         let root = client::json(fetch.as_ref(), &url, &[])?;
         let (head, ids) =
             service::parse_service(&root).map_err(|message| ArcgisError::BadShape {
                 route: url.clone(),
                 message,
             })?;
+        let ids: Vec<i64> = match scope {
+            Some(scoped) => {
+                if !ids.contains(&scoped) {
+                    return Err(ArcgisError::BadUrl(
+                        format!("{url}/{scoped}"),
+                        format!("the service lists no layer or table with id {scoped}"),
+                    ));
+                }
+                vec![scoped]
+            }
+            None => ids,
+        };
         let mut layers = Vec::new();
         for id in ids {
             let route = format!("{url}/{id}");
@@ -105,6 +168,7 @@ impl ArcgisSource {
         Ok(ArcgisSource {
             service: Service {
                 url,
+                scope,
                 description: head.description,
                 versioned: head.versioned,
                 layers,
@@ -134,10 +198,11 @@ fn count(fetch: &dyn Fetch, url: &str, id: i64) -> Option<u64> {
     value.get("count").and_then(serde_json::Value::as_u64)
 }
 
-/// The FeatureServer root, held to exactly that: a layer id on the end would
-/// make every route this crate builds wrong, and a MapServer answers to a
-/// different contract than the one verne was written against.
-fn normalize(url: &str) -> Result<String, ArcgisError> {
+/// The FeatureServer root, and the one layer the URL scoped verne to when it
+/// ended in a layer id, which is how a portal names its items. A MapServer is
+/// refused: it answers to a different contract than the one verne was written
+/// against.
+fn normalize(url: &str) -> Result<(String, Option<i64>), ArcgisError> {
     let trimmed = url.trim_end_matches('/');
     if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(ArcgisError::BadUrl(
@@ -145,22 +210,22 @@ fn normalize(url: &str) -> Result<String, ArcgisError> {
             "expected http:// or https://".into(),
         ));
     }
-    let last = trimmed.rsplit('/').next().unwrap_or_default();
-    if last.chars().all(|c| c.is_ascii_digit()) && !last.is_empty() {
+    let (root, scope) = match trimmed.rsplit_once('/') {
+        Some((root, last)) if !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()) => {
+            let id = last.parse().map_err(|_| {
+                ArcgisError::BadUrl(url.to_string(), format!("layer {last} is not an id"))
+            })?;
+            (root, Some(id))
+        }
+        _ => (trimmed, None),
+    };
+    if root.rsplit('/').next() != Some("FeatureServer") {
         return Err(ArcgisError::BadUrl(
             url.to_string(),
-            format!(
-                "this points at layer {last}; give the FeatureServer root and verne will read every layer in it"
-            ),
+            "expected a URL ending in /FeatureServer, or in /FeatureServer/<layer id>".into(),
         ));
     }
-    if last != "FeatureServer" {
-        return Err(ArcgisError::BadUrl(
-            url.to_string(),
-            "expected a URL ending in /FeatureServer".into(),
-        ));
-    }
-    Ok(trimmed.to_string())
+    Ok((root.to_string(), scope))
 }
 
 impl Source for ArcgisSource {
@@ -182,8 +247,13 @@ impl Source for ArcgisSource {
         if let Some(description) = &self.service.description {
             detail.push_str(&format!(". {description}"));
         }
-        SourceDescription::new("ArcGIS Feature Service", self.service.url.clone())
-            .with_detail(detail)
+        // the location is the URL as the operator gave it, scope included, so
+        // the report and the sidecar say what was pointed at
+        let location = match self.service.scope {
+            Some(id) => format!("{}/{id}", self.service.url),
+            None => self.service.url.clone(),
+        };
+        SourceDescription::new("ArcGIS Feature Service", location).with_detail(detail)
     }
 
     fn inventory(&self) -> Result<Vec<Item>, Self::Error> {
@@ -199,21 +269,27 @@ impl Source for ArcgisSource {
 mod tests {
     use super::normalize;
 
+    /// A portal names its items by layer URL, so one scopes the source rather
+    /// than being refused.
     #[test]
-    fn a_layer_url_is_refused_with_directions() {
-        let refused =
-            normalize("https://host/arcgis/rest/services/x/FeatureServer/3").expect_err("refused");
-        assert!(refused.to_string().contains("layer 3"), "{refused}");
+    fn a_layer_url_scopes_the_source_to_that_layer() {
+        let (root, scope) =
+            normalize("https://host/arcgis/rest/services/x/FeatureServer/3").expect("accepted");
+        assert_eq!(root, "https://host/arcgis/rest/services/x/FeatureServer");
+        assert_eq!(scope, Some(3));
     }
 
     #[test]
     fn a_mapserver_url_is_refused() {
         assert!(normalize("https://host/arcgis/rest/services/x/MapServer").is_err());
+        assert!(normalize("https://host/arcgis/rest/services/x/MapServer/3").is_err());
     }
 
     #[test]
     fn a_trailing_slash_is_trimmed() {
-        let url = normalize("https://host/rest/services/x/FeatureServer/").expect("accepted");
+        let (url, scope) =
+            normalize("https://host/rest/services/x/FeatureServer/").expect("accepted");
         assert_eq!(url, "https://host/rest/services/x/FeatureServer");
+        assert_eq!(scope, None);
     }
 }

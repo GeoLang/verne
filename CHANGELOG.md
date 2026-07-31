@@ -23,3 +23,18 @@ All notable changes to this project will be documented in this file.
   the REST layer description has none, and the report says so.
 - ArcGIS's habit of answering a failed request with HTTP 200 and an error
   object in the body surfaces as an error naming the route.
+- The untransformed originals ride on REST inserts too: each page is fetched a
+  second time by its object ids in the layer's own reference, and the original
+  lands beside the working copy as its EPSG code, or as the reference's WKT
+  when only Esri's own authority names it.
+- OAuth client_credentials: with `VERNE_ARCGIS_CLIENT_ID` and
+  `VERNE_ARCGIS_CLIENT_SECRET` set, verne mints its own token against the
+  portal named by `VERNE_ARCGIS_PORTAL` (arcgis.com by default) and re-mints
+  it before it expires. A ready `VERNE_ARCGIS_TOKEN` still wins.
+- `verne services <portal-url>`: list the feature services a portal holds
+  through `sharing/rest/search`, one URL per line, with `--owner` to narrow
+  to an account. The same credentials apply, so a private portal lists what
+  the token may see.
+- A FeatureServer URL ending in a layer id scopes inspect and extract to that
+  one layer, which is the shape a portal's item URLs come in, so the listing
+  pipes straight into `verne inspect`.

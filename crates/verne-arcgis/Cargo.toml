@@ -12,8 +12,9 @@ verne-core = { path = "../verne-core" }
 # same client as verne-load: rustls rather than the system OpenSSL
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
+    # form-body building and query-string building are their own features in 0.13
+    "form",
     "json",
-    # query-string building is its own feature in 0.13
     "query",
     "rustls",
 ] }

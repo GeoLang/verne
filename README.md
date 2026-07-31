@@ -55,10 +55,14 @@ verne inspect wells.gdb
 verne extract wells.gdb --out ./wells-extract --operator you@example.com
 
 # a hosted feature service, by its FeatureServer root; a private one reads
-# the token from VERNE_ARCGIS_TOKEN
+# VERNE_ARCGIS_TOKEN, or mints its own token from VERNE_ARCGIS_CLIENT_ID and
+# VERNE_ARCGIS_CLIENT_SECRET
 verne inspect https://host/arcgis/rest/services/Wells/FeatureServer
 verne extract https://host/arcgis/rest/services/Wells/FeatureServer \
     --out ./wells-extract --operator you@example.com
+
+# list a portal's feature services, one URL per line
+verne services https://www.arcgis.com --owner your-org-account
 
 # create them in a running ptolemy
 export VERNE_PTOLEMY_TOKEN=<a bearer token that may write>
@@ -126,12 +130,23 @@ what did not survive.
 
 ## Feature services
 
-`verne inspect` and `verne extract` take a FeatureServer root URL and read it
+`verne inspect` and `verne extract` take a FeatureServer URL and read it
 through the documented REST API: the service resource, each layer and table,
-`/query` for the features, and the attachment routes for the blobs. The scope
-is the operator's own services with their own credentials: verne takes a
-ready token, records who ran the extraction, and touches nothing it is not
-pointed at.
+`/query` for the features, and the attachment routes for the blobs. A URL
+ending in a layer id, which is how a portal names its items and how `verne
+services` prints them, scopes verne to that one layer: only it is read, and a
+relationship whose other side is out of scope is reported rather than
+followed. The scope is the operator's own services with their own
+credentials: verne records who ran the extraction and touches nothing it is
+not pointed at.
+
+Credentials come from the environment, never arguments. A ready token in
+`VERNE_ARCGIS_TOKEN` wins; failing that, `VERNE_ARCGIS_CLIENT_ID` and
+`VERNE_ARCGIS_CLIENT_SECRET` have verne mint its own token by OAuth
+client_credentials against the portal in `VERNE_ARCGIS_PORTAL` (arcgis.com
+when unset) and re-mint it a minute before it expires; failing both, the
+service is read as the public. The secret goes to the token route as a form
+body and nowhere else: not in a URL, an error, or a log line.
 
 What is inventoried: layers and tables with their fields, aliases and domain
 bindings, coded and range domains, subtypes with their defaults and per-subtype
@@ -143,10 +158,14 @@ Three things differ from a geodatabase on disk, and the report names each:
 
 - **The service does the reprojecting.** Every query asks for EPSG:4326 in
   `outSR` and verne does no coordinate arithmetic, which is what keeps this
-  side GDAL-free. Esri does not document which datum transformation answers
-  that, and the coordinates as stored are not fetched, so no native original
-  rides on the inserts. The source stays hosted, which is what makes the loss
-  bearable: the original coordinates are where they always were.
+  side GDAL-free; Esri does not document which datum transformation answers
+  that, so the report says the transform happened without naming a number.
+  The coordinates as the service stores them still survive it: each page is
+  fetched a second time by its object ids, untransformed and POSTed because a
+  page of ids does not fit in a URL, and the original rides on each insert as
+  its EPSG code, or as the reference's WKT definition when only Esri's own
+  authority names it. A reference verne cannot state at all is the one case
+  the original stays behind, and the log says so per layer.
 - **No GeoPackage.** The feature files and the sidecar are the whole
   extraction.
 - **A layer's relationship description carries no forward or backward label

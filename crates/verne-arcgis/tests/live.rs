@@ -12,7 +12,7 @@
 //! cargo test -p verne-arcgis --test live -- --nocapture
 //! ```
 
-use verne_arcgis::{ArcgisSource, TOKEN_VAR};
+use verne_arcgis::{ArcgisSource, Credentials, TOKEN_VAR};
 use verne_core::Source;
 
 #[test]
@@ -25,10 +25,14 @@ fn a_live_feature_service_inventories_and_extracts() {
         return;
     };
     // a public service needs none, so an unset token is not a skip
-    let token = std::env::var(TOKEN_VAR)
+    let credentials = match std::env::var(TOKEN_VAR)
         .ok()
-        .filter(|held| !held.is_empty());
-    let source = ArcgisSource::open(&url, token).expect("the service opens");
+        .filter(|held| !held.is_empty())
+    {
+        Some(token) => Credentials::Token(token),
+        None => Credentials::Anonymous,
+    };
+    let source = ArcgisSource::open(&url, credentials).expect("the service opens");
     eprintln!("{:?}", source.describe());
 
     let items = source.inventory().expect("the service inventories");

@@ -22,7 +22,7 @@ enum Command {
     /// Report what a source holds and how much of it GeoLang could keep
     Inspect {
         /// Path to a .kml or .kmz file or a .gdb directory, or the URL of an
-        /// ArcGIS FeatureServer root
+        /// ArcGIS FeatureServer, whole or scoped to one layer id
         source: String,
         /// Also write the report as JSON to this path
         #[arg(long, value_name = "PATH")]
@@ -31,7 +31,8 @@ enum Command {
     /// Write a source out as a sidecar ptolemy can load: a geodatabase also
     /// gets a GeoPackage, a feature service is fetched over REST
     Extract {
-        /// Path to a .gdb directory, or the URL of an ArcGIS FeatureServer root
+        /// Path to a .gdb directory, or the URL of an ArcGIS FeatureServer,
+        /// whole or scoped to one layer id
         source: String,
         /// Directory to write the features, the attachment blobs, the sidecar
         /// and the log into (and the GeoPackage, from a geodatabase)
@@ -40,6 +41,14 @@ enum Command {
         /// Who is running this, recorded in the extraction log
         #[arg(long, value_name = "NAME")]
         operator: String,
+    },
+    /// List the feature services a portal holds, one URL per line
+    Services {
+        /// Root of the portal, such as https://www.arcgis.com
+        portal: String,
+        /// Only the services this account owns
+        #[arg(long, value_name = "NAME")]
+        owner: Option<String>,
     },
     /// Create the datasets, domains, subtypes, relationship classes, features
     /// and attachments an extraction produced in a running ptolemy
@@ -94,6 +103,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 extract(&PathBuf::from(&source), &out, &operator)
             }
         }
+        Command::Services { portal, owner } => services(&portal, owner.as_deref()),
         Command::Load { path, ptolemy } => load(&path, &ptolemy),
     }
 }
@@ -106,11 +116,55 @@ fn is_url(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
 }
 
-/// A feature service, with the token from [`verne_arcgis::TOKEN_VAR`] when one
-/// is set; a public service needs none.
+/// The portal a token is minted at when none is named.
+const DEFAULT_PORTAL: &str = "https://www.arcgis.com";
+
 fn open_service(url: &str) -> Result<verne_arcgis::ArcgisSource, Box<dyn std::error::Error>> {
-    let token = std::env::var(verne_arcgis::TOKEN_VAR).ok();
-    Ok(verne_arcgis::ArcgisSource::open(url, token)?)
+    Ok(verne_arcgis::ArcgisSource::open(
+        url,
+        arcgis_credentials()?,
+    )?)
+}
+
+/// A token the operator holds wins over an app id and secret: whoever set one
+/// meant it to be used. Failing both, the service is read as the public.
+fn arcgis_credentials() -> Result<verne_arcgis::Credentials, Box<dyn std::error::Error>> {
+    if let Some(token) = env(verne_arcgis::TOKEN_VAR) {
+        return Ok(verne_arcgis::Credentials::Token(token));
+    }
+    match (
+        env(verne_arcgis::CLIENT_ID_VAR),
+        env(verne_arcgis::CLIENT_SECRET_VAR),
+    ) {
+        (Some(client_id), Some(client_secret)) => {
+            let portal =
+                env(verne_arcgis::PORTAL_VAR).unwrap_or_else(|| DEFAULT_PORTAL.to_string());
+            Ok(verne_arcgis::Credentials::ClientCredentials {
+                token_url: format!("{}/sharing/rest/oauth2/token", portal.trim_end_matches('/')),
+                client_id,
+                client_secret,
+            })
+        }
+        (Some(_), None) => Err(format!(
+            "{} is set without {}, and half a client credential mints nothing",
+            verne_arcgis::CLIENT_ID_VAR,
+            verne_arcgis::CLIENT_SECRET_VAR
+        )
+        .into()),
+        (None, Some(_)) => Err(format!(
+            "{} is set without {}, and half a client credential mints nothing",
+            verne_arcgis::CLIENT_SECRET_VAR,
+            verne_arcgis::CLIENT_ID_VAR
+        )
+        .into()),
+        (None, None) => Ok(verne_arcgis::Credentials::Anonymous),
+    }
+}
+
+/// A variable set to nothing is a variable unset: an empty token would be sent
+/// as a credential and refused.
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|held| !held.is_empty())
 }
 
 fn extract_service(
@@ -121,6 +175,21 @@ fn extract_service(
     let extraction = open_service(url)?.extract(out, operator)?;
     println!("{}", extraction.sidecar.log.to_markdown());
     eprintln!("wrote {}", extraction.sidecar_path.display());
+    Ok(())
+}
+
+/// The URL comes first on the line so a listing pipes straight into an inspect,
+/// and a portal holding nothing that matched is not a failure.
+fn services(portal: &str, owner: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let fetch = verne_arcgis::HttpFetch::new(arcgis_credentials()?)?;
+    let services = verne_arcgis::feature_services(&fetch, portal, owner)?;
+    if services.is_empty() {
+        eprintln!("no feature services matched");
+        return Ok(());
+    }
+    for service in &services {
+        println!("{}  {} ({})", service.url, service.title, service.owner);
+    }
     Ok(())
 }
 

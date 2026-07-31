@@ -148,16 +148,22 @@ fn layer_losses(layer: &Layer) -> Vec<String> {
 
 /// What getting a layer's geometry into the only spatial reference ptolemy
 /// stores costs it. The service does the transforming: every query asks for
-/// EPSG:4326 in `outSR` and verne does no coordinate arithmetic, so unlike a
-/// file extraction there is no second output keeping the source's own
-/// coordinates, only the service itself.
+/// EPSG:4326 in `outSR` and verne does no coordinate arithmetic. The
+/// coordinates as stored are fetched in a second pass, paired by object id,
+/// and ride on each insert, where the reference can be declared at all.
 fn reprojection_losses(layer: &Layer) -> Vec<String> {
-    match layer.wkid {
-        Some(4326) => Vec::new(),
-        Some(code) => vec![format!(
-            "ptolemy serves geometry as EPSG:4326, so every query asks the service to answer in it and the service transforms this layer out of wkid {code} itself; Esri does not document which datum transformation that picks, verne cannot ask for one, and the coordinates as the service stores them are not fetched, so no native original rides on the inserts and the layer's own reference lives on only in the service"
+    match (layer.wkid, &layer.crs_wkt) {
+        (Some(4326), _) => Vec::new(),
+        (Some(code), _) if code < 33000 => vec![format!(
+            "ptolemy serves geometry as EPSG:4326, so every query asks the service to answer in it and the service transforms this layer out of EPSG:{code} itself; Esri does not document which datum transformation that picks and verne cannot ask for one. the coordinates as the service stores them are fetched in a second pass and ride on each insert as EPSG:{code}, stored beside the working copy and read back exactly by feature"
         )],
-        None => vec![
+        (Some(code), Some(_)) => vec![format!(
+            "ptolemy serves geometry as EPSG:4326, so every query asks the service to answer in it and the service transforms this layer out of wkid {code} itself; {code} is Esri's own authority rather than an EPSG code, so the coordinates as stored are fetched in a second pass and ride on each insert with the reference's WKT definition, stored beside the working copy"
+        )],
+        (Some(code), None) => vec![format!(
+            "ptolemy serves geometry as EPSG:4326, so every query asks the service to answer in it and the service transforms this layer out of wkid {code} itself; {code} is Esri's own authority rather than an EPSG code and the layer states no WKT for it, so the original cannot be declared to ptolemy, is not fetched, and lives on only in the service"
+        )],
+        (None, _) => vec![
             "the layer states no spatial reference verne can read; every query still asks for EPSG:4326 and the service's own knowledge of its source reference decides what that means, so verne cannot say what the coordinates were transformed out of".to_string(),
         ],
     }
@@ -391,8 +397,10 @@ fn dedup(mut values: Vec<String>) -> Vec<String> {
 pub struct Pairing<'a> {
     pub origin_layer: &'a Layer,
     pub origin: &'a RelationshipEnd,
-    /// Absent when the related table is not in this service, which the REST
-    /// model allows and ptolemy cannot hold.
+    /// Absent when the related table is not among the layers verne was
+    /// pointed at: a table outside the service, which the REST model allows,
+    /// or outside the one layer the operator's URL scoped verne to. ptolemy
+    /// can hold neither.
     pub destination: Option<(&'a Layer, &'a RelationshipEnd)>,
 }
 
@@ -456,7 +464,10 @@ fn relationship_detail(pairing: &Pairing<'_>) -> String {
     };
     let destination = match &pairing.destination {
         Some((layer, end)) => side(layer, &end.key_field),
-        None => format!("table id {}, not in this service", origin.related_table_id),
+        None => format!(
+            "table id {}, not among the layers verne was pointed at",
+            origin.related_table_id
+        ),
     };
     let mut detail = format!(
         "{}: {} -> {}, {}, {}",
@@ -490,7 +501,7 @@ fn relationship_losses(pairing: &Pairing<'_>) -> Vec<String> {
     ];
     if pairing.destination.is_none() {
         losses.push(format!(
-            "the other side is table id {}, which is not in this service, and a relationship class in ptolemy names two dataset ids, so the class cannot be created",
+            "the other side is table id {}, which is not among the layers verne was pointed at, and a relationship class in ptolemy names two dataset ids, so the class cannot be created",
             origin.related_table_id
         ));
     }

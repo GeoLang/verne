@@ -14,6 +14,9 @@ use serde::Deserialize;
 pub struct Service {
     /// The FeatureServer root, no trailing slash.
     pub url: String,
+    /// The one layer the operator's URL scoped verne to, when it named one.
+    /// `layers` then holds it and nothing else.
+    pub scope: Option<i64>,
     pub description: Option<String>,
     /// `hasVersionedData`: only an enterprise geodatabase behind the service
     /// can make this true.
@@ -39,6 +42,9 @@ pub struct Layer {
     /// The reference the layer answers in when no `outSR` is asked for:
     /// `latestWkid` where the service states one, else `wkid`.
     pub wkid: Option<i32>,
+    /// The same reference as WKT, which is how a custom or compound one is
+    /// stated when no code names it.
+    pub crs_wkt: Option<String>,
     pub object_id_field: Option<String>,
     pub max_record_count: Option<u64>,
     pub supports_pagination: bool,
@@ -190,6 +196,8 @@ struct RawSpatialReference {
     wkid: Option<i32>,
     #[serde(default)]
     latest_wkid: Option<i32>,
+    #[serde(default)]
+    wkt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -327,15 +335,18 @@ pub fn parse_layer(json: &serde_json::Value) -> Result<Layer, String> {
             supports_pagination: false,
             supports_query_attachments: false,
         });
+    let reference = raw.extent.and_then(|extent| extent.spatial_reference);
     Ok(Layer {
         id: raw.id,
         geometry_type: raw.geometry_type.filter(|kind| kind != "esriGeometryNull"),
         has_z: raw.has_z,
         has_m: raw.has_m,
-        wkid: raw.extent.and_then(|extent| {
-            let reference = extent.spatial_reference?;
-            reference.latest_wkid.or(reference.wkid)
-        }),
+        wkid: reference
+            .as_ref()
+            .and_then(|held| held.latest_wkid.or(held.wkid)),
+        crs_wkt: reference
+            .and_then(|held| held.wkt)
+            .filter(|wkt| !wkt.trim().is_empty()),
         object_id_field: raw.object_id_field.filter(|name| !name.is_empty()),
         max_record_count: raw.max_record_count,
         supports_pagination: capabilities.supports_pagination,

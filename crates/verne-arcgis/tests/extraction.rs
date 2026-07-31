@@ -32,6 +32,29 @@ fn wells_pages(params: &[(&str, String)]) -> Vec<u8> {
     if param(params, "returnCountOnly").is_some() {
         return serde_json::to_vec(&json!({ "count": 3 })).expect("the count serialises");
     }
+    // the second pass: the page's rows again by object id, untransformed, so
+    // no outSR, and only the pairing key comes back as an attribute
+    if let Some(oids) = param(params, "objectIds") {
+        assert_eq!(param(params, "outSR"), None, "{params:?}");
+        assert_eq!(param(params, "outFields"), Some("objectid"), "{params:?}");
+        assert_eq!(param(params, "returnGeometry"), Some("true"), "{params:?}");
+        let natives: Vec<serde_json::Value> = oids
+            .split(',')
+            .map(|oid| {
+                let oid: i64 = oid.parse().expect("an object id");
+                // web mercator metres, unmistakably not degrees
+                json!({
+                    "attributes": { "objectid": oid },
+                    "geometry": { "x": 389600.0 + oid as f64, "y": 6540000.0 }
+                })
+            })
+            .collect();
+        return serde_json::to_vec(&json!({
+            "objectIdFieldName": "objectid",
+            "features": natives
+        }))
+        .expect("the native page serialises");
+    }
     assert_eq!(param(params, "where"), Some("1=1"), "{params:?}");
     assert_eq!(param(params, "outFields"), Some("*"), "{params:?}");
     assert_eq!(param(params, "returnGeometry"), Some("true"), "{params:?}");
@@ -188,10 +211,27 @@ fn three_features_arrive_across_two_pages() {
     let offsets: Vec<String> = calls
         .borrow()
         .iter()
-        .filter(|call| call.route == "/0/query" && call.param("returnCountOnly").is_none())
+        .filter(|call| {
+            call.route == "/0/query"
+                && call.param("returnCountOnly").is_none()
+                && call.param("objectIds").is_none()
+        })
         .map(|call| call.param("resultOffset").unwrap_or("none").to_string())
         .collect();
     assert_eq!(offsets, ["0", "2"]);
+
+    // each page was followed by its native pass, POSTed because the object id
+    // list of a full page does not fit in a URL
+    let native_ids: Vec<String> = calls
+        .borrow()
+        .iter()
+        .filter(|call| call.route == "/0/query" && call.param("objectIds").is_some())
+        .map(|call| {
+            assert_eq!(call.method, "POST");
+            call.param("objectIds").unwrap_or_default().to_string()
+        })
+        .collect();
+    assert_eq!(native_ids, ["1,2", "3"]);
 }
 
 #[test]
@@ -206,10 +246,15 @@ fn every_line_is_an_insert_ptolemy_could_take() {
             "{}",
             feature.geometry_wkb_hex
         );
-        // the service transformed on the way out, so there is no distinct
-        // original to send
-        assert_eq!(feature.native_geometry_wkb_hex, None);
-        assert_eq!(feature.native_srid, None);
+        // the untransformed original came back from the second pass and rides
+        // on the insert as the layer's EPSG code
+        let native = feature
+            .native_geometry_wkb_hex
+            .as_deref()
+            .expect("a native original on a transformed layer");
+        assert!(native.starts_with("0101000000"), "{native}");
+        assert_ne!(native, feature.geometry_wkb_hex);
+        assert_eq!(feature.native_srid, Some(3857));
         assert_eq!(feature.native_crs_wkt, None);
     }
     // a table row carries the empty geometry collection instead
@@ -443,7 +488,9 @@ fn the_log_names_the_reprojection_and_leaves_the_renderer_behind() {
     assert_eq!(extraction.sidecar.log.operator, OPERATOR);
 
     let reprojected = entries.iter().any(|entry| match &entry.action {
-        Action::CarriedWithLoss { losses } => losses.iter().any(|loss| loss.contains("wkid 3857")),
+        Action::CarriedWithLoss { losses } => losses
+            .iter()
+            .any(|loss| loss.contains("EPSG:3857") && loss.contains("second pass")),
         _ => false,
     });
     assert!(reprojected, "no entry names the transform: {entries:#?}");

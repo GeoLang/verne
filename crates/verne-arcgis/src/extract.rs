@@ -20,7 +20,7 @@ use verne_core::{
     NewSubtype, SIDECAR_FILE, Sidecar, Source, safe_file_name,
 };
 
-use crate::client::{Fetch, json};
+use crate::client::{Fetch, json, json_post};
 use crate::geometry::{EMPTY_GEOMETRY, EsriGeometry, Position};
 use crate::service::{DomainKind, Layer, text};
 use crate::verdict::{self, Pairing};
@@ -480,7 +480,7 @@ fn new_relationship(
     let origin = pairing.origin;
     let Some((destination_layer, destination)) = &pairing.destination else {
         return Err(format!(
-            "{} relates to table id {}, which is not in this service, and a relationship class in ptolemy names two dataset ids",
+            "{} relates to table id {}, which is not among the layers verne was pointed at, and a relationship class in ptolemy names two dataset ids",
             origin.name, origin.related_table_id
         ));
     };
@@ -540,6 +540,32 @@ struct Tally {
     largest: usize,
     /// Vertices whose declared Z or M was missing and written as zero.
     nulled_ordinates: usize,
+    /// Rows whose untransformed original did not come back from the second
+    /// pass, so their inserts carry the working copy alone.
+    no_native: usize,
+}
+
+/// How a transformed layer's original reference is said to ptolemy: by EPSG
+/// code when one names it, or by the WKT definition when only that does.
+enum OriginalRef {
+    Code(i32),
+    Wkt(String),
+}
+
+/// Whether this layer's features get a second, untransformed fetch, and how
+/// the original's reference would be declared. None when there is nothing to
+/// fetch: a table, a layer already in 4326, or a reference verne cannot state,
+/// where a fetched original could not be declared to ptolemy anyway.
+fn original_ref(layer: &Layer) -> Option<OriginalRef> {
+    layer.geometry_type.as_ref()?;
+    match (layer.wkid, &layer.crs_wkt) {
+        (Some(4326), _) => None,
+        // wkids below 33000 are EPSG codes; from there up they are Esri's own
+        // authority, which ptolemy's native_srid cannot name
+        (Some(code), _) if code < 33000 => Some(OriginalRef::Code(code)),
+        (_, Some(wkt)) => Some(OriginalRef::Wkt(wkt.clone())),
+        _ => None,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -608,6 +634,18 @@ fn write_layer(
     let mut losses = Vec::new();
     let page_size = layer.max_record_count.unwrap_or(DEFAULT_PAGE);
     let route = format!("{url}/{}/query", layer.id);
+    // the original is only fetchable when there is an object id to pair the
+    // two passes on; without one the pairing would be a guess
+    let original = match (original_ref(layer), &layer.object_id_field) {
+        (Some(original), Some(_)) => Some(original),
+        (Some(_), None) => {
+            losses.push(
+                "the layer names no object id field, so the untransformed originals could not be paired with the features and none were fetched".to_string(),
+            );
+            None
+        }
+        (None, _) => None,
+    };
     let mut offset: u64 = 0;
     let mut empty_pages = 0u32;
     loop {
@@ -658,6 +696,13 @@ fn write_layer(
         empty_pages = 0;
         offset += page.features.len() as u64;
 
+        // the same rows again, untransformed, asked for by the object ids this
+        // page just delivered so an edit mid-extraction cannot skew the pairing
+        let natives = match &original {
+            Some(_) => native_page(fetch, &route, layer, &page, &mut tally)?,
+            None => BTreeMap::new(),
+        };
+
         for feature in &page.features {
             tally.read += 1;
             let id = uuid::Uuid::now_v7().to_string();
@@ -689,15 +734,32 @@ fn write_layer(
                     properties.insert((*name).to_string(), value);
                 }
             }
+            let native = original.as_ref().and_then(|_| {
+                let oid = layer
+                    .object_id_field
+                    .as_ref()
+                    .and_then(|name| feature.attributes.get(name))?;
+                natives.get(&text(oid))
+            });
+            if original.is_some() && feature.geometry.is_some() && native.is_none() {
+                tally.no_native += 1;
+            }
+            let (native_hex, native_srid, native_crs_wkt) = match (native, &original) {
+                (Some(hex), Some(OriginalRef::Code(code))) => {
+                    (Some(hex.clone()), Some(*code), None)
+                }
+                (Some(hex), Some(OriginalRef::Wkt(wkt))) => {
+                    (Some(hex.clone()), None, Some(wkt.clone()))
+                }
+                _ => (None, None, None),
+            };
             let line = serde_json::to_string(&NewFeature {
                 feature_id: id.clone(),
                 geometry_wkb_hex: geometry,
                 properties,
-                // the service transformed on the way out and the original was
-                // never fetched, so there is no distinct original to send
-                native_geometry_wkb_hex: None,
-                native_srid: None,
-                native_crs_wkt: None,
+                native_geometry_wkb_hex: native_hex,
+                native_srid,
+                native_crs_wkt,
             })
             .expect("a feature holds only serialisable values");
             // a feature ptolemy would refuse is not written: it would fail the
@@ -739,7 +801,7 @@ fn write_layer(
         source,
     })?;
 
-    losses.extend(feature_losses(layer, &tally));
+    losses.extend(feature_losses(layer, original.as_ref(), &tally));
     Ok((
         FeatureFile {
             path: Some(relative),
@@ -750,18 +812,93 @@ fn write_layer(
     ))
 }
 
+/// One page's rows again, untransformed: a POST of the page's object ids with
+/// no `outSR`, so the service answers in the layer's own reference. A POST
+/// because a thousand object ids do not fit in a URL. Keyed by object id, and
+/// a row that comes back without one, or with a shape verne cannot encode, is
+/// simply not in the map: the caller counts the features that end up bare.
+fn native_page(
+    fetch: &dyn Fetch,
+    route: &str,
+    layer: &Layer,
+    page: &RawPage,
+    tally: &mut Tally,
+) -> Result<BTreeMap<String, String>, ArcgisError> {
+    let Some(oid_field) = layer.object_id_field.as_deref() else {
+        return Ok(BTreeMap::new());
+    };
+    let oids: Vec<String> = page
+        .features
+        .iter()
+        .filter_map(|feature| feature.attributes.get(oid_field))
+        .map(text)
+        .collect();
+    if oids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut params: Vec<(&str, String)> = vec![
+        ("objectIds", oids.join(",")),
+        ("outFields", oid_field.to_string()),
+        ("returnGeometry", "true".to_string()),
+    ];
+    if layer.has_z {
+        params.push(("returnZ", "true".to_string()));
+    }
+    if layer.has_m {
+        params.push(("returnM", "true".to_string()));
+    }
+    let value = json_post(fetch, route, &params)?;
+    let natives: RawPage =
+        serde_json::from_value(value).map_err(|error| ArcgisError::BadShape {
+            route: route.to_string(),
+            message: error.to_string(),
+        })?;
+    let mut out = BTreeMap::new();
+    for feature in &natives.features {
+        let (Some(oid), Some(kind), Some(value)) = (
+            feature.attributes.get(oid_field),
+            &layer.geometry_type,
+            &feature.geometry,
+        ) else {
+            continue;
+        };
+        if let Some(shape) = esri_geometry(
+            kind,
+            value,
+            layer.has_z || natives.has_z,
+            layer.has_m || natives.has_m,
+            tally,
+        ) {
+            out.insert(text(oid), shape.wkb_hex());
+        }
+    }
+    Ok(out)
+}
+
 /// What reading the rows found, which is the part no verdict can know.
-fn feature_losses(layer: &Layer, tally: &Tally) -> Vec<String> {
+fn feature_losses(layer: &Layer, original: Option<&OriginalRef>, tally: &Tally) -> Vec<String> {
     let mut losses = Vec::new();
     if layer.geometry_type.is_some() && layer.wkid != Some(4326) {
-        losses.push(match layer.wkid {
-            Some(code) => format!(
-                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the service transformed it out of wkid {code} itself; verne does no coordinate arithmetic, cannot say which datum transformation the service chose, and did not fetch the coordinates as stored, so no native original rides on the inserts"
+        losses.push(match (original, layer.wkid) {
+            (Some(OriginalRef::Code(code)), _) => format!(
+                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the service transformed it out of EPSG:{code} itself; verne does no coordinate arithmetic and cannot say which datum transformation the service chose. the coordinates as the service stores them were fetched in a second pass, paired by object id, and ride on each insert as EPSG:{code}, which ptolemy keeps beside the working copy"
             ),
-            None => format!(
+            (Some(OriginalRef::Wkt(_)), _) => format!(
+                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the service transformed it itself; no single EPSG code names the layer's reference, so the coordinates as stored were fetched in a second pass and ride on each insert with the reference's WKT definition, which ptolemy keeps beside the working copy"
+            ),
+            (None, Some(code)) => format!(
+                "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the service transformed it out of wkid {code} itself; {code} is Esri's own authority rather than an EPSG code and the layer states no WKT for it, so the original could not be declared to ptolemy and was not fetched, and the layer's own reference lives on only in the service"
+            ),
+            (None, None) => format!(
                 "every geometry here was asked for in EPSG:{PTOLEMY_SRID} and the layer states no readable reference of its own, so what the service transformed out of is not written down"
             ),
         });
+    }
+    if tally.no_native > 0 {
+        losses.push(format!(
+            "the untransformed original of {} did not come back from the second pass, so those inserts carry the working copy alone",
+            of_rows(tally.no_native, tally.read)
+        ));
     }
     if layer.supports_pagination && layer.object_id_field.is_none() {
         losses.push(

@@ -104,6 +104,35 @@ fn the_layer_and_the_table_each_get_a_row_with_the_count_the_service_gave() {
     );
 }
 
+/// A portal names its items by layer URL, so pointing verne at one reads that
+/// layer alone, and a relationship whose other side is out of scope says so.
+#[test]
+fn a_layer_url_scopes_the_inventory_to_that_layer() {
+    let source = ArcgisSource::open_with(Box::new(fake()), &format!("{ROOT}/0"))
+        .expect("the scoped fixture opens");
+    let items = source.inventory().expect("the scoped fixture inventories");
+    let collections: Vec<&Item> = items
+        .iter()
+        .filter(|item| item.kind == ItemKind::FeatureCollection)
+        .collect();
+    assert_eq!(collections.len(), 1, "{items:#?}");
+    assert_eq!(collections[0].location, "Wells");
+    let relationship = only(&items, ItemKind::Relationship);
+    assert!(
+        relationship
+            .verdict
+            .shortfall()
+            .contains("not among the layers verne was pointed at"),
+        "{}",
+        relationship.verdict.shortfall()
+    );
+    assert_eq!(
+        source.describe().location,
+        format!("{ROOT}/0"),
+        "the report says what was pointed at"
+    );
+}
+
 #[test]
 fn open_reads_the_service_then_every_layer_and_its_count() {
     let fake = fake();
@@ -115,12 +144,12 @@ fn open_reads_the_service_then_every_layer_and_its_count() {
         .map(|call| call.route.clone())
         .collect();
     assert_eq!(routes, ["", "/0", "/0/query", "/1", "/1/query"]);
-    // f=json rides on every one of them
+    // f=json rides on every one of them, and an open never POSTs
     assert!(
         calls
             .borrow()
             .iter()
-            .all(|call| call.param("f") == Some("json")),
+            .all(|call| call.param("f") == Some("json") && call.method == "GET"),
         "{routes:?}"
     );
 }
@@ -153,9 +182,10 @@ fn the_reprojection_out_of_web_mercator_is_named_on_the_layer() {
     let items = inventory();
     let wells = only_matching(&items, ItemKind::FeatureCollection, "Point");
     let shortfall = wells.verdict.shortfall();
-    // latestWkid wins over the wkid beside it
-    assert!(shortfall.contains("wkid 3857"), "{shortfall}");
-    assert!(shortfall.contains("no native original"), "{shortfall}");
+    // latestWkid wins over the wkid beside it, and the row says the original
+    // comes back in a second pass rather than being lost
+    assert!(shortfall.contains("EPSG:3857"), "{shortfall}");
+    assert!(shortfall.contains("second pass"), "{shortfall}");
 }
 
 #[test]

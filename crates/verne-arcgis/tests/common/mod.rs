@@ -5,6 +5,10 @@
 //! about what ArcGIS sends. A URL with no route is a panic rather than an
 //! empty answer: a missing fixture must be louder than a wrong assertion.
 
+// every test binary compiles this module whole, so a fixture one of them does
+// not read is unused there and used in the next one over
+#![allow(dead_code)]
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -16,9 +20,11 @@ pub const ROOT: &str = "https://example.invalid/arcgis/rest/services/Fixture/Fea
 
 /// One request the adapter made, as the fake saw it.
 pub struct Call {
-    /// The URL past the FeatureServer root, so `/0/query` rather than the whole
-    /// thing.
+    /// The URL past the fake's root, so `/0/query` rather than the whole thing.
     pub route: String,
+    /// "GET" or "POST"; a route answers either, and which was used is part of
+    /// what a test asserts.
+    pub method: &'static str,
     pub params: Vec<(String, String)>,
 }
 
@@ -35,13 +41,21 @@ type Handler = Box<dyn Fn(&[(&str, String)]) -> Vec<u8>>;
 
 /// A [`Fetch`] answering from routes instead of from the network.
 pub struct Fake {
+    root: String,
     routes: Vec<(String, Handler)>,
     calls: Rc<RefCell<Vec<Call>>>,
 }
 
 impl Fake {
     pub fn new() -> Self {
+        Fake::at(ROOT)
+    }
+
+    /// A fake hung off some other root, for the routes that are not under a
+    /// FeatureServer at all: a portal's search is one.
+    pub fn at(root: &str) -> Self {
         Fake {
+            root: root.to_string(),
             routes: Vec::new(),
             calls: Rc::new(RefCell::new(Vec::new())),
         }
@@ -72,13 +86,19 @@ impl Fake {
     }
 }
 
-impl Fetch for Fake {
-    fn get(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError> {
+impl Fake {
+    fn answer(
+        &self,
+        method: &'static str,
+        url: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<u8>, ArcgisError> {
         let suffix = url
-            .strip_prefix(ROOT)
+            .strip_prefix(self.root.as_str())
             .unwrap_or_else(|| panic!("the adapter asked for {url}, which is off the fixture"));
         self.calls.borrow_mut().push(Call {
             route: suffix.to_string(),
+            method,
             params: params
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), value.clone()))
@@ -88,6 +108,16 @@ impl Fetch for Fake {
             Some((_, handler)) => Ok(handler(params)),
             None => panic!("no fixture for {url} with {params:?}"),
         }
+    }
+}
+
+impl Fetch for Fake {
+    fn get(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError> {
+        self.answer("GET", url, params)
+    }
+
+    fn post_form(&self, url: &str, params: &[(&str, String)]) -> Result<Vec<u8>, ArcgisError> {
+        self.answer("POST", url, params)
     }
 }
 

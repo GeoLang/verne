@@ -223,6 +223,12 @@ object id field cannot be paired at all, and a layer that vanished from the
 service keeps its features in ptolemy rather than having a diff delete a
 whole dataset.
 
+`demo/migration-loop.sh` runs the whole story against a live service and a
+scratch ptolemy: full extract, load, delta, delta load, then verifies
+ptolemy's own FeatureServer facade serves the migrated counts. `--force-ops`
+mutates a copy of the full extraction first, so the delta demonstrably
+carries an insert, an update and a delete even when the service is quiet.
+
 ## Extraction
 
 `verne extract` writes four things into the directory it is given:

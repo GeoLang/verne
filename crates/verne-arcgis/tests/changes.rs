@@ -320,23 +320,60 @@ fn job_fake(status: serde_json::Value) -> Fake {
     changed_fake_with(status, change_file())
 }
 
-/// The second state with a scripted job status and change file, and the blob
-/// routes the file's attachment records point at.
+/// The second state with a scripted job status and change file.
 fn changed_fake_with(status: serde_json::Value, file: serde_json::Value) -> Fake {
-    Fake::new()
-        .json("", tracking_root(NEXT_GEN))
-        .json("/0", tracked_wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_changed)
-        .answering("/1/query", logs_pages)
-        .json(
-            "/extractChanges",
-            json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
-        )
-        .json(STATUS_URL, status)
-        .json(RESULT_URL, file)
-        .answering("/0/1/attachments/1", |_| PHOTO_AGAIN.to_vec())
-        .answering("/0/5/attachments/7", |_| LOGS_BYTES.to_vec())
+    changed_attachments(
+        Fake::new()
+            .json("", tracking_root(NEXT_GEN))
+            .json("/0", tracked_wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_changed)
+            .answering("/1/query", logs_pages)
+            .json(
+                "/extractChanges",
+                json!({ "statusUrl": format!("{ROOT}{STATUS_URL}") }),
+            )
+            .json(STATUS_URL, status)
+            .json(RESULT_URL, file),
+    )
+}
+
+/// The second state's attachments, both ways they can be read: the listing per
+/// feature a local diff walks, and the blob routes the change file's records
+/// point at, which are the same routes a listing leads to. The photo on well 1
+/// holds new bytes and the log on well 5 is there now, which is what the change
+/// file names as edits and what a local diff has to find for itself.
+fn changed_attachments(fake: Fake) -> Fake {
+    fake.json(
+        "/0/1/attachments",
+        json!({
+            "attachmentInfos": [{
+                "id": 1,
+                "globalId": PHOTO,
+                "parentGlobalId": well_guid(1),
+                "name": "photo.png",
+                "contentType": "image/png",
+                "size": PHOTO_AGAIN.len()
+            }]
+        }),
+    )
+    .json("/0/2/attachments", json!({ "attachmentInfos": [] }))
+    .json("/0/4/attachments", json!({ "attachmentInfos": [] }))
+    .json(
+        "/0/5/attachments",
+        json!({
+            "attachmentInfos": [{
+                "id": 7,
+                "globalId": LOGS,
+                "parentGlobalId": well_guid(5),
+                "name": "logs.pdf",
+                "contentType": "application/pdf",
+                "size": LOGS_BYTES.len()
+            }]
+        }),
+    )
+    .answering("/0/1/attachments/1", |_| PHOTO_AGAIN.to_vec())
+    .answering("/0/5/attachments/7", |_| LOGS_BYTES.to_vec())
 }
 
 /// The same second state answering a change file a test built itself.
@@ -719,16 +756,18 @@ fn a_refused_request_falls_back_to_the_local_diff() {
     extract_full(full.path());
     let ids = minted(full.path());
 
-    let fake = Fake::new()
-        .json("", tracking_root(NEXT_GEN))
-        .json("/0", tracked_wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_changed)
-        .answering("/1/query", logs_pages)
-        .json(
-            "/extractChanges",
-            json!({ "error": { "code": 400, "message": "Invalid Sync model type", "details": [] } }),
-        );
+    let fake = changed_attachments(
+        Fake::new()
+            .json("", tracking_root(NEXT_GEN))
+            .json("/0", tracked_wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_changed)
+            .answering("/1/query", logs_pages)
+            .json(
+                "/extractChanges",
+                json!({ "error": { "code": 400, "message": "Invalid Sync model type", "details": [] } }),
+            ),
+    );
     let calls = fake.calls();
     let extraction = ArcgisSource::open_with(Box::new(fake), ROOT)
         .expect("the fixture opens")
@@ -800,12 +839,14 @@ fn a_service_that_stopped_tracking_falls_back_to_the_local_diff() {
     let delta = tempfile::tempdir().expect("tempdir");
     extract_full(full.path());
 
-    let fake = Fake::new()
-        .json("", service_root())
-        .json("/0", tracked_wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_changed)
-        .answering("/1/query", logs_pages);
+    let fake = changed_attachments(
+        Fake::new()
+            .json("", service_root())
+            .json("/0", tracked_wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_changed)
+            .answering("/1/query", logs_pages),
+    );
     let extraction = ArcgisSource::open_with(Box::new(fake), ROOT)
         .expect("the fixture opens")
         .extract_since(delta.path(), OPERATOR, full.path())
@@ -1082,26 +1123,79 @@ fn a_layer_without_a_global_id_field_skips_its_attachment_edits() {
     assert_eq!(ops(delta.path(), "features/Wells.ndjson").len(), 3);
 }
 
-/// A local diff says nothing about attachments, and the row says that rather
-/// than claiming the loaded ones are current.
+/// A local diff was told nothing about the attachments, so it lists them and
+/// diffs them itself, and reaches the same two operations the change file named:
+/// the photo on well 1 is not the size it was loaded at, and the log on well 5 is
+/// there now. Both pair by global id, which is what the listing and the previous
+/// extraction's sidecar have in common.
 #[test]
-fn a_local_diff_says_its_attachments_were_not_carried() {
+fn a_local_diff_diffs_the_attachments_it_lists() {
     let full = tempfile::tempdir().expect("tempdir");
     let delta = tempfile::tempdir().expect("tempdir");
-    extract_full(full.path());
+    let first = extract_full(full.path());
+    let (feature, name) = attached(&first);
     std::fs::remove_file(full.path().join(SERVER_GENS_FILE)).expect("the recorded generations");
     let extraction = ArcgisSource::open_with(Box::new(changed_fake()), ROOT)
         .expect("the fixture opens")
         .extract_since(delta.path(), OPERATOR, full.path())
         .expect("the delta runs");
 
-    assert!(extraction.sidecar.attachments.is_empty());
-    let Action::Skipped { reason } = &attachment_verdict(&extraction).action else {
-        panic!("{:#?}", attachment_verdict(&extraction));
-    };
-    assert!(
-        reason.contains("says nothing about attachments"),
-        "{reason}"
+    let update = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .find_map(|op| match op {
+            AttachmentOp::Update(held) => Some(held),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.attachments));
+    assert_eq!(update.global_id.as_deref(), Some(PHOTO));
+    assert_eq!(update.feature_id, feature);
+    assert_eq!(update.name, name);
+    assert_eq!(
+        std::fs::read(delta.path().join(&update.file)).expect("the blob"),
+        PHOTO_AGAIN
+    );
+
+    let add = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .find_map(|op| match op {
+            AttachmentOp::Add(held) => Some(held),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{:#?}", extraction.sidecar.attachments));
+    assert_eq!(add.global_id.as_deref(), Some(LOGS));
+    assert_eq!(add.name, "logs.pdf");
+    assert_eq!(add.feature_id, minted(full.path())[&5]);
+    // the object id and the size ride in the metadata, which is what the next
+    // local diff pairs on when the service keeps no global ids
+    assert_eq!(add.metadata["object_id"], "5");
+    assert_eq!(add.metadata["size"], LOGS_BYTES.len());
+    assert_eq!(
+        std::fs::read(delta.path().join(&add.file)).expect("the blob"),
+        LOGS_BYTES
+    );
+
+    assert_eq!(
+        attachment_counts(&extraction).detail,
+        "1 attachment added, 1 replaced, 0 deleted; 0 unchanged"
+    );
+    assert_eq!(attachment_counts(&extraction).action, Action::Carried);
+    // and the index the delta leaves behind says what ptolemy holds, so a later
+    // run that can ride extractChanges pairs its edits against it
+    let wells = minted(full.path());
+    assert_eq!(
+        attachment_index(delta.path()),
+        vec![
+            (
+                PHOTO.to_string(),
+                wells[&1].clone(),
+                "photo.png".to_string()
+            ),
+            (LOGS.to_string(), wells[&5].clone(), "logs.pdf".to_string()),
+        ]
     );
 }
 

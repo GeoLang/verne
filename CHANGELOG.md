@@ -64,9 +64,8 @@ All notable changes to this project will be documented in this file.
   full extraction and writes only the insert, update and delete operations of
   ptolemy's commit route, paired by object id with a hash deciding changed
   from unchanged; `verne load` commits the delta onto the datasets the first
-  load created and creates nothing. Relationship classes are not diffed, nor
-  are attachments on this path, and a layer without an object id field gets no
-  delta, all said in the log. serde_json's `float_roundtrip` is on throughout:
+  load created and creates nothing. Relationship classes are not diffed and a
+  layer without an object id field gets no delta, both said in the log. serde_json's `float_roundtrip` is on throughout:
   its best-effort parsing does not round-trip its own shortest output, which
   made server-computed floats hash as changed on every delta.
 - A delta asks the service what changed where the service can say. A full
@@ -83,8 +82,7 @@ All notable changes to this project will be documented in this file.
   - The local diff still runs where the server cannot answer, all or nothing
     per run: no generations recorded, change tracking gone, a queryable layer
     with no generation or no object id field, or a refused request. The report
-    row gives the reason, and its attachment row says they were not carried,
-    because reading the features again says nothing about a blob.
+    row gives the reason.
   - A delta on the `extractChanges` path carries the attachment edits too. An
     add or a replacement is fetched off the URL the change file's record names,
     on the service's own host and through the same authed client; a replacement
@@ -105,6 +103,22 @@ All notable changes to this project will be documented in this file.
     the feature, because ptolemy minted its id and no extraction ever saw one, so
     two attachments of one name on one feature refuses that operation with a
     reason instead of picking one.
+  - The local diff carries the attachments as well, so both delta paths do. The
+    current ones are listed through `queryAttachments` or one feature at a time
+    and paired with what the previous extraction recorded: by `globalId` where
+    both sides have one, else by the object id the attachment hangs off and the
+    name it is under, which is what lets a service keeping no attachment global
+    ids be diffed rather than skipped. A pair whose size or content type moved is
+    a replacement and its bytes are fetched, a pair that agrees is counted and
+    costs no traffic, a listing that paired with nothing is an add, and a record
+    that paired with nothing is a delete, including one whose feature this delta
+    deleted: ptolemy's delete writes a new version of the feature and leaves the
+    attachments hanging off it, so nothing else would take the blob out. Two
+    attachments of one name on one feature is counted and named rather than
+    paired, since the loader could not tell them apart either. The report row
+    that used to say a local diff learns nothing about a blob now says what was
+    diffed, with counts, and the delta writes the same `attachment-ids/` index
+    the other path does.
   - The token does not follow the result URL's redirect: it points at a signed
     file on storage, and reqwest only drops `Authorization` across a host
     boundary while the token rides in `X-Esri-Authorization`, so the redirect

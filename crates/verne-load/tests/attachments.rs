@@ -69,6 +69,9 @@ fn answer(
                 .collect();
             ok(&serde_json::Value::Array(held))
         }
+        ("POST", path) if path == format!("/api/v1/branches/{BRANCH}/commit") => {
+            created(&serde_json::json!({ "id": "committed" }))
+        }
         ("POST", path) if path == listing => {
             let mut count = uploads.lock().expect("the upload count");
             *count += 1;
@@ -307,6 +310,47 @@ fn an_addition_uploads_without_listing_anything() {
             .is_none(),
         "{body}"
     );
+}
+
+/// An attachment on a feature the same delta deletes is deleted by an operation
+/// of its own, and it works because the feature's attachments outlive it: a
+/// delete in ptolemy writes a new version of the feature rather than removing a
+/// row, its attachments keep hanging off the feature id, and the listing this
+/// finds them through still answers with them. So the operation comes after the
+/// commit that deleted the feature and still has something to delete.
+#[test]
+fn an_attachment_on_a_deleted_feature_is_deleted_after_the_commit() {
+    let ptolemy = holding(&[(LOADED, "site.jpg")]);
+    let (mut sidecar, directory) = a_delta(vec![AttachmentOp::Delete(DeleteAttachment {
+        dataset: "Wells".into(),
+        feature_id: FEATURE.into(),
+        name: "site.jpg".into(),
+        global_id: None,
+    })]);
+    std::fs::create_dir_all(directory.path().join("features")).expect("the feature dir");
+    std::fs::write(
+        directory.path().join("features/Wells.ndjson"),
+        serde_json::json!({ "type": "delete", "feature_id": FEATURE }).to_string() + "\n",
+    )
+    .expect("the feature file");
+    sidecar.datasets[0].features = Some("features/Wells.ndjson".into());
+
+    let loaded = load(&ptolemy, &sidecar, &directory);
+
+    let calls = ptolemy.calls();
+    let commit = calls
+        .iter()
+        .position(|(method, path)| {
+            method == "POST" && *path == format!("/api/v1/branches/{BRANCH}/commit")
+        })
+        .unwrap_or_else(|| panic!("the feature delete was never committed: {calls:#?}"));
+    let deleted = calls
+        .iter()
+        .position(|(method, path)| method == "DELETE" && path.ends_with(LOADED))
+        .unwrap_or_else(|| panic!("the attachment was never deleted: {calls:#?}"));
+    assert!(commit < deleted, "{calls:#?}");
+    assert_eq!(loaded.attachment_ops.deleted, 1);
+    assert!(loaded.attachment_ops.unmatched.is_empty());
 }
 
 /// The counts and the reasons are the load's answer about the attachments, which

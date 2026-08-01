@@ -2,6 +2,11 @@
 //! extraction of the same service, paired by object id. The fixture's second
 //! state changes one feature, leaves one alone, adds one and drops one, so
 //! the delta is exactly one update, one insert and one delete.
+//!
+//! The attachments are diffed the same way, and here they carry no global id at
+//! all: this service keeps none, so what pairs them is the feature they hang off
+//! and the name they are under. `changes.rs` is where the same diff pairs on the
+//! global id a service that has them states.
 
 mod common;
 
@@ -11,12 +16,24 @@ use std::path::Path;
 use common::{Fake, ROOT, logs_table, service_root, wells_layer};
 use serde_json::json;
 use verne_arcgis::{ArcgisError, ArcgisSource, Extraction};
-use verne_core::{Action, FeatureOp, ItemKind, NewFeature};
+use verne_core::{Action, AttachmentOp, FeatureOp, ItemKind, NewFeature};
 
 const OPERATOR: &str = "verne-arcgis test";
 
 /// A Date attribute as the service sends it, epoch milliseconds.
 const DRILLED: i64 = 1743630690000;
+
+/// The blobs the fixture holds. The photo on well 1 grows between the two
+/// states, which is the whole of what a listing says about a changed
+/// attachment; the plan on well 2 does not move, the notes beside it are gone in
+/// the second state, the picture on well 3 goes when that feature does, and the
+/// log on well 4 arrives with it.
+const PHOTO_BYTES: &[u8] = b"\x89PNG the first";
+const PHOTO_AGAIN: &[u8] = b"\x89PNG the second, longer";
+const PLAN_BYTES: &[u8] = b"%PDF plan";
+const NOTES_BYTES: &[u8] = b"notes on the well";
+const SITE_BYTES: &[u8] = b"\xff\xd8site";
+const LOGS_BYTES: &[u8] = b"%PDF logs";
 
 fn param<'a>(params: &'a [(&str, String)], name: &str) -> Option<&'a str> {
     params
@@ -127,29 +144,73 @@ fn logs_pages(params: &[(&str, String)]) -> Vec<u8> {
     serde_json::to_vec(&page).expect("the page serialises")
 }
 
-/// The first state, with nothing attached, so the full extraction carries
-/// the features and an empty attachment list.
-fn full_fake() -> Fake {
-    Fake::new()
-        .json("", service_root())
-        .json("/0", wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_full)
-        .answering("/1/query", logs_pages)
-        .json("/0/1/attachments", json!({ "attachmentInfos": [] }))
-        .json("/0/2/attachments", json!({ "attachmentInfos": [] }))
-        .json("/0/3/attachments", json!({ "attachmentInfos": [] }))
+/// One attachment as the listing route states it. No `globalId`: the layer
+/// declares no global id column, which is how a service that keeps none answers.
+fn info(id: i64, name: &str, kind: &str, bytes: &[u8]) -> serde_json::Value {
+    json!({ "id": id, "name": name, "contentType": kind, "size": bytes.len() })
 }
 
-/// The second state. No attachment routes on purpose: a delta that asked for
-/// one would panic the fake, which is the proof none is asked for.
+/// The listing routes, one per object id, because the layer does not support
+/// `queryAttachments`. An object id with no route here is a panic, which is what
+/// says which features a pass asked about.
+fn listings(fake: Fake, held: &[(i64, Vec<serde_json::Value>)]) -> Fake {
+    held.iter().fold(fake, |fake, (oid, infos)| {
+        fake.json(
+            &format!("/0/{oid}/attachments"),
+            json!({ "attachmentInfos": infos }),
+        )
+    })
+}
+
+/// The first state: a photo on well 1, a plan and some notes on well 2, and a
+/// picture of the site on well 3.
+fn full_fake() -> Fake {
+    listings(
+        Fake::new()
+            .json("", service_root())
+            .json("/0", wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_full)
+            .answering("/1/query", logs_pages),
+        &[
+            (1, vec![info(1, "photo.png", "image/png", PHOTO_BYTES)]),
+            (
+                2,
+                vec![
+                    info(2, "plan.pdf", "application/pdf", PLAN_BYTES),
+                    info(3, "notes.txt", "text/plain", NOTES_BYTES),
+                ],
+            ),
+            (3, vec![info(4, "site.jpg", "image/jpeg", SITE_BYTES)]),
+        ],
+    )
+    .answering("/0/1/attachments/1", |_| PHOTO_BYTES.to_vec())
+    .answering("/0/2/attachments/2", |_| PLAN_BYTES.to_vec())
+    .answering("/0/2/attachments/3", |_| NOTES_BYTES.to_vec())
+    .answering("/0/3/attachments/4", |_| SITE_BYTES.to_vec())
+}
+
+/// The second state: the photo is bigger, the plan is as it was, the notes are
+/// gone, well 3 took its picture with it, and well 4 arrived with a log.
+///
+/// The plan's blob route is missing on purpose. An unchanged attachment is not
+/// fetched again, and asking for it would panic the fake.
 fn changed_fake() -> Fake {
-    Fake::new()
-        .json("", service_root())
-        .json("/0", wells_layer())
-        .json("/1", logs_table())
-        .answering("/0/query", wells_changed)
-        .answering("/1/query", logs_pages)
+    listings(
+        Fake::new()
+            .json("", service_root())
+            .json("/0", wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_changed)
+            .answering("/1/query", logs_pages),
+        &[
+            (1, vec![info(1, "photo.png", "image/png", PHOTO_AGAIN)]),
+            (2, vec![info(2, "plan.pdf", "application/pdf", PLAN_BYTES)]),
+            (4, vec![info(5, "logs.pdf", "application/pdf", LOGS_BYTES)]),
+        ],
+    )
+    .answering("/0/1/attachments/1", |_| PHOTO_AGAIN.to_vec())
+    .answering("/0/4/attachments/5", |_| LOGS_BYTES.to_vec())
 }
 
 fn extract_full(directory: &Path) -> Extraction {
@@ -272,18 +333,16 @@ fn an_unchanged_table_is_an_empty_delta_with_its_rows_counted() {
 }
 
 /// The relationship classes and the style were created when the full extraction
-/// was loaded, and a local diff learns nothing about attachments: it reads the
-/// features again, and the service says nothing about a blob on the way. The log
-/// says where each of the three stands.
+/// was loaded, and a delta does not repeat either. The log says where both
+/// stand.
 #[test]
-fn a_delta_repeats_no_relationships_style_or_attachments() {
+fn a_delta_repeats_no_relationships_or_style() {
     let full = tempfile::tempdir().expect("tempdir");
     let delta = tempfile::tempdir().expect("tempdir");
     extract_full(full.path());
     let extraction = extract_delta(delta.path(), full.path());
 
     assert!(extraction.sidecar.relationships.is_empty());
-    assert!(extraction.sidecar.attachments.is_empty());
     // no drawing info either, so a delta load has nothing to re-post and the
     // sidecar holds no document no load reads
     assert!(
@@ -312,13 +371,222 @@ fn a_delta_repeats_no_relationships_style_or_attachments() {
         matches!(&relationship.action, Action::Skipped { reason } if reason.contains("does not repeat them")),
         "{relationship:#?}"
     );
-    let attachments = entries
+}
+
+// ─── Attachments ────────────────────────────────────────────────────
+
+/// The feature id each object id was inserted under by a delta, off its
+/// operation file.
+fn inserted(directory: &Path) -> BTreeMap<i64, String> {
+    ops(directory, "features/Wells.ndjson")
+        .into_iter()
+        .filter_map(|op| match op {
+            FeatureOp::Insert(insert) => Some((
+                insert.properties["objectid"].as_i64().expect("an oid"),
+                insert.feature_id,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every attachment operation a delta wrote, as `(kind, feature id, name)`, in
+/// the order the sidecar holds them, which is the order the loader applies them.
+fn attachment_ops(extraction: &Extraction) -> Vec<(&'static str, String, String)> {
+    extraction
+        .sidecar
+        .attachments
         .iter()
-        .find(|entry| entry.kind == ItemKind::EmbeddedResource)
-        .unwrap_or_else(|| panic!("no attachment entry: {entries:#?}"));
+        .map(|op| {
+            let kind = match op {
+                AttachmentOp::Add(_) => "add",
+                AttachmentOp::Update(_) => "update",
+                AttachmentOp::Delete(_) => "delete",
+            };
+            (kind, op.feature_id().to_string(), op.name().to_string())
+        })
+        .collect()
+}
+
+/// The point layer's attachment rows: the one the inventory judged, then the
+/// counts of what the diff came to, which is written only where something moved.
+fn attachment_entries(extraction: &Extraction) -> Vec<&verne_core::LogEntry> {
+    extraction
+        .sidecar
+        .log
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == ItemKind::EmbeddedResource && entry.location == "Wells")
+        .collect()
+}
+
+fn attachment_counts(extraction: &Extraction) -> &verne_core::LogEntry {
+    let entries = attachment_entries(extraction);
+    entries
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| panic!("no counts row: {entries:#?}"))
+}
+
+/// The bytes a delta wrote for the one operation of `kind` on `name`.
+fn blob(extraction: &Extraction, directory: &Path, name: &str) -> Vec<u8> {
+    let file = extraction
+        .sidecar
+        .attachments
+        .iter()
+        .find_map(|op| match op {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) if held.name == name => {
+                Some(held.file.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "nothing carries {name}: {:#?}",
+                extraction.sidecar.attachments
+            )
+        });
+    std::fs::read(directory.join(&file)).unwrap_or_else(|error| panic!("reading {file}: {error}"))
+}
+
+/// The local diff lists the attachments again and pairs them with the ones the
+/// full extraction carried. This service keeps no attachment global ids, so what
+/// pairs them is the object id and the name: the photo grew, so its bytes are
+/// fetched and go up as a replacement of the copy already loaded rather than as a
+/// second one; the log on the row this delta inserted is an add; the notes are
+/// gone and so is well 3, and both of their attachments are deletes.
+///
+/// The delete of well 3's picture is the one ptolemy cannot be left to do:
+/// deleting a feature there writes a new version of it and leaves the
+/// attachments hanging off it in place, so nothing but this operation takes the
+/// blob out.
+#[test]
+fn the_local_diff_carries_the_attachments_that_moved() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    let wells = minted(full.path());
+    let extraction = extract_delta(delta.path(), full.path());
+
+    assert_eq!(
+        attachment_ops(&extraction),
+        vec![
+            ("update", wells[&1].clone(), "photo.png".to_string()),
+            (
+                "add",
+                inserted(delta.path())[&4].clone(),
+                "logs.pdf".to_string()
+            ),
+            ("delete", wells[&2].clone(), "notes.txt".to_string()),
+            ("delete", wells[&3].clone(), "site.jpg".to_string()),
+        ]
+    );
+    assert_eq!(blob(&extraction, delta.path(), "photo.png"), PHOTO_AGAIN);
+    assert_eq!(blob(&extraction, delta.path(), "logs.pdf"), LOGS_BYTES);
+
+    let counts = attachment_counts(&extraction);
+    assert_eq!(
+        counts.detail,
+        "1 attachment added, 1 replaced, 2 deleted; 1 unchanged"
+    );
+    assert_eq!(counts.action, Action::Carried);
+    assert_eq!(
+        counts.destination.as_deref(),
+        Some("attachments of Wells"),
+        "{counts:#?}"
+    );
+}
+
+/// An attachment that did not move costs no bytes: the listing says the size it
+/// is, the sidecar says the size it was loaded at, and that is the whole of the
+/// comparison. The fake holds no route for its blob, so asking would have
+/// panicked as well.
+#[test]
+fn an_unchanged_attachment_is_not_fetched_again() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    let fake = changed_fake();
+    let calls = fake.calls();
+    ArcgisSource::open_with(Box::new(fake), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta extraction runs");
+
+    let asked: Vec<String> = calls
+        .borrow()
+        .iter()
+        .map(|call| call.route.clone())
+        .collect();
     assert!(
-        matches!(&attachments.action, Action::Skipped { reason } if reason.contains("says nothing about attachments")),
-        "{attachments:#?}"
+        !asked.contains(&"/0/2/attachments/2".to_string()),
+        "the unchanged blob was fetched again: {asked:#?}"
+    );
+    // it was listed, which is how the diff knew, and the deleted feature's
+    // attachments were not listed at all: it holds no feature to hang one off
+    assert!(
+        asked.contains(&"/0/2/attachments".to_string()),
+        "{asked:#?}"
+    );
+    assert!(
+        !asked.contains(&"/0/3/attachments".to_string()),
+        "{asked:#?}"
+    );
+}
+
+/// Two attachments of one name on one feature cannot be told apart on the name,
+/// and neither can the loader when it goes looking for the copy to replace, so
+/// the group is counted and named. The rest of the diff still lands.
+#[test]
+fn an_ambiguous_name_is_counted_rather_than_paired() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    let wells = minted(full.path());
+    let twin = listings(
+        Fake::new()
+            .json("", service_root())
+            .json("/0", wells_layer())
+            .json("/1", logs_table())
+            .answering("/0/query", wells_changed)
+            .answering("/1/query", logs_pages),
+        &[
+            (1, vec![info(1, "photo.png", "image/png", PHOTO_BYTES)]),
+            (
+                2,
+                vec![
+                    info(2, "plan.pdf", "application/pdf", PLAN_BYTES),
+                    info(6, "plan.pdf", "application/pdf", PLAN_BYTES),
+                    info(3, "notes.txt", "text/plain", NOTES_BYTES),
+                ],
+            ),
+            (4, vec![]),
+        ],
+    );
+    let extraction = ArcgisSource::open_with(Box::new(twin), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("an ambiguous name is not a failed extraction");
+
+    // nothing was written for either copy of the plan, and what did move still
+    // came across
+    assert_eq!(
+        attachment_ops(&extraction),
+        vec![("delete", wells[&3].clone(), "site.jpg".to_string())]
+    );
+    let counts = attachment_counts(&extraction);
+    assert_eq!(
+        counts.detail,
+        "0 attachments added, 0 replaced, 1 deleted; 2 unchanged"
+    );
+    let Action::CarriedWithLoss { losses } = &counts.action else {
+        panic!("{counts:#?}");
+    };
+    assert!(
+        losses.iter().any(|loss| loss.contains("plan.pdf")
+            && loss.contains("2 attachments")
+            && loss.contains("none of them were paired")),
+        "{losses:#?}"
     );
 }
 

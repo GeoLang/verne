@@ -336,14 +336,24 @@ impl ArcgisSource {
                         )?;
                         place_attachments(layer, carried, &mut placed, &mut conversions);
                     }
-                    // a local diff never asked what changed, so there is
-                    // nothing about the attachments to act on
-                    (Some(_), None) => placed.push((
-                        verdict::attachment_item(layer),
-                        Placed::Left(
-                            "the delta was found by reading the service again and diffing it, which says nothing about attachments, so changes to them were not carried; the attachments the full extraction carried stand".into(),
-                        ),
-                    )),
+                    // a local diff was never told what changed, so the
+                    // attachments are listed again and diffed the way the
+                    // features were
+                    (Some(held), None) => {
+                        let diffed = self.attachment_diff(
+                            &AttachmentBasis {
+                                layer,
+                                dataset: &dataset_name,
+                                features: &written.features,
+                                global_ids: &written.global_ids,
+                                previous: held,
+                                directory,
+                                operator,
+                            },
+                            &mut attachments,
+                        )?;
+                        place_attachment_diff(layer, diffed, &mut placed, &mut conversions);
+                    }
                     (Some(_), Some((held, edits))) => {
                         let carried = self.attachment_delta(
                             &AttachmentBasis {
@@ -945,8 +955,9 @@ struct WrittenLayer {
     /// all of them.
     minted: BTreeMap<String, String>,
     /// Object id to the feature id ptolemy holds the row under once this delta
-    /// is loaded, off the index a change pass writes. Empty on the other
-    /// passes, which have no index and no attachment changes to place.
+    /// is loaded, which is the basis with this pass's operations applied to it.
+    /// Empty on a full pass, which has no basis and hangs its attachments off
+    /// `minted` instead.
     features: BTreeMap<String, String>,
     /// Global id to object id for every row this pass fetched, which is how the
     /// parent of an added attachment is found without asking the service again.
@@ -1255,13 +1266,12 @@ fn write_layer(
         .unwrap_or_default()
         .into_iter();
     let mut paging = Paging::default();
-    // the change pass leaves an index behind, which is the basis plus every op
-    // it writes: the feature file it writes cannot say where the rows it did
-    // not touch landed, and the next delta of the chain has to know
-    let mut index = match (&changed, &previous) {
-        (Some(_), Some(prev)) => Some(prev.map.clone()),
-        _ => None,
-    };
+    // the basis with every op this pass writes applied to it, which is where
+    // each row of the layer stands in ptolemy once the delta is loaded. a change
+    // pass leaves it behind as the dataset's object id index, because the
+    // feature file it writes cannot say where the rows it did not touch landed;
+    // a local diff keeps it to hang the attachments off
+    let mut index = previous.as_ref().map(|prev| prev.map.clone());
     loop {
         let page = match &changed {
             None => match paging.next(fetch, &route, layer, gdb_version, &mut losses)? {
@@ -1462,7 +1472,10 @@ fn write_layer(
         path: path.display().to_string(),
         source,
     })?;
-    if let Some(index) = &index {
+    // only a change pass writes it down: a delta found by a local diff is
+    // refused as the basis of another one, so an index beside that delta would
+    // be a file nothing reads
+    if let (Some(index), Some(_)) = (&index, &changed) {
         changes::write_index(directory, dataset, index)?;
     }
 
@@ -2046,6 +2059,127 @@ fn attachment_metadata(
     serde_json::Value::Object(metadata)
 }
 
+/// The same for an attachment the service listed rather than named as an edit.
+/// One function for the full extraction and the local diff, because the object
+/// id and the size in here are what a later local diff pairs the attachment on:
+/// two of these that disagreed would leave a diff unable to see its own basis.
+fn listing_metadata(info: &RawAttachmentInfo, layer: &Layer, oid: &str) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("source_layer".into(), layer.name.clone().into());
+    metadata.insert("attachment_id".into(), info.id.into());
+    metadata.insert("object_id".into(), oid.to_string().into());
+    if let Some(global_id) = &info.global_id {
+        metadata.insert("global_id".into(), global_id.clone().into());
+    }
+    if let Some(size) = info.size {
+        metadata.insert("size".into(), size.into());
+    }
+    if let Some(keywords) = &info.keywords {
+        metadata.insert("keywords".into(), keywords.clone().into());
+    }
+    serde_json::Value::Object(metadata)
+}
+
+/// One attachment of the previous extraction, as a local diff pairs against it:
+/// the service's own id where it had one, the feature and the name ptolemy holds
+/// it under, and the object id, size and content type it was carried with.
+struct BasisAttachment {
+    global_id: Option<String>,
+    feature_id: String,
+    name: String,
+    oid: Option<String>,
+    size: Option<u64>,
+    content_type: Option<String>,
+}
+
+/// The attachments the previous extraction carried on one dataset.
+///
+/// Off its sidecar and nothing else. A delta is refused as the basis of a local
+/// diff, so this is always a full extraction, whose sidecar names every
+/// attachment it carried along with what the service said about each.
+fn basis_records(previous: &Previous, dataset: &str) -> Vec<BasisAttachment> {
+    previous
+        .sidecar
+        .attachments
+        .iter()
+        .filter(|op| op.dataset() == dataset)
+        .filter_map(|op| match op {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => Some(BasisAttachment {
+                global_id: held.global_id.clone(),
+                feature_id: held.feature_id.clone(),
+                name: held.name.clone(),
+                oid: held.metadata.get("object_id").map(text),
+                size: held
+                    .metadata
+                    .get("size")
+                    .and_then(serde_json::Value::as_u64),
+                content_type: held.content_type.clone(),
+            }),
+            AttachmentOp::Delete(_) => None,
+        })
+        .collect()
+}
+
+/// Where a delta's attachment bytes land: one file per blob under the dataset's
+/// own directory, numbered so two blobs of one name cannot overwrite each other.
+/// The directory is made on the first write, so a delta that carries no bytes
+/// leaves no empty directory behind.
+struct Blobs<'a> {
+    directory: &'a Path,
+    relative_dir: String,
+    row: usize,
+}
+
+impl<'a> Blobs<'a> {
+    fn new(directory: &'a Path, dataset: &str) -> Blobs<'a> {
+        Blobs {
+            directory,
+            relative_dir: format!("{ATTACHMENTS_DIR}/{}", safe_file_name(dataset)),
+            row: 0,
+        }
+    }
+
+    /// The file, named relative to the sidecar as the sidecar names it.
+    fn write(&mut self, bytes: &[u8], name: &str) -> Result<String, ArcgisError> {
+        let blob_dir = self.directory.join(&self.relative_dir);
+        std::fs::create_dir_all(&blob_dir).map_err(|source| ArcgisError::Write {
+            path: blob_dir.display().to_string(),
+            source,
+        })?;
+        let blob = format!(
+            "{}/{}-{}",
+            self.relative_dir,
+            self.row,
+            safe_file_name(name)
+        );
+        self.row += 1;
+        std::fs::write(self.directory.join(&blob), bytes).map_err(|source| ArcgisError::Write {
+            path: blob.clone(),
+            source,
+        })?;
+        Ok(blob)
+    }
+}
+
+/// Everything on one object id under one name, as the fallback pairing groups
+/// it: the attachments the service lists there now, and the ones the previous
+/// extraction carried off it, both as positions in their own lists.
+type NameGroup = (Vec<usize>, Vec<usize>);
+
+/// What a local diff made of one layer's attachments.
+#[derive(Default)]
+struct AttachmentDiff {
+    added: usize,
+    replaced: usize,
+    deleted: usize,
+    /// Paired and unmoved, so no bytes were fetched for them. Counted rather
+    /// than written, which is the proof the diff saw them.
+    unchanged: usize,
+    /// What it could not pair, each with the reason. Not fatal: a blob whose
+    /// history is ambiguous is not worth throwing the window away over.
+    left: Vec<String>,
+}
+
 impl ArcgisSource {
     /// One layer's attachments: listed, downloaded, written as files and named
     /// in the sidecar. A blob that cannot be attributed to a feature the
@@ -2079,11 +2213,7 @@ impl ArcgisSource {
                 ));
                 continue;
             };
-            let route = format!(
-                "{}/{}/{oid}/attachments/{}",
-                self.service.url, layer.id, info.id
-            );
-            let bytes = match self.fetch.get(&route, &[]) {
+            let bytes = match self.attachment_blob(layer, oid, info.id) {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     carried.orphans.push(format!(
@@ -2102,23 +2232,13 @@ impl ArcgisSource {
                 path: blob.clone(),
                 source,
             })?;
-            let mut metadata = serde_json::Map::new();
-            metadata.insert("source_layer".into(), layer.name.clone().into());
-            metadata.insert("attachment_id".into(), info.id.into());
-            metadata.insert("object_id".into(), oid.clone().into());
-            if let Some(size) = info.size {
-                metadata.insert("size".into(), size.into());
-            }
-            if let Some(keywords) = &info.keywords {
-                metadata.insert("keywords".into(), keywords.clone().into());
-            }
             out.push(AttachmentOp::Add(NewAttachment {
                 dataset: dataset.to_string(),
                 feature_id: feature_id.clone(),
                 name,
                 content_type: info.content_type.clone(),
                 file: blob,
-                metadata: serde_json::Value::Object(metadata),
+                metadata: listing_metadata(info, layer, oid),
                 created_by: operator.to_string(),
                 global_id: info.global_id.clone(),
             }));
@@ -2178,24 +2298,7 @@ impl ArcgisSource {
             parents.extend(self.oids_by_global_id(layer, global_id_field, &wanted)?);
         }
 
-        let relative_dir = format!("{ATTACHMENTS_DIR}/{}", safe_file_name(dataset));
-        let blob_dir = held.directory.join(&relative_dir);
-        let mut row = 0usize;
-        let mut blob = |bytes: &[u8], name: &str| -> Result<String, ArcgisError> {
-            std::fs::create_dir_all(&blob_dir).map_err(|source| ArcgisError::Write {
-                path: blob_dir.display().to_string(),
-                source,
-            })?;
-            let blob = format!("{relative_dir}/{row}-{}", safe_file_name(name));
-            row += 1;
-            std::fs::write(held.directory.join(&blob), bytes).map_err(|source| {
-                ArcgisError::Write {
-                    path: blob.clone(),
-                    source,
-                }
-            })?;
-            Ok(blob)
-        };
+        let mut blobs = Blobs::new(held.directory, dataset);
 
         for record in &edits.adds {
             let named = attachment_named(record);
@@ -2219,7 +2322,7 @@ impl ArcgisSource {
                     continue;
                 }
             };
-            let file = blob(&bytes, &named)?;
+            let file = blobs.write(&bytes, &named)?;
             out.push(AttachmentOp::Add(NewAttachment {
                 dataset: dataset.to_string(),
                 feature_id: feature_id.clone(),
@@ -2268,7 +2371,7 @@ impl ArcgisSource {
                     "the service now calls the attachment {global_id} {named} and ptolemy holds it as {loaded_as}, which is what pairs the two, so the new bytes went up under the old name"
                 ));
             }
-            let file = blob(&bytes, &loaded_as)?;
+            let file = blobs.write(&bytes, &loaded_as)?;
             out.push(AttachmentOp::Update(NewAttachment {
                 dataset: dataset.to_string(),
                 feature_id,
@@ -2300,6 +2403,271 @@ impl ArcgisSource {
 
         changes::write_attachment_index(held.directory, dataset, &index)?;
         Ok(delta)
+    }
+
+    /// One layer's attachments diffed, for a delta the service named nothing
+    /// about.
+    ///
+    /// The current attachments are listed the way a full extraction lists them
+    /// and paired with what the previous extraction wrote down: by global id
+    /// where both sides have one, and otherwise by the object id the attachment
+    /// hangs off and the name it is under, which is the only other handle either
+    /// side has. That fallback is what lets a service keeping no attachment
+    /// global ids be diffed rather than skipped.
+    ///
+    /// The size is deliberately not part of that key. A changed size has to read
+    /// as a replacement, and reading it as a delete and an add instead would have
+    /// the loader upload a second attachment of one name onto the feature and
+    /// then refuse to pick which of the two the delete meant.
+    ///
+    /// A pair whose size or content type moved is a replacement and its bytes are
+    /// fetched. A pair that agrees is counted and nothing is fetched for it. A
+    /// listing that paired with nothing is an add, and a record that paired with
+    /// nothing is a delete, which is also what an attachment on a feature this
+    /// delta deleted comes to: ptolemy's delete is a new version of the feature
+    /// rather than a row removed, and it leaves the attachments hanging off it
+    /// where they are, so nothing but this delete would take the blob out.
+    ///
+    /// Two attachments of one name on one feature is a pairing neither this nor
+    /// the loader can pick between, so the group is counted and named and nothing
+    /// is written for it.
+    fn attachment_diff(
+        &self,
+        held: &AttachmentBasis<'_>,
+        out: &mut Vec<AttachmentOp>,
+    ) -> Result<AttachmentDiff, ArcgisError> {
+        let (layer, dataset) = (held.layer, held.dataset);
+        let mut diff = AttachmentDiff::default();
+        let basis = basis_records(held.previous, dataset);
+        let listed = self.list_attachments(layer, held.features)?;
+        // what ptolemy holds, by the global id the service knows it by, which is
+        // what a run that can ride extractChanges pairs its edits against
+        let mut index: BTreeMap<String, (String, String)> = basis
+            .iter()
+            .filter_map(|record| {
+                Some((
+                    record.global_id.clone()?,
+                    (record.feature_id.clone(), record.name.clone()),
+                ))
+            })
+            .collect();
+
+        // paired as `(listing, record)`, and both sides are struck off as they
+        // are matched, so what is left over is exactly what appeared or vanished
+        let mut paired: Vec<(usize, usize)> = Vec::new();
+        let mut matched = vec![false; listed.len()];
+        let mut used = vec![false; basis.len()];
+
+        let by_global: BTreeMap<&str, usize> = basis
+            .iter()
+            .enumerate()
+            .filter_map(|(at, record)| Some((record.global_id.as_deref()?, at)))
+            .collect();
+        for (at, (_, info)) in listed.iter().enumerate() {
+            if let Some(global_id) = info.global_id.as_deref()
+                && let Some(&record) = by_global.get(global_id)
+                && !used[record]
+            {
+                matched[at] = true;
+                used[record] = true;
+                paired.push((at, record));
+            }
+        }
+
+        // the object id and the name, for what has no global id on one side or
+        // the other
+        let mut groups: BTreeMap<(&str, &str), NameGroup> = BTreeMap::new();
+        for (at, (oid, info)) in listed.iter().enumerate() {
+            if matched[at] {
+                continue;
+            }
+            match info.name.as_deref() {
+                Some(name) => groups.entry((oid.as_str(), name)).or_default().0.push(at),
+                None => {
+                    matched[at] = true;
+                    diff.left.push(format!(
+                        "the service lists attachment {} on object id {oid} under no name and under no global id the previous extraction holds, so whether it is one already loaded cannot be told and it was left where it is",
+                        info.id
+                    ));
+                }
+            }
+        }
+        for (at, record) in basis.iter().enumerate() {
+            if used[at] {
+                continue;
+            }
+            match record.oid.as_deref() {
+                Some(oid) => groups
+                    .entry((oid, record.name.as_str()))
+                    .or_default()
+                    .1
+                    .push(at),
+                None => {
+                    used[at] = true;
+                    diff.left.push(format!(
+                        "the previous extraction recorded no object id for {} and the service lists no attachment under its global id now, so nothing could be paired with it and it was left in ptolemy",
+                        record.name
+                    ));
+                }
+            }
+        }
+        for ((oid, name), (current, held_now)) in groups {
+            match (current.as_slice(), held_now.as_slice()) {
+                ([listing], [record]) => {
+                    matched[*listing] = true;
+                    used[*record] = true;
+                    paired.push((*listing, *record));
+                }
+                // one side only: an add or a delete, which the walks below make
+                ([], _) | (_, []) => {}
+                (current, held_now) => {
+                    diff.left.push(format!(
+                        "object id {oid} carries {} attachments called {name} and the previous extraction holds {} of that name on it, and a name on a feature is the only handle either side has, so none of them were paired and nothing was written for any of them",
+                        current.len(),
+                        held_now.len()
+                    ));
+                    for at in current {
+                        matched[*at] = true;
+                    }
+                    for at in held_now {
+                        used[*at] = true;
+                    }
+                }
+            }
+        }
+
+        let mut blobs = Blobs::new(held.directory, dataset);
+        for (listing, record) in paired {
+            let (oid, info) = &listed[listing];
+            let record = &basis[record];
+            // ptolemy holds it on the feature and under the name it was loaded
+            // as, and the index says so by whatever global id the service names
+            // it by now
+            if record.global_id != info.global_id
+                && let Some(stale) = &record.global_id
+            {
+                index.remove(stale);
+            }
+            if let Some(global_id) = &info.global_id {
+                index.insert(
+                    global_id.clone(),
+                    (record.feature_id.clone(), record.name.clone()),
+                );
+            }
+            // only what the listing states can have moved: one that states
+            // neither size nor content type says nothing about the bytes, and
+            // fetching them again on that would be a guess paid for in traffic
+            let moved = info.size.is_some_and(|size| Some(size) != record.size)
+                || info
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|kind| Some(kind) != record.content_type.as_deref());
+            if !moved {
+                diff.unchanged += 1;
+                continue;
+            }
+            let bytes = match self.attachment_blob(layer, oid, info.id) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    diff.left.push(format!(
+                        "{} on object id {oid} is not what was loaded and the service would not hand over the new bytes ({error}), so the copy in ptolemy stands",
+                        record.name
+                    ));
+                    continue;
+                }
+            };
+            // the name it was loaded under is what finds the copy to replace, so
+            // a rename since is not carried
+            if info
+                .name
+                .as_deref()
+                .is_some_and(|fresh| fresh != record.name)
+            {
+                diff.left.push(format!(
+                    "the service now calls attachment {} on object id {oid} {}, and ptolemy holds it as {}, which is what pairs the two, so the new bytes went up under the old name",
+                    info.id,
+                    info.name.as_deref().unwrap_or_default(),
+                    record.name
+                ));
+            }
+            let file = blobs.write(&bytes, &record.name)?;
+            out.push(AttachmentOp::Update(NewAttachment {
+                dataset: dataset.to_string(),
+                feature_id: record.feature_id.clone(),
+                name: record.name.clone(),
+                content_type: info.content_type.clone(),
+                file,
+                metadata: listing_metadata(info, layer, oid),
+                created_by: held.operator.to_string(),
+                global_id: info.global_id.clone().or_else(|| record.global_id.clone()),
+            }));
+            diff.replaced += 1;
+        }
+
+        for (at, (oid, info)) in listed.iter().enumerate() {
+            if matched[at] {
+                continue;
+            }
+            let Some(name) = info.name.clone() else {
+                // counted above, where the pairing gave up on it
+                continue;
+            };
+            let Some(feature_id) = held.features.get(oid) else {
+                diff.left.push(format!(
+                    "the service lists {name} on object id {oid}, which is not a row this delta or the previous extraction holds a feature for, so there is nothing to attach it to"
+                ));
+                continue;
+            };
+            let bytes = match self.attachment_blob(layer, oid, info.id) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    diff.left.push(format!(
+                        "{name} on object id {oid} is new and the service would not hand it over ({error}), so it was left where it is"
+                    ));
+                    continue;
+                }
+            };
+            let file = blobs.write(&bytes, &name)?;
+            out.push(AttachmentOp::Add(NewAttachment {
+                dataset: dataset.to_string(),
+                feature_id: feature_id.clone(),
+                name: name.clone(),
+                content_type: info.content_type.clone(),
+                file,
+                metadata: listing_metadata(info, layer, oid),
+                created_by: held.operator.to_string(),
+                global_id: info.global_id.clone(),
+            }));
+            if let Some(global_id) = &info.global_id {
+                index.insert(global_id.clone(), (feature_id.clone(), name));
+            }
+            diff.added += 1;
+        }
+
+        for (at, record) in basis.iter().enumerate() {
+            if used[at] {
+                continue;
+            }
+            out.push(AttachmentOp::Delete(DeleteAttachment {
+                dataset: dataset.to_string(),
+                feature_id: record.feature_id.clone(),
+                name: record.name.clone(),
+                global_id: record.global_id.clone(),
+            }));
+            if let Some(global_id) = &record.global_id {
+                index.remove(global_id);
+            }
+            diff.deleted += 1;
+        }
+
+        changes::write_attachment_index(held.directory, dataset, &index)?;
+        Ok(diff)
+    }
+
+    /// One listed attachment's bytes, off the route the service holds it at.
+    fn attachment_blob(&self, layer: &Layer, oid: &str, id: i64) -> Result<Vec<u8>, ArcgisError> {
+        let route = format!("{}/{}/{oid}/attachments/{id}", self.service.url, layer.id);
+        self.fetch.get(&route, &[])
     }
 
     /// The object ids of the features these global ids name, asked of the
@@ -2364,16 +2732,17 @@ impl ArcgisSource {
             .map_err(|error| format!("the service would not hand it over ({error})"))
     }
 
-    /// Every attachment of the features that were written, as `(object id,
-    /// info)`. Through `queryAttachments` in batches where the layer supports
-    /// it, and one listing per feature where it does not.
+    /// Every attachment of the features named in `features`, as `(object id,
+    /// info)`, asked about by the object ids that map's keys are. Through
+    /// `queryAttachments` in batches where the layer supports it, and one listing
+    /// per feature where it does not.
     fn list_attachments(
         &self,
         layer: &Layer,
-        minted: &BTreeMap<String, String>,
+        features: &BTreeMap<String, String>,
     ) -> Result<Vec<(String, RawAttachmentInfo)>, ArcgisError> {
         let mut listed = Vec::new();
-        let oids: Vec<&String> = minted.keys().collect();
+        let oids: Vec<&String> = features.keys().collect();
         if layer.supports_query_attachments {
             let route = format!("{}/{}/queryAttachments", self.service.url, layer.id);
             for batch in oids.chunks(ATTACHMENT_BATCH) {
@@ -2497,6 +2866,52 @@ fn place_attachment_delta(
         ),
         destination: Some(destination),
         losses: delta.left,
+    });
+}
+
+/// The log's account of one layer's attachments on the local diff. The counts
+/// are what the diff found, in the shape the change path's row states them, plus
+/// the unchanged ones, which are the proof the listing was read rather than
+/// assumed.
+fn place_attachment_diff(
+    layer: &Layer,
+    diff: AttachmentDiff,
+    placed: &mut Vec<(Item, Placed)>,
+    conversions: &mut Vec<Conversion>,
+) {
+    let item = verdict::attachment_item(layer);
+    if diff.added + diff.replaced + diff.deleted == 0 {
+        placed.push((
+            item,
+            Placed::Left(match (diff.left.is_empty(), diff.unchanged) {
+                (false, _) => diff.left.join("; "),
+                (true, 0) => format!(
+                    "{} holds no attachments on the rows this delta covers, and the previous extraction carried none off it either",
+                    layer.name
+                ),
+                (true, unchanged) => format!(
+                    "the attachments of {} were listed again and paired with the previous extraction's: {unchanged} unchanged, none added, replaced or deleted, so the ones already loaded stand",
+                    layer.name
+                ),
+            }),
+        ));
+        return;
+    }
+    let destination = format!("attachments of {}", layer.name);
+    placed.push((item, Placed::At(destination.clone())));
+    conversions.push(Conversion {
+        location: layer.name.clone(),
+        kind: ItemKind::EmbeddedResource,
+        detail: format!(
+            "{} attachment{} added, {} replaced, {} deleted; {} unchanged",
+            diff.added,
+            plural(diff.added),
+            diff.replaced,
+            diff.deleted,
+            diff.unchanged
+        ),
+        destination: Some(destination),
+        losses: diff.left,
     });
 }
 

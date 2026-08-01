@@ -264,15 +264,30 @@ stopped tracking changes, a queryable layer has no generation or no object id
 field, or the service refuses the request: one run is all one way, never half
 of each.
 
+The local diff carries the attachments too, listed the way a full extraction
+lists them and paired with the ones the previous extraction wrote down: by
+`globalId` where both sides have one, and otherwise by the object id the
+attachment hangs off and the name it is under, so a service keeping no attachment
+global ids is diffed rather than skipped. A pair whose size or content type moved
+is a replacement and its bytes are fetched, a pair that agrees is counted and
+costs no traffic, a listing that paired with nothing is an add, and a record that
+paired with nothing is a delete. That last one includes an attachment on a
+feature the delta deleted: ptolemy's delete writes a new version of the feature
+and leaves the attachments hanging off it, so the delete has to be written or the
+blob outlives the feature. Two attachments of one name on one feature is a
+pairing neither verne nor the loader can pick between, so the group is counted
+and named and nothing is written for it. The report says how many were added,
+replaced, deleted and left as they were, and the delta writes the same
+`attachment-ids/` index the other path does.
+
 What a delta does not carry is named in the log: relationship classes are not
-diffed, and neither are attachments on the local diff, which reads the features
-again and learns nothing about a blob on the way; a layer without an object id
-field cannot be paired at all; and a layer that vanished from the service keeps
-its features in ptolemy rather than having a diff delete a whole dataset. A delta
-is not a basis for a local diff, and not a basis at all without its object id
-index: both would read every row it left alone as vanished or as new, and it is
-refused by name rather than mispaired. A missing attachment index is not refused,
-because an attachment edit that pairs with nothing is a count and a reason.
+diffed; a layer without an object id field cannot be paired at all; and a layer
+that vanished from the service keeps its features in ptolemy rather than having a
+diff delete a whole dataset. A delta is not a basis for a local diff, and not a
+basis at all without its object id index: both would read every row it left alone
+as vanished or as new, and it is refused by name rather than mispaired. A missing
+attachment index is not refused, because an attachment edit that pairs with
+nothing is a count and a reason.
 
 `demo/migration-loop.sh` runs the whole story against a live service and a
 scratch ptolemy: full extract, load, delta, delta load, then verifies

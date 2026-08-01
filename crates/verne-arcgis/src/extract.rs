@@ -352,7 +352,13 @@ impl ArcgisSource {
                             },
                             &mut attachments,
                         )?;
-                        place_attachment_diff(layer, diffed, &mut placed, &mut conversions);
+                        place_attachment_delta(
+                            layer,
+                            diffed,
+                            AttachmentSource::Listed,
+                            &mut placed,
+                            &mut conversions,
+                        );
                     }
                     (Some(_), Some((held, edits))) => {
                         let carried = self.attachment_delta(
@@ -368,7 +374,13 @@ impl ArcgisSource {
                             edits,
                             &mut attachments,
                         )?;
-                        place_attachment_delta(layer, carried, &mut placed, &mut conversions);
+                        place_attachment_delta(
+                            layer,
+                            carried,
+                            AttachmentSource::Named,
+                            &mut placed,
+                            &mut conversions,
+                        );
                     }
                 }
             }
@@ -1976,20 +1988,30 @@ struct AttachmentBasis<'a> {
     operator: &'a str,
 }
 
-/// What a delta did with one layer's attachment edits.
+/// What a delta did with one layer's attachments, on either path.
 #[derive(Default)]
 struct AttachmentDelta {
     added: usize,
     replaced: usize,
     deleted: usize,
-    /// The edits it did not carry, each with the reason. An edit that pairs
-    /// with nothing is one of these, not an error: the window is still worth
+    /// Paired and unmoved, so no bytes were fetched: an attachment the listing
+    /// says is as it was loaded, or an add the service named that ptolemy
+    /// already holds. Counted, which is the proof it was looked at.
+    unchanged: usize,
+    /// What it did not carry, each with the reason. An edit that pairs with
+    /// nothing is one of these, not an error: the window is still worth
     /// loading.
     left: Vec<String>,
 }
 
-/// What ptolemy holds of one dataset's attachments, by global id: the feature
-/// each is on and the name it went up under.
+/// What ptolemy holds of one dataset's attachments, keyed by the global id the
+/// service names each by.
+///
+/// The same shape the basis comes in, because it is what the next run pairs
+/// against: a row here is what an operation leaves ptolemy holding.
+type AttachmentIndex = BTreeMap<String, BasisAttachment>;
+
+/// What ptolemy holds of one dataset's attachments, as this run pairs against it.
 ///
 /// A delta wrote its own index, because its sidecar names only the attachments
 /// it changed. A full extraction's sidecar names every one it carried, which is
@@ -1997,12 +2019,19 @@ struct AttachmentDelta {
 fn basis_attachments(
     previous: &Previous,
     dataset: &str,
-) -> Result<BTreeMap<String, (String, String)>, ArcgisError> {
+) -> Result<Vec<BasisAttachment>, ArcgisError> {
     if previous.sidecar.incremental {
         return Ok(
             changes::read_attachment_index(&previous.directory, dataset)?
                 .into_iter()
-                .map(|held| (held.global_id, (held.feature_id, held.name)))
+                .map(|held| BasisAttachment {
+                    global_id: Some(held.global_id),
+                    feature_id: held.feature_id,
+                    name: held.name,
+                    oid: held.oid,
+                    size: held.size,
+                    content_type: held.content_type,
+                })
                 .collect(),
         );
     }
@@ -2011,13 +2040,62 @@ fn basis_attachments(
         .attachments
         .iter()
         .filter(|op| op.dataset() == dataset)
-        .filter_map(|op| {
-            Some((
-                op.global_id()?.to_string(),
-                (op.feature_id().to_string(), op.name().to_string()),
-            ))
+        .filter_map(|op| match op {
+            AttachmentOp::Add(held) | AttachmentOp::Update(held) => Some(BasisAttachment {
+                global_id: held.global_id.clone(),
+                feature_id: held.feature_id.clone(),
+                name: held.name.clone(),
+                oid: held.metadata.get("object_id").map(text),
+                size: held
+                    .metadata
+                    .get("size")
+                    .and_then(serde_json::Value::as_u64),
+                content_type: held.content_type.clone(),
+            }),
+            AttachmentOp::Delete(_) => None,
         })
         .collect())
+}
+
+/// The index as the basis leaves it, before this window's operations are applied.
+/// An attachment the previous extraction recorded no global id for is not in it:
+/// the file is keyed by the id the service knows it by, and nothing else could
+/// name it.
+fn basis_index(basis: &[BasisAttachment]) -> AttachmentIndex {
+    basis
+        .iter()
+        .filter_map(|record| Some((record.global_id.clone()?, record.clone())))
+        .collect()
+}
+
+/// The index as a file holds it, in the order the map keeps it.
+fn index_rows(index: &AttachmentIndex) -> Vec<changes::IndexedAttachment> {
+    index
+        .iter()
+        .map(|(global_id, held)| changes::IndexedAttachment {
+            global_id: global_id.clone(),
+            feature_id: held.feature_id.clone(),
+            name: held.name.clone(),
+            oid: held.oid.clone(),
+            size: held.size,
+            content_type: held.content_type.clone(),
+        })
+        .collect()
+}
+
+/// What ptolemy holds of one attachment after an operation, written into the
+/// index under the global id the service names it by now. A pairing that crossed
+/// two global ids moves the row rather than leaving both, so the stale one cannot
+/// outlive what it named.
+fn reindex(index: &mut AttachmentIndex, stale: Option<&str>, held: BasisAttachment) {
+    if held.global_id.as_deref() != stale
+        && let Some(stale) = stale
+    {
+        index.remove(stale);
+    }
+    if let Some(global_id) = &held.global_id {
+        index.insert(global_id.clone(), held);
+    }
 }
 
 /// What to call an attachment the change file named: its file name, or the ids
@@ -2080,9 +2158,11 @@ fn listing_metadata(info: &RawAttachmentInfo, layer: &Layer, oid: &str) -> serde
     serde_json::Value::Object(metadata)
 }
 
-/// One attachment of the previous extraction, as a local diff pairs against it:
-/// the service's own id where it had one, the feature and the name ptolemy holds
-/// it under, and the object id, size and content type it was carried with.
+/// One attachment as a delta pairs against it: the service's own id where it had
+/// one, the feature and the name ptolemy holds it under, and the object id, size
+/// and content type it was last known by. The last three are what say whether an
+/// attachment moved without its bytes being fetched to see.
+#[derive(Clone)]
 struct BasisAttachment {
     global_id: Option<String>,
     feature_id: String,
@@ -2090,34 +2170,6 @@ struct BasisAttachment {
     oid: Option<String>,
     size: Option<u64>,
     content_type: Option<String>,
-}
-
-/// The attachments the previous extraction carried on one dataset.
-///
-/// Off its sidecar and nothing else. A delta is refused as the basis of a local
-/// diff, so this is always a full extraction, whose sidecar names every
-/// attachment it carried along with what the service said about each.
-fn basis_records(previous: &Previous, dataset: &str) -> Vec<BasisAttachment> {
-    previous
-        .sidecar
-        .attachments
-        .iter()
-        .filter(|op| op.dataset() == dataset)
-        .filter_map(|op| match op {
-            AttachmentOp::Add(held) | AttachmentOp::Update(held) => Some(BasisAttachment {
-                global_id: held.global_id.clone(),
-                feature_id: held.feature_id.clone(),
-                name: held.name.clone(),
-                oid: held.metadata.get("object_id").map(text),
-                size: held
-                    .metadata
-                    .get("size")
-                    .and_then(serde_json::Value::as_u64),
-                content_type: held.content_type.clone(),
-            }),
-            AttachmentOp::Delete(_) => None,
-        })
-        .collect()
 }
 
 /// Where a delta's attachment bytes land: one file per blob under the dataset's
@@ -2166,18 +2218,63 @@ impl<'a> Blobs<'a> {
 /// extraction carried off it, both as positions in their own lists.
 type NameGroup = (Vec<usize>, Vec<usize>);
 
-/// What a local diff made of one layer's attachments.
-#[derive(Default)]
-struct AttachmentDiff {
-    added: usize,
-    replaced: usize,
-    deleted: usize,
-    /// Paired and unmoved, so no bytes were fetched for them. Counted rather
-    /// than written, which is the proof the diff saw them.
-    unchanged: usize,
-    /// What it could not pair, each with the reason. Not fatal: a blob whose
-    /// history is ambiguous is not worth throwing the window away over.
-    left: Vec<String>,
+/// The basis record a server-reported add is already loaded as, struck off as
+/// matched so two adds cannot pair with one record.
+///
+/// By global id, and otherwise by the feature and the name, which is the pairing
+/// a service keeping no attachment global ids leaves. Two records of one name on
+/// one feature pair with nothing, for the reason a local diff gives: the name is
+/// the only handle, and the loader has no better one.
+fn already_loaded(
+    basis: &[BasisAttachment],
+    used: &mut [bool],
+    record: &AttachmentRecord,
+    oid: Option<&str>,
+) -> Result<Option<usize>, String> {
+    if let Some(global_id) = record.global_id.as_deref() {
+        for (at, held) in basis.iter().enumerate() {
+            if !used[at] && held.global_id.as_deref() == Some(global_id) {
+                used[at] = true;
+                return Ok(Some(at));
+            }
+        }
+    }
+    let (Some(oid), Some(name)) = (oid, record.name.as_deref()) else {
+        return Ok(None);
+    };
+    let same: Vec<usize> = basis
+        .iter()
+        .enumerate()
+        .filter(|(at, held)| !used[*at] && held.oid.as_deref() == Some(oid) && held.name == name)
+        .map(|(at, _)| at)
+        .collect();
+    match same.as_slice() {
+        [] => Ok(None),
+        [at] => {
+            used[*at] = true;
+            Ok(Some(*at))
+        }
+        many => Err(format!(
+            "the service says {name} was added to object id {oid}, which already holds {} attachments of that name, and a name on a feature is the only handle either side has, so which of them this is cannot be told and nothing was written",
+            many.len()
+        )),
+    }
+}
+
+/// Whether what the service says about an attachment now differs from what it
+/// was loaded as, and whether the two can be compared at all: an attachment
+/// nothing wrote a size or a content type down for cannot be told apart from a
+/// new one without fetching the bytes.
+fn moved_from(
+    size: Option<u64>,
+    content_type: Option<&str>,
+    loaded: &BasisAttachment,
+) -> (bool, bool) {
+    let comparable = (size.is_some() && loaded.size.is_some())
+        || (content_type.is_some() && loaded.content_type.is_some());
+    let moved = size.is_some_and(|size| Some(size) != loaded.size)
+        || content_type.is_some_and(|kind| Some(kind) != loaded.content_type.as_deref());
+    (comparable, moved)
 }
 
 impl ArcgisSource {
@@ -2257,6 +2354,15 @@ impl ArcgisSource {
     /// edit that pairs with nothing is counted and named rather than guessed
     /// onto a feature, and rather than failing the extraction.
     ///
+    /// An add is paired against the basis as well, and not applied for being an
+    /// add. A window that ends where the next one begins reports the edits on
+    /// that boundary twice, which a generation scheme counting whole windows does
+    /// on every run and a live service does at the edges, so an add of an
+    /// attachment ptolemy already holds byte for byte is counted and dropped, and
+    /// one whose size or content type has moved since becomes a replacement. The
+    /// alternative is a second copy of one name on one feature, which is the one
+    /// state the loader cannot act on afterwards.
+    ///
     /// The index this leaves behind is the basis with these operations applied,
     /// which is what the next delta of a chain pairs against. It is written
     /// even where nothing changed and even where nothing could be paired: what
@@ -2269,9 +2375,11 @@ impl ArcgisSource {
     ) -> Result<AttachmentDelta, ArcgisError> {
         let (layer, dataset) = (held.layer, held.dataset);
         let mut delta = AttachmentDelta::default();
-        // global id to the feature ptolemy holds it on and the name it went up
-        // under, which together are the only handle the loader has on it
-        let mut index = basis_attachments(held.previous, dataset)?;
+        // what ptolemy holds and what the service last said about each, which
+        // together are the only handle the loader has on one and the only way to
+        // tell an edit already applied from a real one
+        let basis = basis_attachments(held.previous, dataset)?;
+        let mut index = basis_index(&basis);
         let Some(global_id_field) = &layer.global_id_field else {
             delta.left.push(format!(
                 "a change file names every attachment edit by global id and {} declares no global id field, so the {} edit{} it named could not be paired with anything and none were carried",
@@ -2279,7 +2387,7 @@ impl ArcgisSource {
                 edits.adds.len() + edits.updates.len() + edits.deleted.len(),
                 plural(edits.adds.len() + edits.updates.len() + edits.deleted.len())
             ));
-            changes::write_attachment_index(held.directory, dataset, &index)?;
+            changes::write_attachment_index(held.directory, dataset, &index_rows(&index))?;
             return Ok(delta);
         };
 
@@ -2300,6 +2408,7 @@ impl ArcgisSource {
 
         let mut blobs = Blobs::new(held.directory, dataset);
 
+        let mut used = vec![false; basis.len()];
         for record in &edits.adds {
             let named = attachment_named(record);
             let Some(parent) = &record.parent_global_id else {
@@ -2308,13 +2417,51 @@ impl ArcgisSource {
                 ));
                 continue;
             };
-            let Some(feature_id) = parents.get(parent).and_then(|oid| held.features.get(oid))
-            else {
+            let oid = parents.get(parent);
+            let Some(feature_id) = oid.and_then(|oid| held.features.get(oid)) else {
                 delta.left.push(format!(
                     "the service says {named} was added to the feature {parent}, which is not a feature this extraction or an earlier one wrote, so there is nothing to attach it to"
                 ));
                 continue;
             };
+            // an add is not taken on trust: a window that ends where another
+            // began reports the same edit twice, so what the basis holds decides
+            // whether this is a first copy, new bytes for one already loaded, or
+            // nothing at all
+            let loaded = match already_loaded(&basis, &mut used, record, oid.map(String::as_str)) {
+                Ok(loaded) => loaded.map(|at| basis[at].clone()),
+                Err(reason) => {
+                    delta.left.push(reason);
+                    continue;
+                }
+            };
+            if let Some(loaded) = &loaded {
+                let (comparable, moved) =
+                    moved_from(record.size, record.content_type.as_deref(), loaded);
+                if comparable && !moved {
+                    // already in ptolemy, byte for byte as far as anything says,
+                    // so nothing is fetched and nothing is written
+                    delta.unchanged += 1;
+                    reindex(
+                        &mut index,
+                        loaded.global_id.as_deref(),
+                        BasisAttachment {
+                            global_id: record
+                                .global_id
+                                .clone()
+                                .or_else(|| loaded.global_id.clone()),
+                            oid: oid.cloned().or_else(|| loaded.oid.clone()),
+                            ..loaded.clone()
+                        },
+                    );
+                    continue;
+                }
+                if !comparable {
+                    delta.left.push(format!(
+                        "the service says {named} was added and ptolemy already holds it, and nothing written down says what size it was loaded at, so the bytes were fetched and carried as a replacement rather than taken to be the same"
+                    ));
+                }
+            }
             let bytes = match self.attachment_bytes(record) {
                 Ok(bytes) => bytes,
                 Err(reason) => {
@@ -2322,21 +2469,61 @@ impl ArcgisSource {
                     continue;
                 }
             };
-            let file = blobs.write(&bytes, &named)?;
-            out.push(AttachmentOp::Add(NewAttachment {
+            // the copy ptolemy holds is found by the name it went up under, so a
+            // replacement keeps that name and a rename since is not carried
+            let name = match &loaded {
+                Some(loaded) => loaded.name.clone(),
+                None => named.clone(),
+            };
+            if name != named {
+                delta.left.push(format!(
+                    "the service now calls the attachment it says was added {named} and ptolemy holds it as {name}, which is what pairs the two, so the new bytes went up under the old name"
+                ));
+            }
+            let file = blobs.write(&bytes, &name)?;
+            let landed = NewAttachment {
                 dataset: dataset.to_string(),
-                feature_id: feature_id.clone(),
-                name: named.clone(),
+                feature_id: match &loaded {
+                    Some(loaded) => loaded.feature_id.clone(),
+                    None => feature_id.clone(),
+                },
+                name: name.clone(),
                 content_type: record.content_type.clone(),
                 file,
-                metadata: attachment_metadata(record, layer, parents.get(parent)),
+                metadata: attachment_metadata(record, layer, oid),
                 created_by: held.operator.to_string(),
                 global_id: record.global_id.clone(),
-            }));
-            if let Some(global_id) = &record.global_id {
-                index.insert(global_id.clone(), (feature_id.clone(), named));
+            };
+            reindex(
+                &mut index,
+                loaded
+                    .as_ref()
+                    .and_then(|loaded| loaded.global_id.as_deref()),
+                BasisAttachment {
+                    global_id: record
+                        .global_id
+                        .clone()
+                        .or_else(|| loaded.as_ref().and_then(|loaded| loaded.global_id.clone())),
+                    feature_id: landed.feature_id.clone(),
+                    name,
+                    oid: oid.cloned(),
+                    size: record.size,
+                    content_type: record.content_type.clone(),
+                },
+            );
+            // ptolemy has no route that changes an attachment, so new bytes for
+            // one already loaded ride as the operation the loader turns into a
+            // delete and an upload
+            match loaded {
+                None => {
+                    out.push(AttachmentOp::Add(landed));
+                    delta.added += 1;
+                }
+                Some(_) => {
+                    out.push(AttachmentOp::Update(landed));
+                    delta.replaced += 1;
+                }
             }
-            delta.added += 1;
         }
 
         for record in &edits.updates {
@@ -2347,7 +2534,7 @@ impl ArcgisSource {
                 ));
                 continue;
             };
-            let Some((feature_id, loaded_as)) = index.get(global_id).cloned() else {
+            let Some(loaded) = index.get(global_id).cloned() else {
                 delta.left.push(format!(
                     "the service says the attachment {global_id} was changed, and nothing written down says which feature it was loaded onto, so the new bytes were not carried"
                 ));
@@ -2365,28 +2552,40 @@ impl ArcgisSource {
             if record
                 .name
                 .as_deref()
-                .is_some_and(|fresh| fresh != loaded_as)
+                .is_some_and(|fresh| fresh != loaded.name)
             {
                 delta.left.push(format!(
-                    "the service now calls the attachment {global_id} {named} and ptolemy holds it as {loaded_as}, which is what pairs the two, so the new bytes went up under the old name"
+                    "the service now calls the attachment {global_id} {named} and ptolemy holds it as {}, which is what pairs the two, so the new bytes went up under the old name",
+                    loaded.name
                 ));
             }
-            let file = blobs.write(&bytes, &loaded_as)?;
+            let file = blobs.write(&bytes, &loaded.name)?;
             out.push(AttachmentOp::Update(NewAttachment {
                 dataset: dataset.to_string(),
-                feature_id,
-                name: loaded_as,
+                feature_id: loaded.feature_id.clone(),
+                name: loaded.name.clone(),
                 content_type: record.content_type.clone(),
                 file,
                 metadata: attachment_metadata(record, layer, None),
                 created_by: held.operator.to_string(),
                 global_id: Some(global_id.clone()),
             }));
+            // the new size is what the next window's adds are held against, so
+            // the index carries it rather than what was loaded first
+            reindex(
+                &mut index,
+                Some(global_id),
+                BasisAttachment {
+                    size: record.size.or(loaded.size),
+                    content_type: record.content_type.clone().or(loaded.content_type.clone()),
+                    ..loaded
+                },
+            );
             delta.replaced += 1;
         }
 
         for global_id in &edits.deleted {
-            let Some((feature_id, loaded_as)) = index.remove(global_id) else {
+            let Some(loaded) = index.remove(global_id) else {
                 delta.left.push(format!(
                     "the service says the attachment {global_id} is gone, and nothing written down says which feature it was loaded onto, so nothing was written to delete it"
                 ));
@@ -2394,14 +2593,14 @@ impl ArcgisSource {
             };
             out.push(AttachmentOp::Delete(DeleteAttachment {
                 dataset: dataset.to_string(),
-                feature_id,
-                name: loaded_as,
+                feature_id: loaded.feature_id,
+                name: loaded.name,
                 global_id: Some(global_id.clone()),
             }));
             delta.deleted += 1;
         }
 
-        changes::write_attachment_index(held.directory, dataset, &index)?;
+        changes::write_attachment_index(held.directory, dataset, &index_rows(&index))?;
         Ok(delta)
     }
 
@@ -2435,22 +2634,14 @@ impl ArcgisSource {
         &self,
         held: &AttachmentBasis<'_>,
         out: &mut Vec<AttachmentOp>,
-    ) -> Result<AttachmentDiff, ArcgisError> {
+    ) -> Result<AttachmentDelta, ArcgisError> {
         let (layer, dataset) = (held.layer, held.dataset);
-        let mut diff = AttachmentDiff::default();
-        let basis = basis_records(held.previous, dataset);
+        let mut diff = AttachmentDelta::default();
+        let basis = basis_attachments(held.previous, dataset)?;
         let listed = self.list_attachments(layer, held.features)?;
         // what ptolemy holds, by the global id the service knows it by, which is
         // what a run that can ride extractChanges pairs its edits against
-        let mut index: BTreeMap<String, (String, String)> = basis
-            .iter()
-            .filter_map(|record| {
-                Some((
-                    record.global_id.clone()?,
-                    (record.feature_id.clone(), record.name.clone()),
-                ))
-            })
-            .collect();
+        let mut index = basis_index(&basis);
 
         // paired as `(listing, record)`, and both sides are struck off as they
         // are matched, so what is left over is exactly what appeared or vanished
@@ -2542,26 +2733,23 @@ impl ArcgisSource {
             let record = &basis[record];
             // ptolemy holds it on the feature and under the name it was loaded
             // as, and the index says so by whatever global id the service names
-            // it by now
-            if record.global_id != info.global_id
-                && let Some(stale) = &record.global_id
-            {
-                index.remove(stale);
-            }
-            if let Some(global_id) = &info.global_id {
-                index.insert(
-                    global_id.clone(),
-                    (record.feature_id.clone(), record.name.clone()),
-                );
-            }
+            // it by now, with what the listing says the bytes are
+            reindex(
+                &mut index,
+                record.global_id.as_deref(),
+                BasisAttachment {
+                    global_id: info.global_id.clone().or_else(|| record.global_id.clone()),
+                    feature_id: record.feature_id.clone(),
+                    name: record.name.clone(),
+                    oid: Some(oid.clone()),
+                    size: info.size.or(record.size),
+                    content_type: info.content_type.clone().or(record.content_type.clone()),
+                },
+            );
             // only what the listing states can have moved: one that states
             // neither size nor content type says nothing about the bytes, and
             // fetching them again on that would be a guess paid for in traffic
-            let moved = info.size.is_some_and(|size| Some(size) != record.size)
-                || info
-                    .content_type
-                    .as_deref()
-                    .is_some_and(|kind| Some(kind) != record.content_type.as_deref());
+            let (_, moved) = moved_from(info.size, info.content_type.as_deref(), record);
             if !moved {
                 diff.unchanged += 1;
                 continue;
@@ -2638,9 +2826,18 @@ impl ArcgisSource {
                 created_by: held.operator.to_string(),
                 global_id: info.global_id.clone(),
             }));
-            if let Some(global_id) = &info.global_id {
-                index.insert(global_id.clone(), (feature_id.clone(), name));
-            }
+            reindex(
+                &mut index,
+                None,
+                BasisAttachment {
+                    global_id: info.global_id.clone(),
+                    feature_id: feature_id.clone(),
+                    name,
+                    oid: Some(oid.clone()),
+                    size: info.size,
+                    content_type: info.content_type.clone(),
+                },
+            );
             diff.added += 1;
         }
 
@@ -2660,7 +2857,7 @@ impl ArcgisSource {
             diff.deleted += 1;
         }
 
-        changes::write_attachment_index(held.directory, dataset, &index)?;
+        changes::write_attachment_index(held.directory, dataset, &index_rows(&index))?;
         Ok(diff)
     }
 
@@ -2829,11 +3026,25 @@ fn place_attachments(
     }
 }
 
-/// The log's account of one layer's attachment changes. The counts are what was
-/// carried, and the reasons are what was named and not.
+/// How the delta learned what happened to the attachments, which is the one
+/// thing the two paths' report rows word differently: one was told, the other
+/// looked.
+enum AttachmentSource {
+    /// The service named the edits, and every one of them was held against what
+    /// ptolemy already has.
+    Named,
+    /// verne listed them and paired them itself.
+    Listed,
+}
+
+/// The log's account of one layer's attachments after a delta, on either path.
+/// The counts are what was carried, the unchanged ones are the proof the rest
+/// were looked at rather than assumed, and the reasons are what could not be
+/// placed.
 fn place_attachment_delta(
     layer: &Layer,
     delta: AttachmentDelta,
+    source: AttachmentSource,
     placed: &mut Vec<(Item, Placed)>,
     conversions: &mut Vec<Conversion>,
 ) {
@@ -2841,56 +3052,22 @@ fn place_attachment_delta(
     if delta.added + delta.replaced + delta.deleted == 0 {
         placed.push((
             item,
-            Placed::Left(if delta.left.is_empty() {
-                format!(
+            Placed::Left(match (&source, delta.left.is_empty(), delta.unchanged) {
+                (_, false, _) => delta.left.join("; "),
+                (AttachmentSource::Named, true, 0) => format!(
                     "the service names no attachment edit on {} in this window, so the attachments already loaded stand",
                     layer.name
-                )
-            } else {
-                delta.left.join("; ")
-            }),
-        ));
-        return;
-    }
-    let destination = format!("attachments of {}", layer.name);
-    placed.push((item, Placed::At(destination.clone())));
-    conversions.push(Conversion {
-        location: layer.name.clone(),
-        kind: ItemKind::EmbeddedResource,
-        detail: format!(
-            "{} attachment{} added, {} replaced, {} deleted",
-            delta.added,
-            plural(delta.added),
-            delta.replaced,
-            delta.deleted
-        ),
-        destination: Some(destination),
-        losses: delta.left,
-    });
-}
-
-/// The log's account of one layer's attachments on the local diff. The counts
-/// are what the diff found, in the shape the change path's row states them, plus
-/// the unchanged ones, which are the proof the listing was read rather than
-/// assumed.
-fn place_attachment_diff(
-    layer: &Layer,
-    diff: AttachmentDiff,
-    placed: &mut Vec<(Item, Placed)>,
-    conversions: &mut Vec<Conversion>,
-) {
-    let item = verdict::attachment_item(layer);
-    if diff.added + diff.replaced + diff.deleted == 0 {
-        placed.push((
-            item,
-            Placed::Left(match (diff.left.is_empty(), diff.unchanged) {
-                (false, _) => diff.left.join("; "),
-                (true, 0) => format!(
+                ),
+                (AttachmentSource::Named, true, held) => format!(
+                    "every attachment edit the service names on {} in this window, {held} of them, is already loaded, so nothing was written",
+                    layer.name
+                ),
+                (AttachmentSource::Listed, true, 0) => format!(
                     "{} holds no attachments on the rows this delta covers, and the previous extraction carried none off it either",
                     layer.name
                 ),
-                (true, unchanged) => format!(
-                    "the attachments of {} were listed again and paired with the previous extraction's: {unchanged} unchanged, none added, replaced or deleted, so the ones already loaded stand",
+                (AttachmentSource::Listed, true, held) => format!(
+                    "the attachments of {} were listed again and paired with the previous extraction's: {held} unchanged, none added, replaced or deleted, so the ones already loaded stand",
                     layer.name
                 ),
             }),
@@ -2904,14 +3081,14 @@ fn place_attachment_diff(
         kind: ItemKind::EmbeddedResource,
         detail: format!(
             "{} attachment{} added, {} replaced, {} deleted; {} unchanged",
-            diff.added,
-            plural(diff.added),
-            diff.replaced,
-            diff.deleted,
-            diff.unchanged
+            delta.added,
+            plural(delta.added),
+            delta.replaced,
+            delta.deleted,
+            delta.unchanged
         ),
         destination: Some(destination),
-        losses: diff.left,
+        losses: delta.left,
     });
 }
 

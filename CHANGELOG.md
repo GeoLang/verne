@@ -97,6 +97,21 @@ All notable changes to this project will be documented in this file.
     id column, is counted and named in the report rather than guessed at or
     fatal. The report row that used to say attachments are not diffed now says
     what was carried, with counts.
+  - A server-reported add is paired against the basis like every other edit
+    rather than applied for being an add. A window that ends where the next one
+    begins reports the edits on that boundary twice, which a generation scheme
+    counting whole windows does on every run and a live service does at the
+    edges, so an add of an attachment ptolemy already holds at that size and
+    content type is counted as unchanged and dropped with no bytes fetched, and
+    one whose size or content type has moved becomes a replacement. Otherwise the
+    load would put a second attachment of one name on the feature, which is the
+    one state it cannot act on afterwards. The pairing falls back to the object id
+    and the name where either side has no global id, and `attachment-ids/` now
+    records the object id, size and content type each attachment was last known
+    by so a chained delta can make the same judgement. The rows are optional, so
+    an index written before them reads as "nothing written down says", and such an
+    add is carried as a replacement rather than taken to be the same. The report
+    row counts what was skipped as unchanged.
   - `verne load` applies them: an add is an upload, and a replacement is the
     loaded copy deleted and the new bytes uploaded in that order, since ptolemy
     has no route that changes an attachment. The loaded copy is found by name on

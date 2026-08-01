@@ -229,15 +229,28 @@ sidecar `verne load` reads.
 The attachment edits a change file names are carried too. An add or a
 replacement is bytes, fetched off the URL the record names, which is on the
 service's own host and carries no signature, so the token rides on it as it does
-everywhere else. A replacement or a delete is a pairing: the change file names an
-attachment by the service's `globalId`, and the extraction that loaded it wrote
-that id down beside the feature it went onto and the name it went up under, which
-is the only handle ptolemy leaves on it. An add names its feature by global id
-too, and a parent that did not itself change is not among the rows the delta
+everywhere else. Every edit is a pairing, including an add: the change file names
+an attachment by the service's `globalId`, and the extraction that loaded it
+wrote that id down beside the feature it went onto and the name it went up under,
+which is the only handle ptolemy leaves on it. An add names its feature by global
+id too, and a parent that did not itself change is not among the rows the delta
 fetched, so it is asked for with the service's own `where <globalIdField> IN
-(...)`. On the load an add is an upload, and a replacement is the loaded copy
-deleted and the new bytes uploaded in that order, because ptolemy has no route
-that changes an attachment. Two attachments of one name on one feature is a
+(...)`.
+
+An add is not taken on trust for being an add. A window that ends where the next
+one begins reports the edits on that boundary twice, so an add of an attachment
+ptolemy already holds at that size and content type is counted and dropped with no
+bytes fetched, and one whose size or content type has moved since becomes a
+replacement. Without that the loader would put a second attachment of one name on
+the feature, which is the one state it cannot act on afterwards. The pairing falls
+back to the object id and the name where a global id is missing on either side,
+the same way the local diff's does, and what the service last said about each
+attachment is written into `attachment-ids/` so the next delta of the chain can
+make the same judgement.
+
+On the load an add is an upload, and a replacement is the loaded copy deleted and
+the new bytes uploaded in that order, because ptolemy has no route that changes an
+attachment. Two attachments of one name on one feature is a
 pairing the loader will not pick between, and it refuses that operation and says
 so. So does an edit to an attachment nothing was ever loaded under, and a layer
 with no global id column has all of its attachment edits skipped: each is a count
@@ -248,7 +261,8 @@ chain of cheap deltas rather than one. Three things have to carry over, and all
 of them are written into the delta's own directory: the generations, an object
 id index in `object-ids/`, one line per row saying which feature id ptolemy
 holds it under and a hash of what was last written for it, and an attachment
-index in `attachment-ids/` doing the same by global id. The indexes are what the
+index in `attachment-ids/` doing the same by global id, with the object id, size
+and content type each was last known by. The indexes are what the
 feature files cannot be, because they hold only the rows that delta touched, and
 without them a row edited in two windows running would come back as a second
 copy of itself. Each delta writes the indexes it was given with its own
@@ -319,10 +333,11 @@ From a feature service the GeoPackage is absent and everything else is the
 same, so `verne load` reads both extractions without knowing which it was
 handed. A feature service that publishes a generation window leaves a fifth
 file, `server-gens.json`, which is the cursor the next `--since` sends back to
-`extractChanges`, and a delta that rode that path leaves `object-ids/` and
-`attachment-ids/` beside it, one file per dataset saying which feature id
-ptolemy holds each object id under and which feature and name it holds each
-attachment under. Nothing but a later delta reads any of them.
+`extractChanges`. A delta leaves an `attachment-ids/` beside it, one file per
+dataset saying which feature and name ptolemy holds each attachment under and
+what the service last said about its bytes, and one that rode that path leaves an
+`object-ids/` as well, saying which feature id ptolemy holds each object id under.
+Nothing but a later delta reads any of them.
 
 The sidecar's structs mirror ptolemy's request bodies field for field, so
 loading is a POST of each struct and not a translation that can drift from the

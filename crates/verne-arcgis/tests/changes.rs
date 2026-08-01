@@ -249,15 +249,7 @@ fn change_file() -> serde_json::Value {
                     "deleteIds": [3]
                 },
                 "attachments": {
-                    "adds": [{
-                        "attachmentId": 7,
-                        "globalId": LOGS,
-                        "parentGlobalId": well_guid(5),
-                        "contentType": "application/pdf",
-                        "name": "logs.pdf",
-                        "size": LOGS_BYTES.len(),
-                        "url": format!("{ROOT}/0/5/attachments/7")
-                    }],
+                    "adds": [logs_add()],
                     "updates": [{
                         "attachmentId": 1,
                         "globalId": PHOTO,
@@ -277,6 +269,45 @@ fn change_file() -> serde_json::Value {
             { "id": 1, "serverGen": NEXT_GEN }
         ]
     })
+}
+
+/// The add the window names: a log on well 5, which nothing was ever loaded for.
+fn logs_add() -> serde_json::Value {
+    json!({
+        "attachmentId": 7,
+        "globalId": LOGS,
+        "parentGlobalId": well_guid(5),
+        "contentType": "application/pdf",
+        "name": "logs.pdf",
+        "size": LOGS_BYTES.len(),
+        "url": format!("{ROOT}/0/5/attachments/7")
+    })
+}
+
+/// The photo on well 1 as an add rather than an update, which is how a window
+/// that ends where the last one began reports it, with the size the service says
+/// it is now.
+fn photo_add(size: usize) -> serde_json::Value {
+    json!({
+        "attachmentId": 1,
+        "globalId": PHOTO,
+        "parentGlobalId": well_guid(1),
+        "contentType": "image/png",
+        "name": "photo.png",
+        "size": size,
+        "url": format!("{ROOT}/0/1/attachments/1")
+    })
+}
+
+/// The standard window with its attachment section replaced.
+fn window_with(adds: Vec<serde_json::Value>) -> serde_json::Value {
+    let mut file = change_file();
+    file["edits"][0]["attachments"] = json!({
+        "adds": adds,
+        "updates": [],
+        "deleteIds": []
+    });
+    file
 }
 
 /// The first state, tracking changes and publishing its generations. Well 1
@@ -663,7 +694,7 @@ fn a_delta_with_recorded_generations_rides_extract_changes() {
     let attachments = attachment_counts(&extraction);
     assert_eq!(
         attachments.detail,
-        "1 attachment added, 1 replaced, 0 deleted"
+        "1 attachment added, 1 replaced, 0 deleted; 0 unchanged"
     );
     let Action::CarriedWithLoss { losses } = &attachments.action else {
         panic!("{attachments:#?}");
@@ -1020,7 +1051,7 @@ fn a_deleted_attachment_is_carried_as_a_delete() {
     assert_eq!(delete.dataset, "Wells");
     assert_eq!(
         attachment_counts(&extraction).detail,
-        "0 attachments added, 0 replaced, 1 deleted"
+        "0 attachments added, 0 replaced, 1 deleted; 0 unchanged"
     );
     // and it is out of the index, so the next delta of the chain does not think
     // ptolemy still holds it
@@ -1061,6 +1092,123 @@ fn an_unpairable_delete_is_counted_rather_than_fatal() {
     // the window still landed: the two edits that could be placed are there
     assert_eq!(extraction.sidecar.attachments.len(), 2);
     assert_eq!(ops(delta.path(), "features/Wells.ndjson").len(), 3);
+}
+
+/// A server can report an add for an attachment ptolemy already holds: a window
+/// that ends where the next one begins carries the edits on that boundary twice,
+/// which ptolemy's own generation scheme does on every run and a live service
+/// does at the edges. What the basis says decides, so the add is dropped, no
+/// bytes are fetched, and the loaded copy is left alone: uploading it again would
+/// put two attachments of one name on the feature, which is the one state the
+/// loader cannot act on afterwards.
+#[test]
+fn an_add_the_basis_already_holds_is_skipped() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let first = extract_full(full.path());
+    let (feature, name) = attached(&first);
+    let fake = changed_file_fake(window_with(vec![photo_add(PHOTO_BYTES.len())]));
+    let calls = fake.calls();
+    let extraction = ArcgisSource::open_with(Box::new(fake), ROOT)
+        .expect("the fixture opens")
+        .extract_since(delta.path(), OPERATOR, full.path())
+        .expect("the delta extraction runs");
+
+    assert!(
+        extraction.sidecar.attachments.is_empty(),
+        "{:#?}",
+        extraction.sidecar.attachments
+    );
+    let asked: Vec<String> = calls
+        .borrow()
+        .iter()
+        .map(|call| call.route.clone())
+        .collect();
+    assert!(
+        !asked.contains(&"/0/1/attachments/1".to_string()),
+        "the bytes of an attachment already loaded were fetched anyway: {asked:#?}"
+    );
+    // the row says the window held nothing new rather than claiming a carry
+    let Action::Skipped { reason } = &attachment_verdict(&extraction).action else {
+        panic!("{:#?}", attachment_verdict(&extraction));
+    };
+    assert!(reason.contains("1 of them, is already loaded"), "{reason}");
+    // and the index still says ptolemy holds it, so the next window pairs against
+    // it the same way
+    assert_eq!(
+        attachment_index(delta.path()),
+        vec![(PHOTO.to_string(), feature, name)]
+    );
+    // the features of the same window still landed
+    assert_eq!(ops(delta.path(), "features/Wells.ndjson").len(), 3);
+}
+
+/// The same add with a size the loaded copy does not have is new bytes for it,
+/// whatever section the service put it in, so it rides as the operation the
+/// loader turns into a delete and an upload rather than as a second copy.
+#[test]
+fn an_add_of_new_bytes_for_a_loaded_attachment_is_a_replacement() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    let first = extract_full(full.path());
+    let (feature, name) = attached(&first);
+    let extraction = ArcgisSource::open_with(
+        Box::new(changed_file_fake(window_with(vec![photo_add(
+            PHOTO_AGAIN.len(),
+        )]))),
+        ROOT,
+    )
+    .expect("the fixture opens")
+    .extract_since(delta.path(), OPERATOR, full.path())
+    .expect("the delta extraction runs");
+
+    let [AttachmentOp::Update(update)] = extraction.sidecar.attachments.as_slice() else {
+        panic!("{:#?}", extraction.sidecar.attachments);
+    };
+    assert_eq!(update.global_id.as_deref(), Some(PHOTO));
+    assert_eq!(update.feature_id, feature);
+    assert_eq!(update.name, name);
+    assert_eq!(
+        std::fs::read(delta.path().join(&update.file)).expect("the blob"),
+        PHOTO_AGAIN
+    );
+    assert_eq!(
+        attachment_counts(&extraction).detail,
+        "0 attachments added, 1 replaced, 0 deleted; 0 unchanged"
+    );
+}
+
+/// A repeated add does not cost the window the rest of it: the add of something
+/// nothing was ever loaded for still lands, and the report counts both.
+#[test]
+fn a_new_add_beside_a_repeated_one_still_lands() {
+    let full = tempfile::tempdir().expect("tempdir");
+    let delta = tempfile::tempdir().expect("tempdir");
+    extract_full(full.path());
+    let extraction = ArcgisSource::open_with(
+        Box::new(changed_file_fake(window_with(vec![
+            photo_add(PHOTO_BYTES.len()),
+            logs_add(),
+        ]))),
+        ROOT,
+    )
+    .expect("the fixture opens")
+    .extract_since(delta.path(), OPERATOR, full.path())
+    .expect("the delta extraction runs");
+
+    let [AttachmentOp::Add(add)] = extraction.sidecar.attachments.as_slice() else {
+        panic!("{:#?}", extraction.sidecar.attachments);
+    };
+    assert_eq!(add.global_id.as_deref(), Some(LOGS));
+    assert_eq!(add.feature_id, minted(full.path())[&5]);
+    assert_eq!(
+        std::fs::read(delta.path().join(&add.file)).expect("the blob"),
+        LOGS_BYTES
+    );
+    assert_eq!(
+        attachment_counts(&extraction).detail,
+        "1 attachment added, 0 replaced, 0 deleted; 1 unchanged"
+    );
 }
 
 /// A layer with no global id column cannot have an attachment edit paired with
@@ -1411,6 +1559,15 @@ fn a_chained_delta_pairs_an_attachment_the_previous_delta_created() {
             ),
             (LOGS.to_string(), wells[&5].clone(), "logs.pdf".to_string()),
         ]
+    );
+
+    // it also wrote down what the bytes are now, which is what lets the next
+    // window tell an add it has already applied from a real one
+    let rows = std::fs::read_to_string(first.path().join(ATTACHMENT_IDS_DIR).join("Wells.ndjson"))
+        .expect("the index");
+    assert!(
+        rows.contains(&format!(r#""size":{}"#, PHOTO_AGAIN.len())),
+        "{rows}"
     );
 
     let [AttachmentOp::Delete(delete)] = extraction.sidecar.attachments.as_slice() else {

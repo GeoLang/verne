@@ -217,11 +217,24 @@ fn write_lines(path: &Path, lines: impl Iterator<Item = String>) -> Result<(), A
 /// One attachment as the index holds it: the id the service knows it by, the
 /// feature ptolemy hangs it off, and the name it was uploaded under, which is
 /// what the loader matches to find it again.
+///
+/// The last three are what the service said about the blob when it was loaded.
+/// They are what lets the next delta tell an edit it has already applied from a
+/// real one without fetching the bytes to look, and the object id is the only
+/// handle it has where the service keeps no attachment global ids. All optional:
+/// an index written before they existed says nothing about the bytes, and a run
+/// reading one takes that for what it is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedAttachment {
     pub global_id: String,
     pub feature_id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
 }
 
 pub fn attachment_index_path(directory: &Path, dataset: &str) -> PathBuf {
@@ -264,22 +277,17 @@ pub fn read_attachment_index(
     Ok(rows)
 }
 
-/// Write one dataset's attachment index, keyed by global id, holding the
-/// feature it is on and the name it is under.
+/// Write one dataset's attachment index, a line per attachment, in the order the
+/// caller holds them, which is by the global id each carries.
 pub fn write_attachment_index(
     directory: &Path,
     dataset: &str,
-    rows: &BTreeMap<String, (String, String)>,
+    rows: &[IndexedAttachment],
 ) -> Result<(), ArcgisError> {
     write_lines(
         &attachment_index_path(directory, dataset),
-        rows.iter().map(|(global_id, (feature_id, name))| {
-            serde_json::to_string(&IndexedAttachment {
-                global_id: global_id.clone(),
-                feature_id: feature_id.clone(),
-                name: name.clone(),
-            })
-            .expect("an index row holds only text")
+        rows.iter().map(|row| {
+            serde_json::to_string(row).expect("an index row holds only text and a number")
         }),
     )
 }

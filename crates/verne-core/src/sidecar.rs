@@ -200,6 +200,9 @@ pub struct NewRelationship {
     pub cardinality: String,
     pub forward_label: String,
     pub backward_label: String,
+    /// Composite: deleting an origin feature deletes what hangs off it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_composite: bool,
 }
 
 /// One feature to insert: one `insert` operation of ptolemy's

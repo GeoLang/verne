@@ -679,6 +679,7 @@ impl Loader {
                 cardinality: &class.cardinality,
                 forward_label: &class.forward_label,
                 backward_label: &class.backward_label,
+                is_composite: class.is_composite,
             },
         )?;
         id_of(&route, &body)
@@ -897,4 +898,5 @@ struct RelationshipBody<'a> {
     cardinality: &'a str,
     forward_label: &'a str,
     backward_label: &'a str,
+    is_composite: bool,
 }

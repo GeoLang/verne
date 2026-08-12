@@ -200,7 +200,7 @@ fn a_range_domain_carries_both_bounds() {
 }
 
 #[test]
-fn a_composite_relationship_names_the_cascade_it_loses() {
+fn a_composite_relationship_no_longer_names_the_cascade_as_a_loss() {
     let dir = tempfile::tempdir().expect("tempdir");
     let items = inventory(&fixture(dir.path()));
 
@@ -218,9 +218,11 @@ fn a_composite_relationship_names_the_cascade_it_loses() {
         "{}",
         related.detail
     );
+    // the detail still says which kind it is, and the flag now reaches ptolemy
+    assert!(related.detail.contains("composite"), "{}", related.detail);
     assert_eq!(related.verdict.outcome(), Outcome::Approximated);
     let shortfall = related.verdict.shortfall();
-    assert!(shortfall.contains("is_composite"), "{shortfall}");
+    assert!(!shortfall.contains("composite"), "{shortfall}");
     assert!(shortfall.contains("origin_primary_key"), "{shortfall}");
 }
 

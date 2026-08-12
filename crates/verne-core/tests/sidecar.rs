@@ -26,7 +26,7 @@ fn approximated(location: &str) -> Item {
         "wells -> inspections",
         Verdict::approximated(
             Target::Ptolemy,
-            Losses::one("origin_primary_key stays at its default").and("is_composite is not set"),
+            Losses::one("origin_primary_key stays at its default").and("no rules are carried"),
         ),
     )
 }
@@ -140,7 +140,7 @@ fn the_log_renders_every_entry_as_a_markdown_row() {
     let markdown = log.to_markdown();
 
     assert!(markdown.contains("Extracted by operator at"), "{markdown}");
-    assert!(markdown.contains("is_composite is not set"), "{markdown}");
+    assert!(markdown.contains("no rules are carried"), "{markdown}");
     // a pipe in a detail would end the cell early
     let rows = markdown.lines().filter(|l| l.starts_with("| ")).count();
     assert_eq!(rows, 2, "a header and one entry: {markdown}");
@@ -236,6 +236,7 @@ fn a_sidecar() -> Sidecar {
             cardinality: "one_to_many".into(),
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
+            is_composite: true,
         }],
         attachments: vec![AttachmentOp::Add(NewAttachment {
             dataset: "wells".into(),

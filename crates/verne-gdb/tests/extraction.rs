@@ -144,8 +144,8 @@ fn the_log_names_the_losses_ptolemy_cannot_take() {
         .collect();
     let all = losses.join("\n");
 
-    // a composite class's cascade has a column but no route sets it
-    assert!(all.contains("is_composite"), "{all}");
+    // the composite flag is sent, so no loss names it
+    assert!(!all.contains("composite"), "{all}");
     // a domain's description has a column the create route does not take
     assert!(all.contains("the description"), "{all}");
     // a domain binds to a field only through a subtype
@@ -363,6 +363,8 @@ fn a_relationship_class_names_two_datasets_and_the_key_between_them() {
     assert_eq!(class.cardinality, "one_to_many");
     assert_eq!(class.forward_label, "has inspections");
     assert_eq!(class.backward_label, "inspected well");
+    // the fixture writes this one as composite, and the flag goes to ptolemy
+    assert!(class.is_composite);
 }
 
 /// An attachment relationship is not a class in ptolemy, and attachments are

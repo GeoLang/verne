@@ -940,6 +940,7 @@ fn new_relationship(
         // the REST layer description carries no labels, and the report says so
         forward_label: String::new(),
         backward_label: String::new(),
+        is_composite: origin.composite,
     })
 }
 

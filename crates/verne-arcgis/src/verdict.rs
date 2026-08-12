@@ -594,11 +594,6 @@ fn relationship_losses(pairing: &Pairing<'_>) -> Vec<String> {
             origin.related_table_id
         ));
     }
-    if origin.composite {
-        losses.push(
-            "this is a composite class, where deleting the origin deletes what hangs off it; ptolemy's relationship_classes has an is_composite column but no route sets it, so the cascade stops at the API".to_string(),
-        );
-    }
     if origin.cardinality == "esriRelCardinalityManyToMany" {
         losses.push(
             "a many-to-many class relates through a mapping table, and ptolemy relates through relationship_records keyed by feature id, so any attribute on the mapping table has nowhere to go".to_string(),

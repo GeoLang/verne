@@ -705,9 +705,9 @@ fn relationship_losses(relationship: &Relationship) -> Vec<String> {
         ),
         "GDAL's relationship model has no rules, key type or notification direction, so verne cannot say whether this class carries any of them".to_string(),
     ];
-    if relationship.kind == "composite" {
+    if relationship.kind == "aggregation" {
         losses.push(
-            "this is a composite class, where deleting the origin deletes what hangs off it; ptolemy's relationship_classes has an is_composite column but no route sets it, so the cascade stops at the API".to_string(),
+            "this is an aggregation class, where the origin owns what hangs off it in part and deleting it does not cascade; ptolemy's is_composite is the whole of what it says about ownership, and it is created as not composite, so the partial ownership cannot be said".to_string(),
         );
     }
     if relationship.cardinality == "many to many" {

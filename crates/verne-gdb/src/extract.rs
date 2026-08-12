@@ -681,6 +681,9 @@ fn new_relationship(
         cardinality: cardinality(relationship.cardinality).to_string(),
         forward_label: forward.clone().unwrap_or_default(),
         backward_label: backward.clone().unwrap_or_default(),
+        // an aggregation owns its destinations only in part and does not
+        // cascade a delete, so only a composite class sets the flag
+        is_composite: relationship.kind == "composite",
     })
 }
 
@@ -827,6 +830,24 @@ mod tests {
         assert_eq!(class.destination_dataset, "wells");
         assert_eq!(class.origin_foreign_key, "OBJECTID");
         assert_eq!(class.forward_label, "sits on well");
+    }
+
+    /// ptolemy's flag is composite or not, and GDAL's kind is one of three.
+    /// An aggregation is the one that fits neither: it is a part-ownership
+    /// that does not cascade a delete, so it is sent as not composite and the
+    /// report says what that leaves out.
+    #[test]
+    fn only_a_composite_kind_sets_the_flag() {
+        let plans = plans(&["pads", "wells"]);
+        let carried = |kind: &'static str| {
+            let mut held = relationship("one to many");
+            held.kind = kind;
+            new_relationship(&held, &plans).expect("kept").is_composite
+        };
+
+        assert!(carried("composite"));
+        assert!(!carried("aggregation"));
+        assert!(!carried("association"));
     }
 
     /// ptolemy's class names two dataset ids, and a table that never became a

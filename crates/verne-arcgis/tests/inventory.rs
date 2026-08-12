@@ -249,7 +249,8 @@ fn the_relationship_is_told_once_from_its_origin_end() {
         "wells_logs: Wells.objectid -> Logs.well_id, one to many, composite"
     );
     let shortfall = class.verdict.shortfall();
-    assert!(shortfall.contains("is_composite"), "{shortfall}");
+    // the flag reaches ptolemy, so the shortfall no longer names it
+    assert!(!shortfall.contains("composite"), "{shortfall}");
     assert!(
         shortfall.contains("no forward or backward label"),
         "{shortfall}"

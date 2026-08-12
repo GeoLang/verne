@@ -231,6 +231,7 @@ fn a_sidecar(suffix: &str, well_feature: &str) -> Sidecar {
             cardinality: "one_to_many".into(),
             forward_label: "has inspections".into(),
             backward_label: "inspected well".into(),
+            is_composite: true,
         }],
         attachments: vec![AttachmentOp::Add(NewAttachment {
             dataset: wells,
@@ -371,6 +372,7 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
     assert_eq!(class["origin_dataset_id"].as_str(), Some(wells.as_str()));
     assert_eq!(class["cardinality"], "one_to_many");
     assert_eq!(class["forward_label"], "has inspections");
+    assert_eq!(class["is_composite"], true, "{class}");
 }
 
 /// The features and the attachment, read back off the branch the load created.

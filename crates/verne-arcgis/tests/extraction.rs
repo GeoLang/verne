@@ -395,6 +395,8 @@ fn the_relationship_is_keyed_on_the_column_the_table_side_names() {
     // the REST layer description carries no labels
     assert!(class.forward_label.is_empty());
     assert!(class.backward_label.is_empty());
+    // the service states this one as composite, and the flag goes to ptolemy
+    assert!(class.is_composite);
 }
 
 #[test]

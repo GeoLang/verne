@@ -154,3 +154,14 @@ All notable changes to this project will be documented in this file.
   - The change hash is FNV-1a rather than the standard library's hasher, whose
     value is documented as not to be relied on across releases: a chained
     delta compares against a hash an earlier run wrote down.
+- CI loads a sidecar into a real ptolemy. The `live-load` job starts
+  `postgis/postgis:16-3.4` and `ghcr.io/geolang/ptolemy:master` in that order,
+  waits on `/api/v1/readyz` so the wait covers the migrations and not just the
+  process, mints an HS256 token carrying ptolemy's own claims and the `editor`
+  role, and runs `crates/verne-load/tests/live.rs` against it. No GDAL and no
+  `--all-features`, since the loader is HTTP.
+- `VERNE_REQUIRE_LIVE` makes those tests fail rather than skip when there is no
+  ptolemy to load into. Only the `live-load` job sets it, so `cargo test` with
+  nothing running still skips them, but a CI job that started ptolemy wrongly
+  or exported the wrong variable name now fails instead of passing on three
+  skipped tests, which would look like coverage and be none.

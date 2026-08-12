@@ -1,12 +1,15 @@
 //! Loading into a live ptolemy.
 //!
-//! Gated on `VERNE_PTOLEMY_URL`, so verne's CI does not cover it. A mocked
-//! version would only prove the loader agrees with itself: the failure this
-//! test exists to catch is a request shape drifting from ptolemy's real API,
-//! and a mock built from the same assumptions cannot see that. ptolemy
-//! publishes no container image and no OpenAPI spec, so there is nothing CI
-//! could stand up or check against, and the test names what it needs and skips
-//! when it is not there.
+//! Gated on `VERNE_PTOLEMY_URL` and `VERNE_PTOLEMY_TOKEN`, and skipped without
+//! them so a developer with no ptolemy still gets a green `cargo test`. A
+//! mocked version would only prove the loader agrees with itself: the failure
+//! this test exists to catch is a request shape drifting from ptolemy's real
+//! API, and a mock built from the same assumptions cannot see that.
+//!
+//! CI runs the real thing against `ghcr.io/geolang/ptolemy:master` and sets
+//! [`REQUIRE_LIVE`], which turns the skip into a failure. Without that a job
+//! that started ptolemy wrongly would pass on three skipped tests, which looks
+//! like coverage and is not.
 //!
 //! ```bash
 //! export VERNE_PTOLEMY_URL=http://localhost:3000
@@ -252,25 +255,39 @@ struct Live {
     token: String,
 }
 
-/// The live ptolemy, or `None` with a line saying what would have to be set.
+/// Set where the live load has to run rather than may run, which is CI.
+const REQUIRE_LIVE: &str = "VERNE_REQUIRE_LIVE";
+
+/// The live ptolemy, or `None` after a line saying what would have to be set.
 fn live() -> Option<Live> {
-    let url = std::env::var("VERNE_PTOLEMY_URL").ok()?;
+    let url = std::env::var("VERNE_PTOLEMY_URL").unwrap_or_default();
     let token = std::env::var("VERNE_PTOLEMY_TOKEN").unwrap_or_default();
+    if url.is_empty() {
+        no_live_ptolemy("VERNE_PTOLEMY_URL is not set");
+        return None;
+    }
     if token.is_empty() {
-        eprintln!(
-            "VERNE_PTOLEMY_URL is set and VERNE_PTOLEMY_TOKEN is not; ptolemy gates every write \
-             on a bearer token, so the load would only prove that it says so"
+        no_live_ptolemy(
+            "VERNE_PTOLEMY_TOKEN is not set, and ptolemy gates every write on a bearer token, so \
+             the load would only prove that it says so",
         );
         return None;
     }
     Some(Live { url, token })
 }
 
-fn skipped() {
-    eprintln!(
-        "skipping the live load: set VERNE_PTOLEMY_URL to a running ptolemy (for instance \
-         http://localhost:3000) and VERNE_PTOLEMY_TOKEN to a bearer token that may write"
+/// Says what is missing, and fails outright where the load was required: a
+/// skipped live test reports as a pass, so nothing but a failure tells CI that
+/// it stood ptolemy up wrongly.
+fn no_live_ptolemy(reason: &str) {
+    let wanted = "set VERNE_PTOLEMY_URL to a running ptolemy (for instance http://localhost:3000) \
+                  and VERNE_PTOLEMY_TOKEN to a bearer token that may write";
+    let required = std::env::var(REQUIRE_LIVE).is_ok_and(|value| !value.is_empty());
+    assert!(
+        !required,
+        "{REQUIRE_LIVE} is set, so the live load had to run: {reason}. To run it, {wanted}"
     );
+    eprintln!("skipping the live load: {reason}. To run it, {wanted}");
 }
 
 /// Everything in one sidecar, against the real API. Nothing here is asserted
@@ -280,7 +297,6 @@ fn skipped() {
 #[test]
 fn a_sidecar_loads_into_a_live_ptolemy() {
     let Some(live) = live() else {
-        skipped();
         return;
     };
     let suffix = suffix();
@@ -384,7 +400,6 @@ fn a_sidecar_loads_into_a_live_ptolemy() {
 #[test]
 fn the_features_and_their_attachment_come_back_off_the_branch() {
     let Some(live) = live() else {
-        skipped();
         return;
     };
     let suffix = suffix();
@@ -500,7 +515,6 @@ fn the_features_and_their_attachment_come_back_off_the_branch() {
 #[test]
 fn a_load_without_a_token_is_refused_by_ptolemy() {
     let Some(live) = live() else {
-        skipped();
         return;
     };
     let extraction = an_extraction(&suffix());

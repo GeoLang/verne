@@ -557,11 +557,18 @@ There is no rollback. A load that fails part way leaves what it already created
 and the error names the route that refused it.
 
 `crates/verne-load/tests/live.rs` loads a sidecar into a real ptolemy and is
-gated on `VERNE_PTOLEMY_URL` and `VERNE_PTOLEMY_TOKEN`. **CI does not set
-either, so CI does not cover the loader.** A mocked version would only prove the
-loader agrees with itself, and the failure worth catching is a request shape
-drifting from ptolemy's real API. Automating it would need ptolemy to publish a
-container image or an OpenAPI spec; it does neither.
+gated on `VERNE_PTOLEMY_URL` and `VERNE_PTOLEMY_TOKEN`. A mocked version would
+only prove the loader agrees with itself, and the failure worth catching is a
+request shape drifting from ptolemy's real API.
+
+CI runs it. The `live-load` job starts `postgis/postgis:16-3.4` and
+`ghcr.io/geolang/ptolemy:master`, waits on ptolemy's `/api/v1/readyz`, which
+answers only once its migrations are applied, mints an HS256 token with the
+`editor` role against the throwaway secret it passed the container, and runs
+the three tests against it. It also sets `VERNE_REQUIRE_LIVE`, which turns the
+tests' skip path into a failure: without that, a job that stood ptolemy up
+wrongly would pass on three skipped tests and read as coverage. Nothing else in
+CI sets it, so `cargo test` with no ptolemy still skips them.
 
 ## Writing an adapter
 

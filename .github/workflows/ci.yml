@@ -28,10 +28,78 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       # the loader's live test needs a ptolemy and skips without
-      # VERNE_PTOLEMY_URL, which nothing here sets, so what CI covers of the
-      # loader is what a scripted ptolemy on a socket can answer for
+      # VERNE_PTOLEMY_URL, which nothing here sets: the live-load job below
+      # runs it against a real one
       - name: Test
         run: cargo test --all
+
+  live-load:
+    runs-on: ubuntu-latest
+    env:
+      # CI only, and not a credential for anything: it signs tokens for a
+      # ptolemy that exists for the length of this job and holds nothing
+      PTOLEMY_JWT_SECRET: 0123456789abcdef0123456789abcdef
+      VERNE_PTOLEMY_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # explicit runs rather than service containers, which all start at once:
+      # ptolemy migrates on startup and needs the database up first. This is
+      # ptolemy's own smoke test sequence, which its repo proves on every push
+      - name: Start ptolemy
+        run: |
+          docker network create verne-live
+          docker run -d --name verne-live-db --network verne-live \
+            -e POSTGRES_USER=ptolemy -e POSTGRES_PASSWORD=ptolemy -e POSTGRES_DB=ptolemy \
+            postgis/postgis:16-3.4
+          for _ in $(seq 1 30); do
+            docker exec verne-live-db pg_isready -U ptolemy -q && break
+            sleep 2
+          done
+          docker run -d --name verne-live-api --network verne-live -p 3000:3000 \
+            -e DATABASE_URL=postgres://ptolemy:ptolemy@verne-live-db/ptolemy \
+            -e PTOLEMY_JWT_SECRET="$PTOLEMY_JWT_SECRET" \
+            ghcr.io/geolang/ptolemy:master
+          # readyz answers only once migrations are applied and the pool
+          # connects, so it covers the whole startup path health cannot
+          for _ in $(seq 1 60); do
+            curl -fsS "$VERNE_PTOLEMY_URL/api/v1/readyz" && exit 0
+            sleep 2
+          done
+          docker logs verne-live-api
+          exit 1
+      # editor is the least privilege verne's README documents for a load, and
+      # the loader creates its own datasets, so it holds the creator's grant
+      - name: Mint a token
+        run: |
+          python3 - >> "$GITHUB_ENV" <<'MINT'
+          import base64, hashlib, hmac, json, os, time
+
+          def segment(value):
+              raw = json.dumps(value, separators=(",", ":")).encode()
+              return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+          # exactly ptolemy's Claims struct and nothing more: an aud claim would
+          # be rejected, since every service here validates with jsonwebtoken's
+          # default Validation
+          claims = {"sub": "verne-ci", "exp": int(time.time()) + 3600, "role": "editor"}
+          signed = segment({"alg": "HS256", "typ": "JWT"}) + b"." + segment(claims)
+          secret = os.environ["PTOLEMY_JWT_SECRET"].encode()
+          signature = hmac.new(secret, signed, hashlib.sha256).digest()
+          token = signed + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")
+          print("VERNE_PTOLEMY_TOKEN=" + token.decode())
+          MINT
+      # VERNE_REQUIRE_LIVE turns the test's skip path into a failure, so a
+      # ptolemy this job stood up wrongly cannot pass as coverage. No GDAL and
+      # no --all-features: the loader is HTTP and would only drag it in
+      - name: Live load
+        env:
+          VERNE_REQUIRE_LIVE: "1"
+        run: cargo test -p verne-load --test live -- --nocapture
+      - name: ptolemy logs
+        if: failure()
+        run: docker logs verne-live-api
 
   gdal:
     runs-on: ubuntu-latest

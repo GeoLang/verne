@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verne — GIS Migration with a Fidelity Report</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;line-height:1.6}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.container{max-width:1100px;margin:0 auto;padding:0 24px}
+header{border-bottom:1px solid var(--border);padding:64px 0 40px;text-align:center}
+header h1{font-size:3.5rem;color:var(--heading);margin-bottom:12px}
+header .tagline{font-size:1.3rem;color:var(--muted);max-width:750px;margin:0 auto}
+.badges{margin-top:20px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.badges img{height:24px}
+.hero{display:flex;gap:16px;justify-content:center;margin-top:28px;flex-wrap:wrap}
+.hero a{background:var(--accent);color:#fff;padding:12px 28px;border-radius:6px;font-weight:600;font-size:1rem;transition:opacity .2s}
+.hero a:hover{text-decoration:none;opacity:.85}
+.hero a.secondary{background:var(--card);border:1px solid var(--border)}
+section{padding:56px 0}
+section h2{font-size:1.9rem;color:var(--heading);margin-bottom:28px;border-bottom:1px solid var(--border);padding-bottom:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:20px}
+.card h3{color:var(--heading);margin-bottom:8px;font-size:1.1rem}
+.card ul{list-style:none;padding:0;margin:0}
+.card ul li{padding:3px 0;color:var(--text);font-size:.9rem}
+.card ul li::before{content:"✓ ";color:var(--accent2);font-weight:bold}
+code{background:#1c2128;padding:2px 6px;border-radius:4px;font-size:.85em;color:#f0f6fc}
+pre{background:#1c2128;border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;font-size:.85rem;color:#f0f6fc;margin:12px 0}
+table{width:100%;border-collapse:collapse;margin:12px 0}
+th,td{padding:12px 16px;text-align:left;border-bottom:1px solid var(--border);font-size:.9rem}
+th{color:var(--heading);background:var(--card);position:sticky;top:0}
+footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color:var(--muted);font-size:.85rem}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;margin-top:24px}
+.stat{text-align:center;padding:20px;background:var(--card);border:1px solid var(--border);border-radius:8px}
+.stat .num{font-size:2rem;color:var(--heading);font-weight:bold}
+.stat .label{color:var(--muted);font-size:.85rem;margin-top:4px}
+@media(max-width:600px){header h1{font-size:2.2rem}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+<div class="container">
+<h1>🧳 Verne</h1>
+<p class="tagline">Read-only inventory of a third-party geospatial source. Verne opens a file or a hosted service, lists what is in it, and says of each thing whether GeoLang could hold it faithfully, would have to approximate it, or has no home for it at all — then extracts and loads it.</p>
+<div class="badges">
+<img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
+<img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
+<img src="https://github.com/GeoLang/verne/actions/workflows/ci.yml/badge.svg" alt="CI">
+</div>
+<div class="hero">
+<a href="https://github.com/GeoLang/verne">GitHub</a>
+<a href="https://github.com/GeoLang/verne#usage" class="secondary">Usage</a>
+<a href="#fidelity" class="secondary">Fidelity</a>
+</div>
+<div class="stats">
+<div class="stat"><div class="num">3</div><div class="label">Sources: KML/KMZ, Esri file geodatabase, hosted ArcGIS</div></div>
+<div class="stat"><div class="num">4</div><div class="label">Verdicts: faithful, approximated, unsupported, not applicable</div></div>
+<div class="stat"><div class="num">0</div><div class="label">Writes to the source, ever</div></div>
+<div class="stat"><div class="num">62/62</div><div class="label">Domains carried from a USGS geodatabase (ogr2ogr keeps 18)</div></div>
+</div>
+</div>
+</header>
+
+<section>
+<div class="container">
+<h2>How It Works</h2>
+<p><code>verne inspect</code> reads a source and prints a markdown report (JSON beside it on request) with one verdict per item. <code>verne extract</code> writes the source out as a sidecar ptolemy can load — datasets and their semantics, the features, and the attachments on them — with a GeoPackage beside it when the source is a geodatabase. <code>verne load</code> creates what the sidecar describes in a running ptolemy. The source is never written to, in any of the three.</p>
+</div>
+</section>
+
+<section id="fidelity">
+<div class="container">
+<h2>The Fidelity Report</h2>
+<div class="grid">
+<div class="card">
+<h3>✅ Faithful</h3>
+<ul><li>Carried across without loss</li><li>Names the GeoLang component it goes to</li></ul>
+</div>
+<div class="card">
+<h3>⚠️ Approximated</h3>
+<ul><li>Carried with something left behind</li><li>The row must say what — a loss list cannot be empty</li></ul>
+</div>
+<div class="card">
+<h3>🚫 Unsupported</h3>
+<ul><li>No home in GeoLang</li><li>With the reason</li></ul>
+</div>
+<div class="card">
+<h3>➖ Not applicable</h3>
+<ul><li>The source cannot have the thing at all</li><li>Nothing carried, nothing lost</li></ul>
+</div>
+</div>
+<p style="margin-top:16px">An inventory that cannot be produced is an error, never an empty list, so a source verne failed to read is not mistaken for a clean one.</p>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>What a Plain Conversion Loses</h2>
+<p>Counted on one USGS National Hydrography geodatabase (41 tables, public domain), against a GeoPackage written by GDAL's own vector translate — the code behind <code>ogr2ogr</code>:</p>
+<table>
+<thead><tr><th></th><th>In the geodatabase</th><th>The GeoPackage keeps</th><th>Verne carries</th></tr></thead>
+<tbody>
+<tr><td>Domains</td><td>62</td><td>18</td><td><strong>62</strong></td></tr>
+<tr><td>Relationship classes</td><td>10</td><td>0</td><td><strong>10</strong></td></tr>
+<tr><td>Subtypes</td><td>5 sets</td><td>0</td><td><strong>5 sets</strong></td></tr>
+</tbody>
+</table>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Sources</h2>
+<div class="grid">
+<div class="card">
+<h3>🗂️ KML / KMZ</h3>
+<ul>
+<li>Pure Rust, no GDAL</li>
+<li>Reads no network, takes no credentials</li>
+<li>A NetworkLink or remote overlay is reported as outside the inventory, never fetched</li>
+</ul>
+</div>
+<div class="card">
+<h3>🗄️ Esri File Geodatabase</h3>
+<ul>
+<li>Behind the <code>gdb</code> build feature, GDAL 3.8+ via OpenFileGDB — Esri's SDK is never loaded</li>
+<li>Feature classes, fields, aliases, domains, subtypes, relationship classes, attachments</li>
+<li>What GDAL cannot model is named from the catalogue rather than silently dropped</li>
+<li>Extraction also writes a GeoPackage</li>
+</ul>
+</div>
+<div class="card">
+<h3>🌐 Hosted ArcGIS Feature Services</h3>
+<ul>
+<li>REST reads only, by FeatureServer root</li>
+<li>Token from <code>VERNE_ARCGIS_TOKEN</code>, or minted from a client id and secret — never an argument</li>
+<li><code>verne services</code> lists a portal's feature services</li>
+</ul>
+</div>
+</div>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Quick Start</h2>
+<pre># print a markdown report
+verne inspect sites.kml
+
+# a hosted feature service
+verne inspect https://host/arcgis/rest/services/Wells/FeatureServer
+
+# write the features and the semantics out
+verne extract wells.gdb --out ./wells-extract --operator you@example.com
+
+# create them in a running ptolemy
+export VERNE_PTOLEMY_TOKEN=&lt;a bearer token that may write&gt;
+verne load ./wells-extract --ptolemy http://localhost:3000</pre>
+</div>
+</section>
+
+<section>
+<div class="container">
+<h2>Architecture</h2>
+<pre>verne/
+├── crates/
+│   ├── verne-core/     # inventory model, verdicts, report rendering
+│   ├── verne-kml/      # KML/KMZ reader (pure Rust)
+│   ├── verne-gdb/      # file geodatabase adapter (GDAL 3.8+, `gdb` feature)
+│   ├── verne-arcgis/   # hosted feature service reader (REST)
+│   ├── verne-load/     # sidecar loader targeting ptolemy
+│   └── verne-cli/      # inspect, extract, services, load
+└── docs/               # This page</pre>
+</div>
+</section>
+
+<footer>
+<div class="container">
+<p>Verne is free software under the <a href="https://github.com/GeoLang/verne/blob/master/LICENSE">AGPL-3.0 license</a>.</p>
+<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a> — migration for the open geospatial stack.</p>
+<p>&copy; 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
+</div>
+</footer>
+</body>
+</html>

@@ -146,6 +146,44 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </div>
 </section>
 
+<section id="arcgis">
+<div class="container">
+<h2>What Migrates from ArcGIS</h2>
+<p>For a hosted feature or map service, read over the documented REST API:</p>
+<div class="grid">
+<div class="card">
+<h3>✅ Carried</h3>
+<ul>
+<li>Layers and tables: fields, aliases, domain bindings</li>
+<li>Coded and range domains</li>
+<li>Subtypes with defaults and per-subtype domain assignments</li>
+<li>Relationships, as both ends describe them</li>
+<li>Attachments — every blob lands on its feature</li>
+<li>All features, paged, with the original coordinates preserved beside the reprojected ones</li>
+<li>Layer symbology, stored verbatim as Esri drawing info</li>
+<li>Time awareness and metadata records</li>
+<li>Private services (token or OAuth client credentials)</li>
+<li>Enterprise versioned data, one named version at a time</li>
+<li>Ongoing edits: inserts, updates, deletes and attachment changes flow across on every delta run</li>
+</ul>
+</div>
+<div class="card">
+<h3>🚫 Left behind — named in the report, never dropped silently</h3>
+<ul>
+<li>Rasters: named for the platform's raster tooling, never fetched</li>
+<li>The version tree: one version is read, versions are not enumerated or diffed (that API demands editing privileges verne refuses)</li>
+<li>Group-layer hierarchy: members flatten to datasets, the grouping becomes a report row</li>
+<li>Relationship labels and rules: not visible over REST, created empty</li>
+<li>Symbology and aliases are stored, not yet rendered by any platform screen</li>
+<li>Binary column values (attachment bytes are the exception)</li>
+<li>Web maps, dashboards, and other portal content: out of scope, verne reads FeatureServer and MapServer only</li>
+</ul>
+</div>
+</div>
+<p style="margin-top:16px">A file geodatabase adds what its format holds — feature datasets, annotation and dimension classes, `__ATTACH` tables — and its own limits: what GDAL cannot model (topologies, networks, parcel fabrics, mosaic datasets, attribute rules) is named from the catalogue and goes no further.</p>
+</div>
+</section>
+
 <section>
 <div class="container">
 <h2>Quick Start</h2>

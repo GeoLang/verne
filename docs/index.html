@@ -44,7 +44,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <header>
 <div class="container">
 <h1>🧳 Verne</h1>
-<p class="tagline">Read-only inventory of a third-party geospatial source. Verne opens a file or a hosted service, lists the contents, and reports for each item whether GeoLang can carry it faithfully, only approximate it, or not hold it at all — then extracts and loads it.</p>
+<p class="tagline">Verne moves your data out of a file or a hosted ArcGIS service and into GeoLang. Every item gets a verdict before anything moves: carried faithfully, approximated, or not carried.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
@@ -67,9 +67,49 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>How It Works</h2>
-<p><code>verne inspect</code> reads a source and prints a markdown report (JSON beside it on request) with one verdict per item. <code>verne extract</code> writes the source out as a sidecar ptolemy can load — datasets and their semantics, the features, and the attachments on them — with a GeoPackage beside it when the source is a geodatabase. <code>verne load</code> creates what the sidecar describes in a running ptolemy. The source is never written to, in any of the three.</p>
+<div class="grid">
+<div class="card">
+<h3>1. Inspect</h3>
+<ul>
+<li><code>verne inspect</code> reads the source</li>
+<li>Prints a report with one verdict per item</li>
+<li>JSON output on request</li>
+</ul>
+</div>
+<div class="card">
+<h3>2. Extract</h3>
+<ul>
+<li><code>verne extract</code> writes everything to a folder: datasets, features, attachments</li>
+<li>A GeoPackage beside it when the source is a geodatabase</li>
+</ul>
+</div>
+<div class="card">
+<h3>3. Load</h3>
+<ul>
+<li><code>verne load</code> creates it all in a running ptolemy</li>
+<li>The source is never written to, at any step</li>
+</ul>
+</div>
+</div>
 <h2 style="margin-top:40px">Not a One-Time Migration</h2>
-<p>Verne can keep running against the third-party service after the first load. A delta extraction fetches what changed since the previous run — from the service's own change tracking when it has one, or verne's own diff of the full state when it does not — and carries the inserts, updates and deletes into ptolemy. An update keeps the feature id the first extraction minted, so a feature's history in ptolemy stays one feature across every window, and attachments are diffed the same way. Each delta is the basis for the next, so a migration window is a chain of cheap deltas. Scheduling is yours: verne has no daemon, so run it from cron or a timer and each run picks up where the last ended. <code>demo/migration-loop.sh</code> runs the whole loop against a live service: full extract, load, delta, delta load, then verifies the migrated counts.</p>
+<div class="grid">
+<div class="card">
+<h3>🔁 Delta runs</h3>
+<ul>
+<li>After the first load, each run carries only what changed since the last</li>
+<li>Inserts, updates, deletes and attachment changes all flow across</li>
+<li>Feature ids stay stable, so a feature's history stays one feature</li>
+</ul>
+</div>
+<div class="card">
+<h3>⏰ On your schedule</h3>
+<ul>
+<li>No daemon: run it from cron or a timer</li>
+<li>Each run picks up where the last ended</li>
+<li><code>demo/migration-loop.sh</code> runs the full loop against a live service</li>
+</ul>
+</div>
+</div>
 </div>
 </section>
 
@@ -101,7 +141,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <section>
 <div class="container">
 <h2>What a Plain Conversion Loses</h2>
-<p>Counted on one USGS National Hydrography geodatabase (41 tables, public domain), against a GeoPackage written by GDAL's own vector translate — the code behind <code>ogr2ogr</code>:</p>
+<p>Counted on one USGS National Hydrography geodatabase (41 tables), against a plain <code>ogr2ogr</code> conversion to GeoPackage:</p>
 <table>
 <thead><tr><th></th><th>In the geodatabase</th><th>The GeoPackage keeps</th><th>Verne carries</th></tr></thead>
 <tbody>
@@ -120,17 +160,15 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🗂️ KML / KMZ</h3>
 <ul>
-<li>Pure Rust, no GDAL</li>
 <li>Reads no network, takes no credentials</li>
-<li>A NetworkLink or remote overlay is reported as outside the inventory, never fetched</li>
+<li>A remote link or overlay is reported, never fetched</li>
 </ul>
 </div>
 <div class="card">
 <h3>🗄️ Esri File Geodatabase</h3>
 <ul>
-<li>Behind the <code>gdb</code> build feature, GDAL 3.8+ via OpenFileGDB — Esri's SDK is never loaded</li>
 <li>Feature classes, fields, aliases, domains, subtypes, relationship classes, attachments</li>
-<li>What GDAL cannot model is named from the catalogue rather than silently dropped</li>
+<li>Anything that cannot be carried is named in the report, never silently dropped</li>
 <li>Extraction also writes a GeoPackage</li>
 </ul>
 </div>
@@ -171,7 +209,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h3>🚫 Left behind — named in the report, never dropped silently</h3>
 <ul>
 <li>Rasters: named for the platform's raster tooling, never fetched</li>
-<li>The version tree: one version is read, versions are not enumerated or diffed (that API demands editing privileges verne refuses)</li>
+<li>The version tree: one named version is read at a time</li>
 <li>Group-layer hierarchy: members flatten to datasets, the grouping becomes a report row</li>
 <li>Relationship labels and rules: not visible over REST, created empty</li>
 <li>Symbology and aliases are stored, not yet rendered by any platform screen</li>
@@ -180,7 +218,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 </div>
-<p style="margin-top:16px">A file geodatabase adds what its format holds — feature datasets, annotation and dimension classes, `__ATTACH` tables — and its own limits: what GDAL cannot model (topologies, networks, parcel fabrics, mosaic datasets, attribute rules) is named from the catalogue and goes no further.</p>
+<p style="margin-top:16px">A file geodatabase adds feature datasets, annotation and dimension classes, and attachment tables. Topologies, networks, parcel fabrics, mosaic datasets and attribute rules are named in the report and not carried.</p>
 </div>
 </section>
 
@@ -199,21 +237,6 @@ verne extract wells.gdb --out ./wells-extract --operator you@example.com
 # create them in a running ptolemy
 export VERNE_PTOLEMY_TOKEN=&lt;a bearer token that may write&gt;
 verne load ./wells-extract --ptolemy http://localhost:3000</pre>
-</div>
-</section>
-
-<section>
-<div class="container">
-<h2>Architecture</h2>
-<pre>verne/
-├── crates/
-│   ├── verne-core/     # inventory model, verdicts, report rendering
-│   ├── verne-kml/      # KML/KMZ reader (pure Rust)
-│   ├── verne-gdb/      # file geodatabase adapter (GDAL 3.8+, `gdb` feature)
-│   ├── verne-arcgis/   # hosted feature service reader (REST)
-│   ├── verne-load/     # sidecar loader targeting ptolemy
-│   └── verne-cli/      # inspect, extract, services, load
-└── docs/               # This page</pre>
 </div>
 </section>
 

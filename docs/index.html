@@ -68,6 +68,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="container">
 <h2>How It Works</h2>
 <p><code>verne inspect</code> reads a source and prints a markdown report (JSON beside it on request) with one verdict per item. <code>verne extract</code> writes the source out as a sidecar ptolemy can load — datasets and their semantics, the features, and the attachments on them — with a GeoPackage beside it when the source is a geodatabase. <code>verne load</code> creates what the sidecar describes in a running ptolemy. The source is never written to, in any of the three.</p>
+<h2 style="margin-top:40px">Not a One-Time Migration</h2>
+<p>Verne can keep running against the third-party service after the first load. A delta extraction fetches what changed since the previous run — from the service's own change tracking when it has one, or verne's own diff of the full state when it does not — and carries the inserts, updates and deletes into ptolemy. An update keeps the feature id the first extraction minted, so a feature's history in ptolemy stays one feature across every window, and attachments are diffed the same way. Each delta is the basis for the next, so a migration window is a chain of cheap deltas. <code>demo/migration-loop.sh</code> runs the whole loop against a live service: full extract, load, delta, delta load, then verifies the migrated counts.</p>
 </div>
 </section>
 

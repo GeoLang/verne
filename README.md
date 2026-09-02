@@ -15,7 +15,7 @@ ptolemy. The source is never written to, in either.
 
 ## Scope
 
-v0.4 reads KML and KMZ, Esri file geodatabases, and hosted ArcGIS feature
+Verne reads KML and KMZ, Esri file geodatabases, and hosted ArcGIS feature
 services over their REST API, and extracts a geodatabase or a feature service
 into what ptolemy loads: the datasets and their semantics, the features
 themselves, and the attachments on the features they belong to. A geodatabase
@@ -62,7 +62,8 @@ verne inspect https://host/arcgis/rest/services/Wells/FeatureServer
 verne extract https://host/arcgis/rest/services/Wells/FeatureServer \
     --out ./wells-extract --operator you@example.com
 
-# list a portal's feature services, one URL per line
+# list a portal's feature services, one per line, the URL first and its title
+# and owner after it
 verne services https://www.arcgis.com --owner your-org-account
 
 # create them in a running ptolemy
@@ -308,6 +309,11 @@ scratch ptolemy: full extract, load, delta, delta load, then verifies
 ptolemy's own FeatureServer facade serves the migrated counts. `--force-ops`
 mutates a copy of the full extraction first, so the delta demonstrably
 carries an insert, an update and a delete even when the service is quiet.
+
+`crates/verne-arcgis/tests/live.rs` inventories and extracts a real service,
+gated on `VERNE_ARCGIS_URL` and skipped without it. No service URL is hardcoded
+and CI sets none, so the test runs only where somebody points it at a service of
+their own.
 
 ## Extraction
 

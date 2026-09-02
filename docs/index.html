@@ -162,6 +162,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <ul>
 <li>Reads no network, takes no credentials</li>
 <li>A remote link or overlay is reported, never fetched</li>
+<li>Inspected only: extraction covers geodatabases and feature services</li>
 </ul>
 </div>
 <div class="card">
@@ -199,7 +200,6 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Attachments — every blob lands on its feature</li>
 <li>All features, paged, with the original coordinates preserved beside the reprojected ones</li>
 <li>Layer symbology, stored verbatim as Esri drawing info</li>
-<li>Time awareness and metadata records</li>
 <li>Private services (token or OAuth client credentials)</li>
 <li>Enterprise versioned data, one named version at a time</li>
 <li>Ongoing edits: inserts, updates, deletes and attachment changes flow across on every delta run</li>
@@ -213,6 +213,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Group-layer hierarchy: members flatten to datasets, the grouping becomes a report row</li>
 <li>Relationship labels and rules: not visible over REST, created empty</li>
 <li>Symbology and aliases are stored, not yet rendered by any platform screen</li>
+<li>Time settings: the fields they run over become ordinary columns, so the dataset is not time-aware</li>
+<li>Metadata records: reported, and not written, since ptolemy takes one through a route the extraction does not use</li>
 <li>Binary column values (attachment bytes are the exception)</li>
 <li>Web maps, dashboards, and other portal content: out of scope, verne reads FeatureServer and MapServer only</li>
 </ul>

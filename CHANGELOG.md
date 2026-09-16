@@ -165,3 +165,12 @@ All notable changes to this project will be documented in this file.
   nothing running still skips them, but a CI job that started ptolemy wrongly
   or exported the wrong variable name now fails instead of passing on three
   skipped tests, which would look like coverage and be none.
+
+### Notes
+
+- 2026-09-16: ArcGIS Pro's mobile geodatabase (`.geodatabase`) stays out of
+  scope. GDAL 3.11.5 opens one with its SQLite driver and reports every layer
+  as `Geometry: None` with the `Shape` column as `Binary`, because the geometry
+  is an Esri ST_Geometry blob, and the OpenFileGDB driver takes `.gdb`
+  directories only. `TODO.md` holds the driver runs, the GDAL doc lines and the
+  two sample files checked.

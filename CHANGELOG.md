@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-09-16: `docs/index.html` matches the code. The tagline no longer reads as
+  though a KML file can be extracted, which only a geodatabase and a service
+  can. The ArcGIS card says the attachments that get skipped and the layers that
+  cannot page, rather than "every blob" and "all features". A FeatureServer root
+  is joined by a MapServer one, and the quick start builds with the `gdb`
+  feature before it extracts a `.gdb`, which a default binary refuses.
+
 ### Added
 
 - `verne-arcgis`: hosted ArcGIS feature services over their REST API, no GDAL,

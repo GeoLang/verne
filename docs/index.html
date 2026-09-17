@@ -44,7 +44,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <header>
 <div class="container">
 <h1>🧳 Verne</h1>
-<p class="tagline">Verne moves your data out of a file or a hosted ArcGIS service and into GeoLang. Every item gets a verdict before anything moves: carried faithfully, approximated, or not carried.</p>
+<p class="tagline">Verne reports what a KML file, an Esri file geodatabase or a hosted ArcGIS service holds, and moves the geodatabase and the service into GeoLang. Every item gets a verdict first: carried faithfully, approximated, or not carried.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
 <img src="https://img.shields.io/badge/Rust-2024-orange" alt="Rust">
@@ -176,7 +176,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="card">
 <h3>🌐 Hosted ArcGIS Feature Services</h3>
 <ul>
-<li>REST reads only, by FeatureServer root</li>
+<li>REST reads only, by FeatureServer or MapServer root</li>
 <li>Token from <code>VERNE_ARCGIS_TOKEN</code>, or minted from a client id and secret — never an argument</li>
 <li><code>verne services</code> lists a portal's feature services</li>
 </ul>
@@ -197,8 +197,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Coded and range domains</li>
 <li>Subtypes with defaults and per-subtype domain assignments</li>
 <li>Relationships, as both ends describe them</li>
-<li>Attachments — every blob lands on its feature</li>
-<li>All features, paged, with the original coordinates preserved beside the reprojected ones</li>
+<li>Attachments: each blob lands on the feature it belongs to, and one whose feature the extraction never wrote is counted and skipped</li>
+<li>Features, paged by object id, with the original coordinates beside the reprojected ones. A layer that caps its answers and cannot page is fetched once, and the log says the rest was left behind</li>
 <li>Layer symbology, stored verbatim as Esri drawing info</li>
 <li>Private services (token or OAuth client credentials)</li>
 <li>Enterprise versioned data, one named version at a time</li>
@@ -231,7 +231,9 @@ verne inspect sites.kml
 # a hosted feature service
 verne inspect https://host/arcgis/rest/services/Wells/FeatureServer
 
-# write the features and the semantics out
+# write the features and the semantics out. The geodatabase adapter is a
+# build-time feature, and a binary without it refuses a .gdb
+cargo install --path crates/verne-cli --features gdb
 verne extract wells.gdb --out ./wells-extract --operator you@example.com
 
 # create them in a running ptolemy

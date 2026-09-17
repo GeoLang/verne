@@ -336,7 +336,7 @@ fn a_metadata_record_is_carried_as_catalogue_fields() {
 
     let metadata = only_matching(&items, ItemKind::Metadata, "ISO or FGDC");
     assert_eq!(metadata.location, "wells");
-    assert_eq!(metadata.verdict.outcome(), Outcome::Approximated);
+    assert_eq!(metadata.verdict.outcome(), Outcome::Unsupported);
     assert!(metadata.verdict.shortfall().contains("lineage"));
 }
 

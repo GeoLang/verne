@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- 2026-09-16: a layer's metadata record is reported `unsupported`, not
+  `approximated`, in both the geodatabase and the ArcGIS inventories. Nothing
+  verne writes carries dataset metadata, so ptolemy's description, source,
+  licence, attribution and keywords stay empty for a loaded dataset.
 - 2026-09-16: `docs/index.html` matches the code. The tagline no longer reads as
   though a KML file can be extracted, which only a geodatabase and a service
   can. The ArcGIS card says the attachments that get skipped and the layers that

@@ -662,11 +662,8 @@ fn metadata_item(layer: &Layer) -> Item {
         layer.name.clone(),
         ItemKind::Metadata,
         "metadata record".to_string(),
-        Verdict::approximated(
-            Target::Ptolemy,
-            Losses::one(
-                "ptolemy's dataset_metadata holds a description, a source, a licence, an attribution and keywords, so what maps onto those is kept and the rest of the record, its lineage, contacts, extents, dates and the standard it follows, has nowhere to go",
-            ),
+        Verdict::unsupported(
+            "the record is not read: verne writes no dataset metadata, so ptolemy's description, source, licence, attribution and keywords stay empty and the record's lineage, contacts, extents, dates and the standard it follows are not carried either",
         ),
     )
 }

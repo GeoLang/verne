@@ -327,19 +327,15 @@ fn is_media(relationship: &&Relationship) -> bool {
     relationship.related_table_type.as_deref() == Some("media")
 }
 
-/// An ISO or FGDC record on a layer, which ptolemy holds as a handful of
-/// catalogue fields rather than as a record.
+/// An ISO or FGDC record on a layer, which verne does not read.
 fn layer_metadata(scan: &Scan, items: &mut Vec<Item>) {
     for table in scan.user_tables().filter(|table| table.metadata) {
         items.push(Item::new(
             table.name.clone(),
             ItemKind::Metadata,
             "ISO or FGDC metadata record".to_string(),
-            Verdict::approximated(
-                Target::Ptolemy,
-                Losses::one(
-                    "ptolemy's dataset_metadata holds a description, a source, a licence, an attribution and keywords, so what maps onto those is kept and the rest of the record, its lineage, contacts, extents, dates and the standard it follows, has nowhere to go",
-                ),
+            Verdict::unsupported(
+                "the record is not read: verne writes no dataset metadata, so ptolemy's description, source, licence, attribution and keywords stay empty and the record's lineage, contacts, extents, dates and the standard it follows are not carried either",
             ),
         ));
     }

@@ -38,7 +38,7 @@ jobs:
     env:
       # CI only, and not a credential for anything: it signs tokens for a
       # ptolemy that exists for the length of this job and holds nothing
-      PTOLEMY_JWT_SECRET: 0123456789abcdef0123456789abcdef
+      PLATFORM_JWT_SECRET: 0123456789abcdef0123456789abcdef
       VERNE_PTOLEMY_URL: http://localhost:3000
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +59,7 @@ jobs:
           done
           docker run -d --name verne-live-api --network verne-live -p 3000:3000 \
             -e DATABASE_URL=postgres://ptolemy:ptolemy@verne-live-db/ptolemy \
-            -e PTOLEMY_JWT_SECRET="$PTOLEMY_JWT_SECRET" \
+            -e PLATFORM_JWT_SECRET="$PLATFORM_JWT_SECRET" \
             ghcr.io/geolang/ptolemy:master
           # readyz answers only once migrations are applied and the pool
           # connects, so it covers the whole startup path health cannot
@@ -85,7 +85,7 @@ jobs:
           # default Validation
           claims = {"sub": "verne-ci", "exp": int(time.time()) + 3600, "role": "editor"}
           signed = segment({"alg": "HS256", "typ": "JWT"}) + b"." + segment(claims)
-          secret = os.environ["PTOLEMY_JWT_SECRET"].encode()
+          secret = os.environ["PLATFORM_JWT_SECRET"].encode()
           signature = hmac.new(secret, signed, hashlib.sha256).digest()
           token = signed + b"." + base64.urlsafe_b64encode(signature).rstrip(b"=")
           print("VERNE_PTOLEMY_TOKEN=" + token.decode())

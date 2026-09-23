@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Verne — GIS Migration with a Fidelity Report</title>
+<title>Verne: GIS Migration with a Fidelity Report</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--heading:#f0f6fc;--accent:#58a6ff;--accent2:#3fb950;--muted:#8b949e;--red:#f85149}
@@ -43,7 +43,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <body>
 <header>
 <div class="container">
-<h1>🧳 Verne</h1>
+<h1>Verne</h1>
 <p class="tagline">Verne reports what a KML file, an Esri file geodatabase or a hosted ArcGIS service holds, and moves the geodatabase and the service into GeoLang. Every item gets a verdict first: carried faithfully, approximated, or not carried.</p>
 <div class="badges">
 <img src="https://img.shields.io/badge/license-AGPL--3.0-blue" alt="License">
@@ -58,7 +58,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <div class="stats">
 <div class="stat"><div class="num">3</div><div class="label">Sources: KML/KMZ, Esri file geodatabase, hosted ArcGIS</div></div>
 <div class="stat"><div class="num">4</div><div class="label">Verdicts: faithful, approximated, unsupported, not applicable</div></div>
-<div class="stat"><div class="num">0</div><div class="label">Writes to the source, ever</div></div>
+<div class="stat"><div class="num">0</div><div class="label">Writes to the source</div></div>
 <div class="stat"><div class="num">62/62</div><div class="label">Domains carried from a USGS geodatabase (ogr2ogr keeps 18)</div></div>
 </div>
 </div>
@@ -91,21 +91,22 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 </div>
-<h2 style="margin-top:40px">Not a One-Time Migration</h2>
+<h2 style="margin-top:40px">Repeat Runs from a Feature Service</h2>
 <div class="grid">
 <div class="card">
-<h3>🔁 Delta runs</h3>
+<h3>Delta runs</h3>
 <ul>
-<li>After the first load, each run carries only what changed since the last</li>
-<li>Inserts, updates, deletes and attachment changes all flow across</li>
-<li>Feature ids stay stable, so a feature's history stays one feature</li>
+<li><code>verne extract --since</code> writes only what changed since an earlier full extraction</li>
+<li>Inserts, updates, deletes and attachment edits, committed onto the datasets the first load created</li>
+<li>An update keeps the feature id the first extraction minted, so ptolemy keeps one history per feature</li>
+<li>Uses the service's <code>extractChanges</code> when it publishes a generation window, and a full re-read and local diff otherwise</li>
 </ul>
 </div>
 <div class="card">
-<h3>⏰ On your schedule</h3>
+<h3>Scheduling</h3>
 <ul>
 <li>No daemon: run it from cron or a timer</li>
-<li>Each run picks up where the last ended</li>
+<li>A delta read through <code>extractChanges</code> is the basis for the next one</li>
 <li><code>demo/migration-loop.sh</code> runs the full loop against a live service</li>
 </ul>
 </div>
@@ -118,19 +119,19 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>The Fidelity Report</h2>
 <div class="grid">
 <div class="card">
-<h3>✅ Faithful</h3>
+<h3>Faithful</h3>
 <ul><li>Carried across without loss</li><li>Names the GeoLang component it goes to</li></ul>
 </div>
 <div class="card">
-<h3>⚠️ Approximated</h3>
-<ul><li>Carried with something left behind</li><li>The row must say what — a loss list cannot be empty</li></ul>
+<h3>Approximated</h3>
+<ul><li>Carried with something left behind</li><li>The row says what, and a loss list cannot be empty</li></ul>
 </div>
 <div class="card">
-<h3>🚫 Unsupported</h3>
+<h3>Unsupported</h3>
 <ul><li>No home in GeoLang</li><li>With the reason</li></ul>
 </div>
 <div class="card">
-<h3>➖ Not applicable</h3>
+<h3>Not applicable</h3>
 <ul><li>The source cannot have the thing at all</li><li>Nothing carried, nothing lost</li></ul>
 </div>
 </div>
@@ -158,7 +159,7 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <h2>Sources</h2>
 <div class="grid">
 <div class="card">
-<h3>🗂️ KML / KMZ</h3>
+<h3>KML / KMZ</h3>
 <ul>
 <li>Reads no network, takes no credentials</li>
 <li>A remote link or overlay is reported, never fetched</li>
@@ -166,18 +167,19 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 </ul>
 </div>
 <div class="card">
-<h3>🗄️ Esri File Geodatabase</h3>
+<h3>Esri File Geodatabase</h3>
 <ul>
 <li>Feature classes, fields, aliases, domains, subtypes, relationship classes, attachments</li>
 <li>Anything that cannot be carried is named in the report, never silently dropped</li>
 <li>Extraction also writes a GeoPackage</li>
+<li>Needs GDAL 3.8 or later and the <code>gdb</code> build feature</li>
 </ul>
 </div>
 <div class="card">
-<h3>🌐 Hosted ArcGIS Feature Services</h3>
+<h3>ArcGIS Feature and Map Services</h3>
 <ul>
-<li>REST reads only, by FeatureServer or MapServer root</li>
-<li>Token from <code>VERNE_ARCGIS_TOKEN</code>, or minted from a client id and secret — never an argument</li>
+<li>REST reads only, by FeatureServer or MapServer URL, whole or one layer</li>
+<li>Token from <code>VERNE_ARCGIS_TOKEN</code>, or minted from a client id and secret. Never an argument</li>
 <li><code>verne services</code> lists a portal's feature services</li>
 </ul>
 </div>
@@ -191,22 +193,22 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <p>For a hosted feature or map service, read over the documented REST API:</p>
 <div class="grid">
 <div class="card">
-<h3>✅ Carried</h3>
+<h3>Carried</h3>
 <ul>
 <li>Layers and tables: fields, aliases, domain bindings</li>
 <li>Coded and range domains</li>
 <li>Subtypes with defaults and per-subtype domain assignments</li>
 <li>Relationships, as both ends describe them</li>
-<li>Attachments: each blob lands on the feature it belongs to, and one whose feature the extraction never wrote is counted and skipped</li>
+<li>Attachments: each blob is attached to its feature, and one whose feature the extraction did not write is counted and skipped</li>
 <li>Features, paged by object id, with the original coordinates beside the reprojected ones. A layer that caps its answers and cannot page is fetched once, and the log says the rest was left behind</li>
 <li>Layer symbology, stored verbatim as Esri drawing info</li>
 <li>Private services (token or OAuth client credentials)</li>
 <li>Enterprise versioned data, one named version at a time</li>
-<li>Ongoing edits: inserts, updates, deletes and attachment changes flow across on every delta run</li>
+<li>Later edits: inserts, updates, deletes and attachment edits, on each delta run</li>
 </ul>
 </div>
 <div class="card">
-<h3>🚫 Left behind — named in the report, never dropped silently</h3>
+<h3>Left behind, each named in the report</h3>
 <ul>
 <li>Rasters: named for the platform's raster tooling, never fetched</li>
 <li>The version tree: one named version is read at a time</li>
@@ -214,7 +216,8 @@ footer{border-top:1px solid var(--border);padding:32px 0;text-align:center;color
 <li>Relationship labels and rules: not visible over REST, created empty</li>
 <li>Symbology and aliases are stored, not yet rendered by any platform screen</li>
 <li>Time settings: the fields they run over become ordinary columns, so the dataset is not time-aware</li>
-<li>Metadata records: reported, and not written, since ptolemy takes one through a route the extraction does not use</li>
+<li>Metadata records: reported as unsupported, not read or written</li>
+<li>Annotation and dimension layers: their text and placement have no place in the platform</li>
 <li>Binary column values (attachment bytes are the exception)</li>
 <li>Web maps, dashboards, and other portal content: out of scope, verne reads FeatureServer and MapServer only</li>
 </ul>
@@ -245,7 +248,7 @@ verne load ./wells-extract --ptolemy http://localhost:3000</pre>
 <footer>
 <div class="container">
 <p>Verne is free software under the <a href="https://github.com/GeoLang/verne/blob/master/LICENSE">AGPL-3.0 license</a>.</p>
-<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a> — migration for the open geospatial stack.</p>
+<p style="margin-top:8px">Made by <a href="https://github.com/GeoLang">GeoLang</a>.</p>
 <p>&copy; 2026 Grok Image Compression Inc. Licensed under AGPL-3.0-or-later.</p>
 </div>
 </footer>

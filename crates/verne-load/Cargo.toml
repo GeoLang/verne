@@ -17,7 +17,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls",
 ] }
 # ptolemy takes an attachment's bytes as base64 in the JSON body
-base64 = "0.22"
+base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 # best-effort float parsing does not round-trip its own shortest output, and a
 # reparsed feature must equal the one that was written: the delta diff and a
